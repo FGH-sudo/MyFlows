@@ -5,6 +5,20 @@ from ..core.node import Variable
 from ..ops.basic import MatMul, Add
 from ..ops.convolution import Conv2D_Op, MaxPool2d_Op, Flatten_Op
 
+
+def _pair(value, name):
+    if isinstance(value, int):
+        if value <= 0:
+            raise ValueError(f"{name} must be positive, got {value}")
+        return (value, value)
+    if isinstance(value, (tuple, list)) and len(value) == 2:
+        first, second = int(value[0]), int(value[1])
+        if first <= 0 or second <= 0:
+            raise ValueError(f"{name} must be positive, got {value}")
+        return (first, second)
+    raise TypeError(f"{name} must be an int or a pair of ints, got {value!r}")
+
+
 class Layer:
     """层基类"""
     def __init__(self, name=None):
@@ -44,14 +58,16 @@ class Conv2D(Layer):
     def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=0, activation=None, name=None):
         super().__init__(name=name)
 
-        fan_in = in_channels * kernel_size**2
-        k_init = np.random.randn(out_channels, in_channels, kernel_size, kernel_size) * np.sqrt(2./fan_in)
+        kernel_h, kernel_w = _pair(kernel_size, "kernel_size")
+        fan_in = in_channels * kernel_h * kernel_w
+        k_init = np.random.randn(out_channels, in_channels, kernel_h, kernel_w) * np.sqrt(2. / fan_in)
         b_init = np.zeros((out_channels,))
-        
+
         self.kernel = Variable(k_init, trainable=True, name=f"{self.name}_kernel" if self.name else "kernel")
         self.b = Variable(b_init, trainable=True, name=f"{self.name}_bias" if self.name else "bias")
         self.params = [self.kernel, self.b]
-        
+
+        self.kernel_size = (kernel_h, kernel_w)
         self.stride, self.padding = stride, padding
         self.activation = activation
 
