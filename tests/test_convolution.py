@@ -11,7 +11,7 @@ if str(PROJECT_PARENT) not in sys.path:
 
 from MyFlows.core.node import Variable
 from MyFlows.layers.layer import Conv2D
-from MyFlows.ops.convolution import Conv2D_Op, MaxPool2d_Op
+from MyFlows.ops.convolution import Conv2D_Op, MaxPool2d_Op, im2col, col2im
 
 
 def naive_conv_forward(x, kernel, stride=(1, 1), padding=(0, 0)):
@@ -96,6 +96,50 @@ def naive_maxpool_backward(x, grad_y, kernel_size=(2, 2), stride=(2, 2)):
     return grad_x
 
 
+def naive_im2col(x, kernel_size, stride=(1, 1), padding=(0, 0)):
+    kernel_h, kernel_w = kernel_size
+    stride_h, stride_w = stride
+    pad_h, pad_w = padding
+    x_pad = np.pad(x, ((0, 0), (0, 0), (pad_h, pad_h), (pad_w, pad_w)), mode="constant")
+    batch_size, channels, _, _ = x.shape
+    out_h = (x_pad.shape[2] - kernel_h) // stride_h + 1
+    out_w = (x_pad.shape[3] - kernel_w) // stride_w + 1
+
+    rows = []
+    for batch in range(batch_size):
+        for i in range(out_h):
+            for j in range(out_w):
+                h_start = i * stride_h
+                w_start = j * stride_w
+                window = x_pad[batch, :, h_start:h_start + kernel_h, w_start:w_start + kernel_w]
+                rows.append(window.reshape(channels * kernel_h * kernel_w))
+    return np.array(rows)
+
+
+def naive_col2im(rows, input_shape, kernel_size, stride=(1, 1), padding=(0, 0)):
+    kernel_h, kernel_w = kernel_size
+    stride_h, stride_w = stride
+    pad_h, pad_w = padding
+    batch_size, channels, height, width = input_shape
+    padded = np.zeros((batch_size, channels, height + 2 * pad_h, width + 2 * pad_w), dtype=rows.dtype)
+    out_h = (padded.shape[2] - kernel_h) // stride_h + 1
+    out_w = (padded.shape[3] - kernel_w) // stride_w + 1
+
+    row_index = 0
+    for batch in range(batch_size):
+        for i in range(out_h):
+            for j in range(out_w):
+                h_start = i * stride_h
+                w_start = j * stride_w
+                window = rows[row_index].reshape(channels, kernel_h, kernel_w)
+                padded[batch, :, h_start:h_start + kernel_h, w_start:w_start + kernel_w] += window
+                row_index += 1
+
+    if pad_h == 0 and pad_w == 0:
+        return padded
+    return padded[:, :, pad_h:pad_h + height, pad_w:pad_w + width]
+
+
 class ConvolutionOpsTest(unittest.TestCase):
     def setUp(self):
         self.rng = np.random.default_rng(7)
@@ -111,6 +155,18 @@ class ConvolutionOpsTest(unittest.TestCase):
 
         expected = naive_conv_forward(x, kernel, stride=(2, 1), padding=(1, 0))
         self.assertTrue(np.allclose(op.value, expected, atol=1e-10))
+
+    def test_im2col_and_col2im_match_naive_reference(self):
+        x = self.rng.normal(size=(2, 3, 4, 5))
+        expected_cols = naive_im2col(x, kernel_size=(2, 3), stride=(1, 2), padding=(1, 0))
+
+        cols, context, _ = im2col(x, kernel_size=(2, 3), stride=(1, 2), padding=(1, 0))
+        self.assertTrue(np.allclose(cols, expected_cols, atol=1e-10))
+
+        rows = self.rng.normal(size=cols.shape)
+        recovered, _ = col2im(rows, x.shape, kernel_size=(2, 3), stride=(1, 2), padding=(1, 0), context=context)
+        expected_recovered = naive_col2im(rows, x.shape, kernel_size=(2, 3), stride=(1, 2), padding=(1, 0))
+        self.assertTrue(np.allclose(recovered, expected_recovered, atol=1e-10))
 
     def test_conv2d_backward_matches_naive_reference(self):
         x = self.rng.normal(size=(2, 2, 4, 5))

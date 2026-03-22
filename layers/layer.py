@@ -3,20 +3,31 @@ import os
 import numpy as np
 from ..core.node import Variable
 from ..ops.basic import MatMul, Add
-from ..ops.convolution import Conv2D_Op, MaxPool2d_Op, Flatten_Op
+from ..ops.convolution import Conv2D_Op, ConvTranspose2D_Op, MaxPool2d_Op, Flatten_Op
 
 
-def _pair(value, name):
+def _pair(value, name, allow_zero=False):
     if isinstance(value, int):
-        if value <= 0:
-            raise ValueError(f"{name} must be positive, got {value}")
+        minimum = 0 if allow_zero else 1
+        if value < minimum:
+            relation = "non-negative" if allow_zero else "positive"
+            raise ValueError(f"{name} must be {relation}, got {value}")
         return (value, value)
     if isinstance(value, (tuple, list)) and len(value) == 2:
         first, second = int(value[0]), int(value[1])
-        if first <= 0 or second <= 0:
-            raise ValueError(f"{name} must be positive, got {value}")
+        minimum = 0 if allow_zero else 1
+        if first < minimum or second < minimum:
+            relation = "non-negative" if allow_zero else "positive"
+            raise ValueError(f"{name} must be {relation}, got {value}")
         return (first, second)
     raise TypeError(f"{name} must be an int or a pair of ints, got {value!r}")
+
+
+def _positive_int(value, name):
+    value = int(value)
+    if value <= 0:
+        raise ValueError(f"{name} must be positive, got {value}")
+    return value
 
 
 class Layer:
@@ -55,26 +66,240 @@ class Dense(Layer):
 
 
 class Conv2D(Layer):
-    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=0, activation=None, name=None):
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        kernel_size=3,
+        stride=1,
+        padding=0,
+        groups=1,
+        dilation=1,
+        activation=None,
+        name=None,
+    ):
         super().__init__(name=name)
 
+        in_channels = _positive_int(in_channels, "in_channels")
+        out_channels = _positive_int(out_channels, "out_channels")
+        groups = _positive_int(groups, "groups")
         kernel_h, kernel_w = _pair(kernel_size, "kernel_size")
-        fan_in = in_channels * kernel_h * kernel_w
-        k_init = np.random.randn(out_channels, in_channels, kernel_h, kernel_w) * np.sqrt(2. / fan_in)
+        stride = _pair(stride, "stride")
+        padding = _pair(padding, "padding", allow_zero=True)
+        dilation = _pair(dilation, "dilation")
+
+        if in_channels % groups != 0:
+            raise ValueError("in_channels must be divisible by groups")
+        if out_channels % groups != 0:
+            raise ValueError("out_channels must be divisible by groups")
+
+        fan_in = (in_channels // groups) * kernel_h * kernel_w
+        k_init = np.random.randn(out_channels, in_channels // groups, kernel_h, kernel_w) * np.sqrt(2. / fan_in)
         b_init = np.zeros((out_channels,))
 
         self.kernel = Variable(k_init, trainable=True, name=f"{self.name}_kernel" if self.name else "kernel")
         self.b = Variable(b_init, trainable=True, name=f"{self.name}_bias" if self.name else "bias")
         self.params = [self.kernel, self.b]
 
+        self.in_channels = in_channels
+        self.out_channels = out_channels
         self.kernel_size = (kernel_h, kernel_w)
-        self.stride, self.padding = stride, padding
+        self.stride = stride
+        self.padding = padding
+        self.groups = groups
+        self.dilation = dilation
         self.activation = activation
 
     def forward(self, input_node):
         # 卷积：传入图像和卷积核
-        conv_out = Conv2D_Op(input_node, self.kernel, self.stride, self.padding)
+        conv_out = Conv2D_Op(
+            input_node,
+            self.kernel,
+            stride=self.stride,
+            padding=self.padding,
+            groups=self.groups,
+            dilation=self.dilation,
+        )
         # 加偏置：Add 算子处理 4D + 1D 的广播
+        z = Add(conv_out, self.b)
+        return self.activation(z) if self.activation else z
+
+
+class GroupedConv2D(Conv2D):
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=0, groups=2, activation=None, name=None):
+        super().__init__(
+            in_channels,
+            out_channels,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            groups=groups,
+            dilation=1,
+            activation=activation,
+            name=name,
+        )
+
+
+class DepthwiseConv2D(Conv2D):
+    def __init__(
+        self,
+        in_channels,
+        kernel_size=3,
+        stride=1,
+        padding=0,
+        depth_multiplier=1,
+        dilation=1,
+        activation=None,
+        name=None,
+    ):
+        depth_multiplier = _positive_int(depth_multiplier, "depth_multiplier")
+        super().__init__(
+            in_channels,
+            in_channels * depth_multiplier,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            groups=in_channels,
+            dilation=dilation,
+            activation=activation,
+            name=name,
+        )
+        self.depth_multiplier = depth_multiplier
+
+
+class DepthwiseSeparableConv2D(Layer):
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        kernel_size=3,
+        stride=1,
+        padding=0,
+        depth_multiplier=1,
+        dilation=1,
+        activation=None,
+        name=None,
+    ):
+        super().__init__(name=name)
+        self.depth_multiplier = _positive_int(depth_multiplier, "depth_multiplier")
+        mid_channels = _positive_int(in_channels, "in_channels") * self.depth_multiplier
+
+        depthwise_name = f"{self.name}_depthwise" if self.name else "depthwise"
+        pointwise_name = f"{self.name}_pointwise" if self.name else "pointwise"
+        self.depthwise = DepthwiseConv2D(
+            in_channels,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            depth_multiplier=self.depth_multiplier,
+            dilation=dilation,
+            activation=None,
+            name=depthwise_name,
+        )
+        self.pointwise = Conv2D(
+            mid_channels,
+            out_channels,
+            kernel_size=1,
+            stride=1,
+            padding=0,
+            groups=1,
+            dilation=1,
+            activation=None,
+            name=pointwise_name,
+        )
+        self.params = self.depthwise.params + self.pointwise.params
+        self.activation = activation
+
+    def forward(self, input_node):
+        z = self.pointwise(self.depthwise(input_node))
+        return self.activation(z) if self.activation else z
+
+
+class DilatedConv2D(Conv2D):
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        kernel_size=3,
+        stride=1,
+        padding=0,
+        dilation=2,
+        activation=None,
+        name=None,
+    ):
+        super().__init__(
+            in_channels,
+            out_channels,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            groups=1,
+            dilation=dilation,
+            activation=activation,
+            name=name,
+        )
+
+
+class ConvTranspose2D(Layer):
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        kernel_size=3,
+        stride=1,
+        padding=0,
+        output_padding=0,
+        groups=1,
+        dilation=1,
+        activation=None,
+        name=None,
+    ):
+        super().__init__(name=name)
+
+        in_channels = _positive_int(in_channels, "in_channels")
+        out_channels = _positive_int(out_channels, "out_channels")
+        groups = _positive_int(groups, "groups")
+        kernel_h, kernel_w = _pair(kernel_size, "kernel_size")
+        stride = _pair(stride, "stride")
+        padding = _pair(padding, "padding", allow_zero=True)
+        output_padding = _pair(output_padding, "output_padding", allow_zero=True)
+        dilation = _pair(dilation, "dilation")
+
+        if in_channels % groups != 0:
+            raise ValueError("in_channels must be divisible by groups")
+        if out_channels % groups != 0:
+            raise ValueError("out_channels must be divisible by groups")
+        if any(output_pad >= max(stride_val, dilation_val) for output_pad, stride_val, dilation_val in zip(output_padding, stride, dilation)):
+            raise ValueError("output_padding must be smaller than max(stride, dilation)")
+
+        fan_in = (out_channels // groups) * kernel_h * kernel_w
+        k_init = np.random.randn(in_channels, out_channels // groups, kernel_h, kernel_w) * np.sqrt(2. / fan_in)
+        b_init = np.zeros((out_channels,))
+
+        self.kernel = Variable(k_init, trainable=True, name=f"{self.name}_kernel" if self.name else "kernel")
+        self.b = Variable(b_init, trainable=True, name=f"{self.name}_bias" if self.name else "bias")
+        self.params = [self.kernel, self.b]
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = (kernel_h, kernel_w)
+        self.stride = stride
+        self.padding = padding
+        self.output_padding = output_padding
+        self.groups = groups
+        self.dilation = dilation
+        self.activation = activation
+
+    def forward(self, input_node):
+        conv_out = ConvTranspose2D_Op(
+            input_node,
+            self.kernel,
+            stride=self.stride,
+            padding=self.padding,
+            output_padding=self.output_padding,
+            groups=self.groups,
+            dilation=self.dilation,
+        )
         z = Add(conv_out, self.b)
         return self.activation(z) if self.activation else z
 
