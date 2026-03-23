@@ -1,6 +1,7 @@
 import numpy as np
 from ..core.node import Variable
 from ..core.graph import Graph
+from ..core.tensor import Tensor
 
 class Optimizer:
     """
@@ -30,12 +31,12 @@ class Optimizer:
         """
         根据节点获取累加的平均梯度（累加梯度除以累加次数）
         """
-        if self.acc_no == 0:
-            return None
-        
         if node not in self.acc_gradient:
             return None
-            
+
+        if self.acc_no == 0:
+            return self.acc_gradient[node]
+
         return self.acc_gradient[node] / self.acc_no
         
     def _update(self, avg_gradients):
@@ -55,6 +56,7 @@ class Optimizer:
             for node, gradient in gradients.items():
                 if gradient is None:
                     continue  # 梯度为空，跳过  
+                gradient = np.asarray(Tensor.ensure(gradient).data)
                 if node in self.acc_gradient:
                     self.acc_gradient[node] += gradient
                 else:
@@ -62,7 +64,7 @@ class Optimizer:
         else:
             # 直接设置梯度
             for node, gradient in gradients.items():
-                self.acc_gradient[node] = gradient
+                self.acc_gradient[node] = None if gradient is None else np.asarray(Tensor.ensure(gradient).data)
 
     def update(self, var_gradients=None):
         """
@@ -210,4 +212,3 @@ class Adam(Optimizer):
                 node.value -= self.learning_rate * v_correct / (np.sqrt(s_correct) + self.eps)
 
                 
-
