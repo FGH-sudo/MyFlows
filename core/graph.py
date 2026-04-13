@@ -1,13 +1,33 @@
 import numpy as np
 from .node import Node, Variable
+from .graph_opt import apply_graph_optimizations
 
 class Graph:
     
-    def __init__(self, target_node):
-        
-        self.target_node = target_node
-        
-        # 自动构建拓扑排序
+    def __init__(
+        self,
+        target_node,
+        optimize=False,
+        fold_constants=False,
+        fuse_linear=True,
+        fuse_activations=True,
+    ):
+        """
+        :param optimize: 为 True 时在构图后运行可选构建期优化（如常量折叠）。
+        :param fold_constants: 仅在 ``optimize=True`` 时生效，是否折叠常量 Add。
+        """
+        self._opt_stats = None
+        if optimize:
+            self.target_node, self._opt_stats = apply_graph_optimizations(
+                target_node,
+                fold_constants=fold_constants,
+                fuse_linear=fuse_linear,
+                fuse_activations=fuse_activations,
+            )
+        else:
+            self.target_node = target_node
+
+        # 自动构建拓扑排序（优化后再排序，避免包含已被替换的节点）
         self.sorted_nodes = self._build_topo_sort(self.target_node)
         
         # self.nodes 是所有节点的集合

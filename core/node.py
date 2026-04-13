@@ -61,9 +61,11 @@ class Node:
 
 
 class Variable(Node):
-    def __init__(self, value=None, trainable=False, name=None):
+    def __init__(self, value=None, trainable=False, name=None, constant=False):
         super().__init__(trainable=trainable, name=name)
         self.value = value
+        #: 若为 True，表示运行期不参与训练更新，且可被图优化折叠（常量折叠）
+        self.constant = bool(constant)
 
     def forward(self): 
         pass

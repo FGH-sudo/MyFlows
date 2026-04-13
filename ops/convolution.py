@@ -174,9 +174,13 @@ def col2im(rows, input_shape, kernel_size, stride=1, padding=0, dilation=1, cont
 
 
 class Conv2D_Op(Node):
-    def __init__(self, x, kernel, stride=1, padding=0, groups=1, dilation=1):
-        # x: 图像, kernel: 卷积核
-        super().__init__(x, kernel)
+    def __init__(self, x, kernel, stride=1, padding=0, groups=1, dilation=1, bias=None):
+        # x: 图像, kernel: 卷积核；可选 bias 与输出通道对齐，前向融合加偏置（减少 Add 节点）
+        if bias is None:
+            super().__init__(x, kernel)
+        else:
+            super().__init__(x, kernel, bias)
+        self.bias = bias
         self.stride = _normalize_pair(stride, "stride")
         self.padding = _normalize_pair(padding, "padding", allow_zero=True)
         self.groups = _normalize_groups(groups)
@@ -198,12 +202,17 @@ class Conv2D_Op(Node):
                 "kernel input channels must equal x input channels divided by groups"
             )
 
-    def forward(self, x_val, kernel_val):
+    def forward(self, x_val, kernel_val, bias_val=None):
         # x_val: (N, C_in, H, W), kernel_val: (C_out, C_in, kH, kW)
         N, C_in, H, W = x_val.shape
         C_out, _, kH, kW = kernel_val.shape
 
         self._validate_kernel(x_val, kernel_val)
+        if self.bias is not None and bias_val is None:
+            raise ValueError("bias was set on Conv2D_Op but forward received no bias value")
+        if self.bias is not None:
+            if bias_val.shape != (C_out,):
+                raise ValueError("bias shape must be (C_out,)")
 
         if len(self._im2col_contexts) != self.groups:
             self._im2col_contexts = [None] * self.groups
@@ -238,13 +247,20 @@ class Conv2D_Op(Node):
             )
 
         self.value = np.concatenate(outputs, axis=1)
+        if self.bias is not None:
+            self.value = self.value + bias_val.reshape(1, C_out, 1, 1)
 
     def backward(self):
-        x_node, kernel_node = self.parents
+        if self.bias is None:
+            x_node, kernel_node = self.parents
+        else:
+            x_node, kernel_node, bias_node = self.parents
         if x_node.grad is None:
             x_node.clear_grad()
         if kernel_node.grad is None:
             kernel_node.clear_grad()
+        if self.bias is not None and bias_node.grad is None:
+            bias_node.clear_grad()
 
         batch_size, in_channels, input_h, input_w = x_node.value.shape
         out_channels = kernel_node.value.shape[0]
@@ -272,10 +288,145 @@ class Conv2D_Op(Node):
             self._im2col_contexts[group_index] = context
             x_node.grad[:, in_start:in_end] += grad_x
 
+        if self.bias is not None:
+            bias_node.grad += np.sum(self.grad, axis=(0, 2, 3))
+
+
+class Conv2D_ReLU_Op(Conv2D_Op):
+    """融合算子：Conv2D(+bias) 后接 ReLU。"""
+
+    def forward(self, x_val, kernel_val, bias_val=None):
+        super().forward(x_val, kernel_val, bias_val=bias_val)
+        # 使用 pre-activation 的符号生成 mask，避免数值差异
+        self._relu_mask = self.value > 0
+        self.value = np.maximum(0, self.value)
+
+    def backward(self):
+        # 先过 ReLU 的梯度门控，再按 Conv2D_Op 反传
+        self.grad = self.grad * self._relu_mask
+        super().backward()
+
+
+class Conv2D_LeakyReLU_Op(Conv2D_Op):
+    """融合算子：Conv2D(+bias) 后接 LeakyReLU。"""
+
+    def __init__(self, *args, alpha=0.01, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.alpha = float(alpha)
+
+    def forward(self, x_val, kernel_val, bias_val=None):
+        super().forward(x_val, kernel_val, bias_val=bias_val)
+        self._leaky_mask = self.value > 0
+        self.value = np.where(self._leaky_mask, self.value, self.alpha * self.value)
+
+    def backward(self):
+        self.grad = self.grad * np.where(self._leaky_mask, 1.0, self.alpha)
+        super().backward()
+
+
+def _conv_transpose2d_accumulate_group(
+    x_group,
+    kernel_group,
+    output,
+    out_start,
+    out_h,
+    out_w,
+    stride,
+    padding,
+    dilation,
+):
+    """Scatter-add one group's transposed conv output using kh*kw outer loops and GEMM.
+
+    x_group: (N, Cin_g, Hin, Win)
+    kernel_group: (Cin_g, Cout_g, kH, kW) — slice of full kernel for this group
+    output: (N, Cout, Hout, Wout), updated in-place for channels [out_start, out_start + Cout_g)
+    """
+    batch_size, _, input_h, input_w = x_group.shape
+    _, out_channels_per_group, kernel_h, kernel_w = kernel_group.shape
+    stride_h, stride_w = stride
+    pad_h, pad_w = padding
+    dilation_h, dilation_w = dilation
+
+    ih_grid = np.arange(input_h, dtype=np.int64)[:, None]
+    iw_grid = np.arange(input_w, dtype=np.int64)[None, :]
+
+    for kr in range(kernel_h):
+        for kc in range(kernel_w):
+            oh = ih_grid * stride_h - pad_h + kr * dilation_h + 0 * iw_grid
+            ow = iw_grid * stride_w - pad_w + kc * dilation_w + 0 * ih_grid
+            mask = (oh >= 0) & (oh < out_h) & (ow >= 0) & (ow < out_w)
+            ih_valid, iw_valid = np.where(mask)
+            if ih_valid.size == 0:
+                continue
+
+            oo_h = oh[ih_valid, iw_valid].astype(np.intp, copy=False)
+            oo_w = ow[ih_valid, iw_valid].astype(np.intp, copy=False)
+            v = oo_h.size
+
+            xv = x_group[:, :, ih_valid, iw_valid]
+            ks = kernel_group[:, :, kr, kc]
+            contrib = xv.swapaxes(1, 2) @ ks
+
+            flat = np.arange(batch_size * v * out_channels_per_group, dtype=np.intp)
+            n_idx = flat // (v * out_channels_per_group)
+            rem = flat % (v * out_channels_per_group)
+            v_idx = rem // out_channels_per_group
+            g_idx = rem % out_channels_per_group
+            c_idx = out_start + g_idx
+            oh_idx = oo_h[v_idx]
+            ow_idx = oo_w[v_idx]
+
+            np.add.at(output, (n_idx, c_idx, oh_idx, ow_idx), contrib.ravel())
+
+
+def _conv_transpose2d_backward_group(
+    x_group,
+    grad_group,
+    grad_x_group,
+    grad_kernel_group,
+    kernel_group,
+    stride,
+    padding,
+    dilation,
+):
+    """Backward for one group; updates grad_x_group and grad_kernel_group in-place."""
+    batch_size, _, input_h, input_w = x_group.shape
+    _, out_channels_per_group, kernel_h, kernel_w = kernel_group.shape
+    out_h, out_w = grad_group.shape[2], grad_group.shape[3]
+    stride_h, stride_w = stride
+    pad_h, pad_w = padding
+    dilation_h, dilation_w = dilation
+
+    ih_grid = np.arange(input_h, dtype=np.int64)[:, None]
+    iw_grid = np.arange(input_w, dtype=np.int64)[None, :]
+
+    for kr in range(kernel_h):
+        for kc in range(kernel_w):
+            oh = ih_grid * stride_h - pad_h + kr * dilation_h + 0 * iw_grid
+            ow = iw_grid * stride_w - pad_w + kc * dilation_w + 0 * ih_grid
+            mask = (oh >= 0) & (oh < out_h) & (ow >= 0) & (ow < out_w)
+            ih_valid, iw_valid = np.where(mask)
+            if ih_valid.size == 0:
+                continue
+
+            oo_h = oh[ih_valid, iw_valid]
+            oo_w = ow[ih_valid, iw_valid]
+
+            xv = x_group[:, :, ih_valid, iw_valid]
+            gv = grad_group[:, :, oo_h, oo_w]
+
+            ks = kernel_group[:, :, kr, kc]
+            grad_x_group[:, :, ih_valid, iw_valid] += np.einsum("cg,ngv->ncv", ks, gv)
+            grad_kernel_group[:, :, kr, kc] += np.einsum("ncv,ngv->cg", xv, gv)
+
 
 class ConvTranspose2D_Op(Node):
-    def __init__(self, x, kernel, stride=1, padding=0, output_padding=0, groups=1, dilation=1):
-        super().__init__(x, kernel)
+    def __init__(self, x, kernel, stride=1, padding=0, output_padding=0, groups=1, dilation=1, bias=None):
+        if bias is None:
+            super().__init__(x, kernel)
+        else:
+            super().__init__(x, kernel, bias)
+        self.bias = bias
         self.stride = _normalize_pair(stride, "stride")
         self.padding = _normalize_pair(padding, "padding", allow_zero=True)
         self.output_padding = _normalize_pair(output_padding, "output_padding", allow_zero=True)
@@ -299,11 +450,13 @@ class ConvTranspose2D_Op(Node):
         if out_channels_per_group <= 0:
             raise ValueError("kernel must provide at least one output channel per group")
 
-    def forward(self, x_val, kernel_val):
+    def forward(self, x_val, kernel_val, bias_val=None):
         batch_size, in_channels, input_h, input_w = x_val.shape
         kernel_in_channels, out_channels_per_group, kernel_h, kernel_w = kernel_val.shape
 
         self._validate_kernel(x_val, kernel_val)
+        if self.bias is not None and bias_val is None:
+            raise ValueError("bias was set on ConvTranspose2D_Op but forward received no bias value")
 
         out_channels = out_channels_per_group * self.groups
         out_h, out_w = _infer_transposed_output_size(
@@ -316,45 +469,42 @@ class ConvTranspose2D_Op(Node):
         )
 
         output = np.zeros((batch_size, out_channels, out_h, out_w), dtype=x_val.dtype)
-        in_channels_per_group = in_channels // self.groups
 
         for group_index in range(self.groups):
             in_start, in_end = _group_bounds(in_channels, self.groups, group_index)
             out_start = group_index * out_channels_per_group
-            out_end = out_start + out_channels_per_group
 
-            for batch_index in range(batch_size):
-                for in_channel in range(in_start, in_end):
-                    for input_row in range(input_h):
-                        base_row = input_row * self.stride[0] - self.padding[0]
-                        for input_col in range(input_w):
-                            input_value = x_val[batch_index, in_channel, input_row, input_col]
-                            base_col = input_col * self.stride[1] - self.padding[1]
-                            if input_value == 0:
-                                continue
-
-                            for kernel_row in range(kernel_h):
-                                out_row = base_row + kernel_row * self.dilation[0]
-                                if out_row < 0 or out_row >= out_h:
-                                    continue
-
-                                for kernel_col in range(kernel_w):
-                                    out_col = base_col + kernel_col * self.dilation[1]
-                                    if out_col < 0 or out_col >= out_w:
-                                        continue
-
-                                    output[batch_index, out_start:out_end, out_row, out_col] += (
-                                        input_value * kernel_val[in_channel, :, kernel_row, kernel_col]
-                                    )
+            x_group = x_val[:, in_start:in_end]
+            kernel_group = kernel_val[in_start:in_end]
+            _conv_transpose2d_accumulate_group(
+                x_group,
+                kernel_group,
+                output,
+                out_start,
+                out_h,
+                out_w,
+                self.stride,
+                self.padding,
+                self.dilation,
+            )
 
         self.value = output
+        if self.bias is not None:
+            if bias_val.shape != (out_channels,):
+                raise ValueError("bias shape must be (C_out,)")
+            self.value = self.value + bias_val.reshape(1, out_channels, 1, 1)
 
     def backward(self):
-        x_node, kernel_node = self.parents
+        if self.bias is None:
+            x_node, kernel_node = self.parents
+        else:
+            x_node, kernel_node, bias_node = self.parents
         if x_node.grad is None:
             x_node.clear_grad()
         if kernel_node.grad is None:
             kernel_node.clear_grad()
+        if self.bias is not None and bias_node.grad is None:
+            bias_node.clear_grad()
 
         batch_size, in_channels, input_h, input_w = x_node.value.shape
         _, out_channels_per_group, kernel_h, kernel_w = kernel_node.value.shape
@@ -364,32 +514,55 @@ class ConvTranspose2D_Op(Node):
             out_start = group_index * out_channels_per_group
             out_end = out_start + out_channels_per_group
 
-            for batch_index in range(batch_size):
-                for in_channel in range(in_start, in_end):
-                    for input_row in range(input_h):
-                        base_row = input_row * self.stride[0] - self.padding[0]
-                        for input_col in range(input_w):
-                            input_value = x_node.value[batch_index, in_channel, input_row, input_col]
-                            base_col = input_col * self.stride[1] - self.padding[1]
+            x_group = x_node.value[:, in_start:in_end]
+            grad_group = self.grad[:, out_start:out_end]
+            grad_x_group = x_node.grad[:, in_start:in_end]
+            grad_kernel_group = kernel_node.grad[in_start:in_end]
+            kernel_group = kernel_node.value[in_start:in_end]
 
-                            for kernel_row in range(kernel_h):
-                                out_row = base_row + kernel_row * self.dilation[0]
-                                if out_row < 0 or out_row >= self.grad.shape[2]:
-                                    continue
+            _conv_transpose2d_backward_group(
+                x_group,
+                grad_group,
+                grad_x_group,
+                grad_kernel_group,
+                kernel_group,
+                self.stride,
+                self.padding,
+                self.dilation,
+            )
 
-                                for kernel_col in range(kernel_w):
-                                    out_col = base_col + kernel_col * self.dilation[1]
-                                    if out_col < 0 or out_col >= self.grad.shape[3]:
-                                        continue
+        if self.bias is not None:
+            bias_node.grad += np.sum(self.grad, axis=(0, 2, 3))
 
-                                    grad_slice = self.grad[batch_index, out_start:out_end, out_row, out_col]
-                                    x_node.grad[batch_index, in_channel, input_row, input_col] += np.dot(
-                                        grad_slice,
-                                        kernel_node.value[in_channel, :, kernel_row, kernel_col],
-                                    )
-                                    kernel_node.grad[in_channel, :, kernel_row, kernel_col] += (
-                                        input_value * grad_slice
-                                    )
+
+class ConvTranspose2D_ReLU_Op(ConvTranspose2D_Op):
+    """融合算子：ConvTranspose2D(+bias) 后接 ReLU。"""
+
+    def forward(self, x_val, kernel_val, bias_val=None):
+        super().forward(x_val, kernel_val, bias_val=bias_val)
+        self._relu_mask = self.value > 0
+        self.value = np.maximum(0, self.value)
+
+    def backward(self):
+        self.grad = self.grad * self._relu_mask
+        super().backward()
+
+
+class ConvTranspose2D_LeakyReLU_Op(ConvTranspose2D_Op):
+    """融合算子：ConvTranspose2D(+bias) 后接 LeakyReLU。"""
+
+    def __init__(self, *args, alpha=0.01, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.alpha = float(alpha)
+
+    def forward(self, x_val, kernel_val, bias_val=None):
+        super().forward(x_val, kernel_val, bias_val=bias_val)
+        self._leaky_mask = self.value > 0
+        self.value = np.where(self._leaky_mask, self.value, self.alpha * self.value)
+
+    def backward(self):
+        self.grad = self.grad * np.where(self._leaky_mask, 1.0, self.alpha)
+        super().backward()
 
 
 class MaxPool2d_Op(Node):

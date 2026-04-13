@@ -11,6 +11,7 @@ from .core.node import Node, Variable
 from .core.tensor import Tensor
 # 导入 Graph，并暴露在顶层命名空间 (ms.Graph)
 from .core.graph import Graph
+from .core.graph_opt import apply_graph_optimizations
 
 # --- 连接层 (layers) ---
 # 导入连接网络层

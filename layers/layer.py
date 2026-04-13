@@ -2,7 +2,7 @@ import pickle
 import os
 import numpy as np
 from ..core.node import Variable
-from ..ops.basic import MatMul, Add
+from ..ops.basic import MatMul, Add, Linear
 from ..ops.convolution import Conv2D_Op, ConvTranspose2D_Op, MaxPool2d_Op, Flatten_Op
 
 
@@ -57,8 +57,8 @@ class Dense(Layer):
 
     def forward(self, input_node):
         """构建计算图分支"""
-        # Z = XW + b
-        z = Add(MatMul(input_node, self.W), self.b)
+        # 融合：Z = XW + b（单算子，减少节点）
+        z = Linear(input_node, self.W, self.b)
         
         if self.activation:
             return self.activation(z)
@@ -76,6 +76,7 @@ class Conv2D(Layer):
         groups=1,
         dilation=1,
         activation=None,
+        fuse_activation=True,
         name=None,
     ):
         super().__init__(name=name)
@@ -109,9 +110,29 @@ class Conv2D(Layer):
         self.groups = groups
         self.dilation = dilation
         self.activation = activation
+        self.fuse_activation = bool(fuse_activation)
 
     def forward(self, input_node):
-        # 卷积：传入图像和卷积核
+        # 卷积 + 偏置在同一算子内融合；若 activation=ReLU 且允许融合，则构图阶段直接用融合算子
+        if self.fuse_activation and self.activation is not None:
+            try:
+                from ..ops.activation import ReLU
+                from ..ops.convolution import Conv2D_ReLU_Op
+                if self.activation is ReLU:
+                    conv_out = Conv2D_ReLU_Op(
+                        input_node,
+                        self.kernel,
+                        stride=self.stride,
+                        padding=self.padding,
+                        groups=self.groups,
+                        dilation=self.dilation,
+                        bias=self.b,
+                    )
+                    return conv_out
+            except Exception:
+                # 保持动态图语义：导入/判定失败时退化为非融合路径
+                pass
+
         conv_out = Conv2D_Op(
             input_node,
             self.kernel,
@@ -119,10 +140,9 @@ class Conv2D(Layer):
             padding=self.padding,
             groups=self.groups,
             dilation=self.dilation,
+            bias=self.b,
         )
-        # 加偏置：Add 算子处理 4D + 1D 的广播
-        z = Add(conv_out, self.b)
-        return self.activation(z) if self.activation else z
+        return self.activation(conv_out) if self.activation else conv_out
 
 
 class GroupedConv2D(Conv2D):
@@ -252,6 +272,7 @@ class ConvTranspose2D(Layer):
         groups=1,
         dilation=1,
         activation=None,
+        fuse_activation=True,
         name=None,
     ):
         super().__init__(name=name)
@@ -289,8 +310,28 @@ class ConvTranspose2D(Layer):
         self.groups = groups
         self.dilation = dilation
         self.activation = activation
+        self.fuse_activation = bool(fuse_activation)
 
     def forward(self, input_node):
+        if self.fuse_activation and self.activation is not None:
+            try:
+                from ..ops.activation import ReLU
+                from ..ops.convolution import ConvTranspose2D_ReLU_Op
+                if self.activation is ReLU:
+                    conv_out = ConvTranspose2D_ReLU_Op(
+                        input_node,
+                        self.kernel,
+                        stride=self.stride,
+                        padding=self.padding,
+                        output_padding=self.output_padding,
+                        groups=self.groups,
+                        dilation=self.dilation,
+                        bias=self.b,
+                    )
+                    return conv_out
+            except Exception:
+                pass
+
         conv_out = ConvTranspose2D_Op(
             input_node,
             self.kernel,
@@ -299,9 +340,9 @@ class ConvTranspose2D(Layer):
             output_padding=self.output_padding,
             groups=self.groups,
             dilation=self.dilation,
+            bias=self.b,
         )
-        z = Add(conv_out, self.b)
-        return self.activation(z) if self.activation else z
+        return self.activation(conv_out) if self.activation else conv_out
 
 class MaxPool2d(Layer):
     def __init__(self, kernel_size=2, stride=2, name=None):
