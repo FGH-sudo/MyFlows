@@ -26,15 +26,20 @@ from .layers.layer import (
     ConvTranspose2D,
     MaxPool2d,
     Flatten,
-    save_checkpoint,
-    load_checkpoint,
 )
+from .layers.resnet import (
+    BatchNorm2d,
+    GlobalAvgPool2d,
+    BasicBlock,
+    ResNet18,
+)
+from .utils.serialization import save_checkpoint, load_checkpoint, export_onnx
 
 # --- 操作符 (ops) ---
 # 导入基本操作 
 from .ops.basic import Add, MatMul
 # 导入损失函数 
-from .ops.loss import PerceptionLoss, LogLoss, CrossEntropy
+from .ops.loss import PerceptionLoss, LogLoss, CrossEntropy, MSELoss
 # 导入激活函数
 from .ops.activation import Logistic, Softmax, Tanh, ReLU, LeakyReLU
 # 导入卷积、池化、展平算子
@@ -47,6 +52,7 @@ from .ops.convolution import (
     im2col,
     col2im,
 )
+from .ops.batchnorm import BatchNorm2d_Op, GlobalAvgPool2d_Op
 
 # --- 训练和优化 (train) ---
 # 导入优化器 (ms.Optimizer, ms.MBGD, ms.Momentum, ms.AdaGrad, ms.RMSProp, ms.Adam)
@@ -63,9 +69,11 @@ __all__ = [
     # Core
     'Node', 'Variable', 'Tensor', 'Graph',
     # Layers
-    'Layer', 'Dense', 'Conv2D', 'GroupedConv2D', 'DepthwiseConv2D', 'DepthwiseSeparableConv2D', 'DilatedConv2D', 'ConvTranspose2D', 'MaxPool2d', 'Flatten', 'save_checkpoint', 'load_checkpoint',
+    'Layer', 'Dense', 'Conv2D', 'GroupedConv2D', 'DepthwiseConv2D', 'DepthwiseSeparableConv2D', 'DilatedConv2D', 'ConvTranspose2D', 'MaxPool2d', 'Flatten', 'save_checkpoint', 'load_checkpoint', 'export_onnx',
+    'BatchNorm2d', 'GlobalAvgPool2d', 'BasicBlock', 'ResNet18',
     # Ops
-    'Add', 'MatMul', 'PerceptionLoss', 'LogLoss', 'CrossEntropy', 'Logistic', 'Softmax', 'Tanh', 'ReLU', 'LeakyReLU', 'Conv2D_Op', 'ConvTranspose2D_Op', 'MaxPool2d_Op', 'Flatten_Op', 'effective_kernel_size', 'im2col', 'col2im',
+    'Add', 'MatMul', 'PerceptionLoss', 'LogLoss', 'CrossEntropy', 'MSELoss', 'Logistic', 'Softmax', 'Tanh', 'ReLU', 'LeakyReLU', 'Conv2D_Op', 'ConvTranspose2D_Op', 'MaxPool2d_Op', 'Flatten_Op', 'effective_kernel_size', 'im2col', 'col2im',
+    'BatchNorm2d_Op', 'GlobalAvgPool2d_Op',
     # Train
     'Optimizer', 'MBGD', 'Momentum', 'AdaGrad', 'RMSProp', 'Adam',
     # Utils

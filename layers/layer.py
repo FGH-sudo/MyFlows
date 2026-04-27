@@ -1,8 +1,6 @@
-import pickle
-import os
 import numpy as np
 from ..core.node import Variable
-from ..ops.basic import MatMul, Add, Linear
+from ..ops.basic import Linear
 from ..ops.convolution import Conv2D_Op, ConvTranspose2D_Op, MaxPool2d_Op, Flatten_Op
 
 
@@ -356,61 +354,3 @@ class MaxPool2d(Layer):
 class Flatten(Layer):
     def forward(self, input_node):
         return Flatten_Op(input_node)
-
-
-def save_checkpoint(layers, optimizer, epoch, acc, filepath="checkpoint.pkl"):
-    """
-    保存断点：包含模型、优化器和进度
-    """
-    # 提取模型权重
-    model_state = []
-    for layer in layers:
-        layer_params = {param.name: param.value for param in layer.params}
-        model_state.append({"name": layer.name, "params": layer_params})
-
-    # 提取优化器状态 
-    # 保存各个 Variable 对应的梯度平滑值
-    opt_state = {}
-    if hasattr(optimizer, 'v'): # 针对 Adam 或动量优化器
-        opt_state['v'] = {k: v for k, v in optimizer.v.items()}
-    if hasattr(optimizer, 'm'):
-        opt_state['m'] = {k: v for k, v in optimizer.m.items()}
-
-    checkpoint = {
-        "epoch": epoch,
-        "model_state": model_state,
-        "optimizer_state": opt_state,
-        "best_acc": acc
-    }
-
-    with open(filepath, 'wb') as f:
-        pickle.dump(checkpoint, f)
-
-
-def load_checkpoint(layers, optimizer, filepath="checkpoint.pkl"):
-    """
-    加载断点：恢复模型权重、优化器状态并返回起始 Epoch
-    """
-    if not os.path.exists(filepath):
-        print("未发现 Checkpoint，从零开始训练。")
-        return -1, 0.0 # 返回起始 epoch 和初始 acc
-
-    with open(filepath, 'rb') as f:
-        checkpoint = pickle.load(f)
-
-    # 恢复模型权重
-    for i, layer in enumerate(layers):
-        saved_params = checkpoint["model_state"][i]["params"]
-        for param in layer.params:
-            if param.name in saved_params:
-                param.value = saved_params[param.name]
-
-    # 恢复优化器状态
-    if "optimizer_state" in checkpoint:
-        opt_state = checkpoint["optimizer_state"]
-        if 'v' in opt_state: optimizer.v = opt_state['v']
-        if 'm' in opt_state: optimizer.m = opt_state['m']
-
-    print(f"--- 已成功加载断点，准备从 Epoch {checkpoint['epoch']+1} 继续训练 ---")
-    return checkpoint["epoch"], checkpoint.get("best_acc", 0.0)
-    

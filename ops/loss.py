@@ -95,4 +95,19 @@ class CrossEntropy(Node):
             self.logits.clear_grad() #
         self.logits.grad += self.grad * final_grad
 
-        
+
+class MSELoss(Node):
+    """均方误差，用于回归(如 user/angle、user/throttle)。"""
+    def __init__(self, y_pred, y_true, name="MSELoss"):
+        super().__init__(y_pred, y_true, name=name)
+
+    def forward(self, y_pred_val, y_true_val):
+        self.y_pred_val = y_pred_val
+        self.y_true_val = y_true_val
+        self.value = float(np.mean((y_pred_val - y_true_val) ** 2))
+
+    def backward(self):
+        y_pred, y_true = self.parents
+        n = max(y_pred.value.size, 1)
+        g = 2.0 * (y_pred.value - y_true.value) / n
+        y_pred.grad += self.grad * g
