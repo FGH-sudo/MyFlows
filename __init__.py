@@ -12,6 +12,7 @@ from .core.tensor import Tensor
 # 导入 Graph，并暴露在顶层命名空间 (ms.Graph)
 from .core.graph import Graph
 from .core.graph_opt import apply_graph_optimizations
+from .core.device import cuda_available, configure_cuda_dll_path, get_device, set_device, to_device, use_cuda
 
 # --- 连接层 (layers) ---
 # 导入连接网络层
@@ -33,6 +34,7 @@ from .layers.resnet import (
     BasicBlock,
     ResNet18,
 )
+from .layers.vgg import VGG11, angle_to_class, vgg_fc_input_dim
 from .utils.serialization import save_checkpoint, load_checkpoint, export_onnx
 
 # --- 操作符 (ops) ---
@@ -58,9 +60,35 @@ from .ops.batchnorm import BatchNorm2d_Op, GlobalAvgPool2d_Op
 # 导入优化器 (ms.Optimizer, ms.MBGD, ms.Momentum, ms.AdaGrad, ms.RMSProp, ms.Adam)
 from .train.opt import Optimizer, MBGD, Momentum, AdaGrad, RMSProp, Adam
 
-# --- 工具和数据 (utils) ---
-# 导入数据生成器 (ms.DataGenerator)
-from .utils.data import DataGenerator, StandardScaler, augment_data, gradient_check, plot_computational_graph
+# --- 工具 (utils) ---
+from .utils.metrics import (
+    DonkeyRegressionEvaluator,
+    accuracy,
+    angle_sign_accuracy,
+    classification_report,
+    confusion_matrix,
+    mae,
+    mse,
+    multivariate_regression_metrics,
+    precision_recall_f1,
+    regression_metrics,
+    rmse,
+    r2_score,
+)
+from .utils.viz import TrainingHistory, plot_metric_series, plot_training_curves
+from .utils.tensorboard_logger import TensorBoardLogger, has_tensorboard_events
+from .utils.quantize import quantize_onnx_dynamic, quantize_onnx_static
+from .utils.transforms import (
+    ColorJitter,
+    ComposeTransform,
+    CutMix,
+    MixUp,
+    RandomCrop,
+    RandomRotation,
+    augment_chw_batch,
+    default_train_transforms,
+)
+from .data.pipeline import MultiprocessDataLoader
 
 
 # 定义当你使用 `from MyFlows import *` 时，会暴露哪些名字
@@ -68,14 +96,24 @@ from .utils.data import DataGenerator, StandardScaler, augment_data, gradient_ch
 __all__ = [
     # Core
     'Node', 'Variable', 'Tensor', 'Graph',
+    'set_device', 'get_device', 'use_cuda', 'cuda_available', 'to_device', 'configure_cuda_dll_path',
     # Layers
     'Layer', 'Dense', 'Conv2D', 'GroupedConv2D', 'DepthwiseConv2D', 'DepthwiseSeparableConv2D', 'DilatedConv2D', 'ConvTranspose2D', 'MaxPool2d', 'Flatten', 'save_checkpoint', 'load_checkpoint', 'export_onnx',
     'BatchNorm2d', 'GlobalAvgPool2d', 'BasicBlock', 'ResNet18',
+    'VGG11', 'angle_to_class', 'vgg_fc_input_dim',
     # Ops
     'Add', 'MatMul', 'PerceptionLoss', 'LogLoss', 'CrossEntropy', 'MSELoss', 'Logistic', 'Softmax', 'Tanh', 'ReLU', 'LeakyReLU', 'Conv2D_Op', 'ConvTranspose2D_Op', 'MaxPool2d_Op', 'Flatten_Op', 'effective_kernel_size', 'im2col', 'col2im',
     'BatchNorm2d_Op', 'GlobalAvgPool2d_Op',
     # Train
     'Optimizer', 'MBGD', 'Momentum', 'AdaGrad', 'RMSProp', 'Adam',
     # Utils
-    'DataGenerator', 'StandardScaler', 'augment_data', 'gradient_check', 'plot_computational_graph',
+    'mse', 'mae', 'rmse', 'r2_score', 'regression_metrics', 'multivariate_regression_metrics',
+    'angle_sign_accuracy', 'accuracy', 'confusion_matrix', 'precision_recall_f1', 'classification_report',
+    'DonkeyRegressionEvaluator',
+    'TrainingHistory', 'plot_training_curves', 'plot_metric_series',
+    'TensorBoardLogger', 'has_tensorboard_events',
+    'ComposeTransform', 'RandomCrop', 'RandomRotation', 'ColorJitter', 'MixUp', 'CutMix',
+    'default_train_transforms', 'augment_chw_batch',
+    'quantize_onnx_dynamic', 'quantize_onnx_static',
+    'MultiprocessDataLoader',
 ]

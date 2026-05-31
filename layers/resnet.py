@@ -13,7 +13,7 @@
   - Residual Add 使用现有 ``Add`` 算子(支持 4D+4D 等形状)，梯度经拓扑排序自然分叉/汇合。
 """
 
-import numpy as np
+from ..core.device import xp
 
 from ..core.node import Variable
 from ..ops.basic import Add
@@ -40,14 +40,14 @@ class BatchNorm2d(Layer):
         self.eps = float(eps)
         self.training = True
 
-        gamma_init = np.ones((self.num_features,), dtype=np.float64)
-        beta_init = np.zeros((self.num_features,), dtype=np.float64)
+        gamma_init = xp.ones((self.num_features,), dtype=xp.float64)
+        beta_init = xp.zeros((self.num_features,), dtype=xp.float64)
         self.gamma = Variable(gamma_init, trainable=True, name=f"{self.name}_gamma" if self.name else "gamma")
         self.beta = Variable(beta_init, trainable=True, name=f"{self.name}_beta" if self.name else "beta")
         self.params = [self.gamma, self.beta]
 
-        self.running_mean = np.zeros((self.num_features,), dtype=np.float64)
-        self.running_var = np.ones((self.num_features,), dtype=np.float64)
+        self.running_mean = xp.zeros((self.num_features,), dtype=xp.float64)
+        self.running_var = xp.ones((self.num_features,), dtype=xp.float64)
         self._last_op = None
 
     def forward(self, input_node):
@@ -180,8 +180,8 @@ class ResNet18(Layer):
 
         # fc 权重形状 (C, num_classes)
         fan_in = widths[3]
-        w_init = np.random.randn(fan_in, num_classes) * np.sqrt(2.0 / fan_in)
-        b_init = np.zeros((num_classes,))
+        w_init = xp.random.randn(fan_in, num_classes) * xp.sqrt(2.0 / fan_in)
+        b_init = xp.zeros((num_classes,))
         self.fc_W = Variable(w_init, trainable=True, name="fc_W")
         self.fc_b = Variable(b_init, trainable=True, name="fc_b")
 

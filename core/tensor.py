@@ -1,5 +1,7 @@
 import numpy as np
 
+from .device import asnumpy, xp
+
 
 def _to_ndarray(data, dtype=None, copy=False):
     if isinstance(data, Tensor):
@@ -10,7 +12,7 @@ def _to_ndarray(data, dtype=None, copy=False):
             array = array.copy()
         return array.copy() if copy and dtype is not None else array
 
-    array = np.asarray(data, dtype=dtype)
+    array = xp.asarray(data, dtype=dtype)
     if copy:
         array = array.copy()
     return array
@@ -32,18 +34,18 @@ class Tensor:
 
     @classmethod
     def zeros_like(cls, other):
-        return cls(np.zeros_like(cls.ensure(other).data))
+        return cls(xp.zeros_like(cls.ensure(other).data))
 
     @classmethod
     def ones_like(cls, other):
-        return cls(np.ones_like(cls.ensure(other).data))
+        return cls(xp.ones_like(cls.ensure(other).data))
 
     @classmethod
     def zeros(cls, shape, dtype=np.float64):
-        return cls(np.zeros(shape, dtype=dtype))
+        return cls(xp.zeros(shape, dtype=dtype))
 
     def numpy(self, copy=False):
-        return self.data.copy() if copy else self.data
+        return asnumpy(self.data, copy=copy)
 
     def item(self):
         return self.data.item()
@@ -65,14 +67,14 @@ class Tensor:
         return Tensor(self.data.copy())
 
     def __array__(self, dtype=None):
-        return np.asarray(self.data, dtype=dtype)
+        return asnumpy(self.data) if dtype is None else np.asarray(asnumpy(self.data), dtype=dtype)
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, key):
         value = self.data[key]
-        return Tensor(value) if isinstance(value, np.ndarray) else value
+        return Tensor(value) if hasattr(value, "shape") and hasattr(value, "dtype") else value
 
     def __setitem__(self, key, value):
         self.data[key] = _to_ndarray(value)

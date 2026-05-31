@@ -1,4 +1,4 @@
-import numpy as np
+from ..core.device import xp
 from ..core.node import Node
 
 
@@ -48,7 +48,7 @@ class BatchNorm2d_Op(Node):
             mean = self.running_mean
             var = self.running_var
 
-        inv_std = 1.0 / np.sqrt(var + self.eps)
+        inv_std = 1.0 / xp.sqrt(var + self.eps)
         self._mean = mean
         self._inv_std = inv_std
         self._x_hat = (x_val - mean.reshape(1, C, 1, 1)) * inv_std.reshape(1, C, 1, 1)
@@ -68,8 +68,8 @@ class BatchNorm2d_Op(Node):
         M = N * H * W
 
         # dgamma / dbeta
-        gamma_node.grad += np.sum(grad_y * self._x_hat, axis=(0, 2, 3))
-        beta_node.grad += np.sum(grad_y, axis=(0, 2, 3))
+        gamma_node.grad += xp.sum(grad_y * self._x_hat, axis=(0, 2, 3))
+        beta_node.grad += xp.sum(grad_y, axis=(0, 2, 3))
 
         if not self.training:
             # 推断期：running stats 不依赖 x
@@ -81,8 +81,8 @@ class BatchNorm2d_Op(Node):
         gamma_val = gamma_node.value.reshape(1, C, 1, 1)
         inv_std = self._inv_std.reshape(1, C, 1, 1)
         dx_hat = grad_y * gamma_val
-        sum_dx_hat = np.sum(dx_hat, axis=(0, 2, 3), keepdims=True)
-        sum_dx_hat_xhat = np.sum(dx_hat * self._x_hat, axis=(0, 2, 3), keepdims=True)
+        sum_dx_hat = xp.sum(dx_hat, axis=(0, 2, 3), keepdims=True)
+        sum_dx_hat_xhat = xp.sum(dx_hat * self._x_hat, axis=(0, 2, 3), keepdims=True)
         dx = (1.0 / M) * inv_std * (M * dx_hat - sum_dx_hat - self._x_hat * sum_dx_hat_xhat)
         x_node.grad += dx
 
@@ -100,4 +100,4 @@ class GlobalAvgPool2d_Op(Node):
             x_node.clear_grad()
         N, C, H, W = self._in_shape
         grad = self.grad.reshape(N, C, 1, 1) / (H * W)
-        x_node.grad += np.broadcast_to(grad, self._in_shape).copy()
+        x_node.grad += xp.broadcast_to(grad, self._in_shape).copy()

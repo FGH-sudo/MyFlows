@@ -1,0 +1,7 @@
+# GPU 训练加速（CuPy，需与本机 CUDA 版本匹配）
+# RTX 40 系列 + CUDA 12.x 常用：
+cupy-cuda12x>=13.0.0
+
+# ONNX 推理 / eval / serve_grpc / 仿真 pilot
+# pip install onnxruntime-gpu
+# 还需 CUDA 12 + cuDNN 9 的 DLL；已安装 PyTorch+cu128 时，device_runtime 会自动把 torch\lib 加入 PATH

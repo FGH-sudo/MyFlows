@@ -1,4 +1,4 @@
-import numpy as np
+from ..core.device import xp
 from ..core.node import Node
 from .activation import Softmax
 
@@ -15,14 +15,14 @@ class PerceptionLoss(Node):
         self.y_true_val = y_true_val
         
        
-        losses = np.where(self.y_true_val * self.y_pred_val < 0, -self.y_true_val * self.y_pred_val, 0)
+        losses = xp.where(self.y_true_val * self.y_pred_val < 0, -self.y_true_val * self.y_pred_val, 0)
         
         # 返回平均损失
-        self.value = np.mean(losses)
+        self.value = xp.mean(losses)
 
     def backward(self):
         # 损失对 y_pred 的梯度
-        grad_signal = np.where(self.y_true_val * self.y_pred_val < 0, -self.y_true_val, 0)
+        grad_signal = xp.where(self.y_true_val * self.y_pred_val < 0, -self.y_true_val, 0)
         
         # 梯度平均
         y_pred.grad += self.grad * (grad_signal / len(self.y_true_val))
@@ -40,19 +40,19 @@ class LogLoss(Node):
         self.x = self.y_true.value * self.y_pred.value
         
        
-        res = np.zeros_like(self.x)
+        res = xp.zeros_like(self.x)
         mask = self.x > 0
-        res[mask] = np.log1p(np.exp(-self.x[mask]))
-        res[~mask] = -self.x[~mask] + np.log1p(np.exp(self.x[~mask]))
+        res[mask] = xp.log1p(xp.exp(-self.x[mask]))
+        res[~mask] = -self.x[~mask] + xp.log1p(xp.exp(self.x[~mask]))
         
-        self.value = np.mean(res)
+        self.value = xp.mean(res)
 
     def backward(self):
         N = len(self.y_true.value)
         
         # 梯度公式说明: grad = -y_true / (1 + e^x)
        
-        exp_x = np.exp(np.clip(self.x, -500, 500)) 
+        exp_x = xp.exp(xp.clip(self.x, -500, 500)) 
         grad_x = -1.0 / (1.0 + exp_x)
         
         # 最终梯度
@@ -75,12 +75,12 @@ class CrossEntropy(Node):
         # 处理标签维度 (兼容整数索引或 One-hot)
         if y_true_val.ndim == 1 or y_true_val.shape[1] == 1:
             num_classes = logits_val.shape[1]
-            self.y_true_final = np.eye(num_classes)[y_true_val.reshape(-1).astype(int)]
+            self.y_true_final = xp.eye(num_classes)[y_true_val.reshape(-1).astype(int)]
         else:
             self.y_true_final = y_true_val
 
         # 计算 Loss 值
-        self.value = -np.mean(np.sum(self.y_true_final * np.log(self.probs + 1e-10), axis=-1))
+        self.value = -xp.mean(xp.sum(self.y_true_final * xp.log(self.probs + 1e-10), axis=-1))
 
     def backward(self):
         #计算 Loss 对 Logits 的梯度：(P - Y) / N
@@ -104,7 +104,7 @@ class MSELoss(Node):
     def forward(self, y_pred_val, y_true_val):
         self.y_pred_val = y_pred_val
         self.y_true_val = y_true_val
-        self.value = float(np.mean((y_pred_val - y_true_val) ** 2))
+        self.value = float(xp.mean((y_pred_val - y_true_val) ** 2))
 
     def backward(self):
         y_pred, y_true = self.parents

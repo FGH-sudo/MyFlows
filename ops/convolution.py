@@ -1,4 +1,4 @@
-import numpy as np
+from ..core.device import xp
 from ..core.node import Node
 
 
@@ -72,12 +72,12 @@ def _build_window_indices(channels, kernel_size, output_size, stride, dilation=(
     stride_h, stride_w = stride
     dilation_h, dilation_w = dilation
 
-    i0 = np.tile(np.repeat(np.arange(k_h) * dilation_h, k_w), channels)
-    j0 = np.tile(np.arange(k_w) * dilation_w, k_h * channels)
-    k = np.repeat(np.arange(channels), k_h * k_w).reshape(-1, 1)
+    i0 = xp.tile(xp.repeat(xp.arange(k_h) * dilation_h, k_w), channels)
+    j0 = xp.tile(xp.arange(k_w) * dilation_w, k_h * channels)
+    k = xp.repeat(xp.arange(channels), k_h * k_w).reshape(-1, 1)
 
-    i1 = (np.repeat(np.arange(out_h), out_w) * stride_h).reshape(1, -1)
-    j1 = (np.tile(np.arange(out_w), out_h) * stride_w).reshape(1, -1)
+    i1 = (xp.repeat(xp.arange(out_h), out_w) * stride_h).reshape(1, -1)
+    j1 = (xp.tile(xp.arange(out_w), out_h) * stride_w).reshape(1, -1)
 
     i = i0.reshape(-1, 1) + i1
     j = j0.reshape(-1, 1) + j1
@@ -95,9 +95,9 @@ def _scatter_patches(rows, output_shape, k_idx, i_idx, j_idx):
     num_positions = i_idx.shape[1]
 
     cols = rows.reshape(batch_size, num_positions, num_features).transpose(0, 2, 1)
-    output = np.zeros(output_shape, dtype=rows.dtype)
-    batch_idx = np.arange(batch_size)[:, None, None]
-    np.add.at(output, (batch_idx, k_idx[None, :, :], i_idx[None, :, :], j_idx[None, :, :]), cols)
+    output = xp.zeros(output_shape, dtype=rows.dtype)
+    batch_idx = xp.arange(batch_size)[:, None, None]
+    xp.add.at(output, (batch_idx, k_idx[None, :, :], i_idx[None, :, :], j_idx[None, :, :]), cols)
     return output
 
 
@@ -142,7 +142,7 @@ def im2col(x, kernel_size, stride=1, padding=0, dilation=1, context=None):
     context = _build_im2col_context(x.shape, kernel_size, stride, padding, dilation, context)
 
     pad_h, pad_w = context["padding"]
-    x_pad = np.pad(
+    x_pad = xp.pad(
         x,
         ((0, 0), (0, 0), (pad_h, pad_h), (pad_w, pad_w)),
         mode="constant",
@@ -246,7 +246,7 @@ class Conv2D_Op(Node):
                 group_out.reshape(N, out_H, out_W, out_channels_per_group).transpose(0, 3, 1, 2)
             )
 
-        self.value = np.concatenate(outputs, axis=1)
+        self.value = xp.concatenate(outputs, axis=1)
         if self.bias is not None:
             self.value = self.value + bias_val.reshape(1, C_out, 1, 1)
 
@@ -289,7 +289,7 @@ class Conv2D_Op(Node):
             x_node.grad[:, in_start:in_end] += grad_x
 
         if self.bias is not None:
-            bias_node.grad += np.sum(self.grad, axis=(0, 2, 3))
+            bias_node.grad += xp.sum(self.grad, axis=(0, 2, 3))
 
 
 class Conv2D_ReLU_Op(Conv2D_Op):
@@ -299,7 +299,7 @@ class Conv2D_ReLU_Op(Conv2D_Op):
         super().forward(x_val, kernel_val, bias_val=bias_val)
         # 使用 pre-activation 的符号生成 mask，避免数值差异
         self._relu_mask = self.value > 0
-        self.value = np.maximum(0, self.value)
+        self.value = xp.maximum(0, self.value)
 
     def backward(self):
         # 先过 ReLU 的梯度门控，再按 Conv2D_Op 反传
@@ -317,10 +317,10 @@ class Conv2D_LeakyReLU_Op(Conv2D_Op):
     def forward(self, x_val, kernel_val, bias_val=None):
         super().forward(x_val, kernel_val, bias_val=bias_val)
         self._leaky_mask = self.value > 0
-        self.value = np.where(self._leaky_mask, self.value, self.alpha * self.value)
+        self.value = xp.where(self._leaky_mask, self.value, self.alpha * self.value)
 
     def backward(self):
-        self.grad = self.grad * np.where(self._leaky_mask, 1.0, self.alpha)
+        self.grad = self.grad * xp.where(self._leaky_mask, 1.0, self.alpha)
         super().backward()
 
 
@@ -347,27 +347,27 @@ def _conv_transpose2d_accumulate_group(
     pad_h, pad_w = padding
     dilation_h, dilation_w = dilation
 
-    ih_grid = np.arange(input_h, dtype=np.int64)[:, None]
-    iw_grid = np.arange(input_w, dtype=np.int64)[None, :]
+    ih_grid = xp.arange(input_h, dtype=xp.int64)[:, None]
+    iw_grid = xp.arange(input_w, dtype=xp.int64)[None, :]
 
     for kr in range(kernel_h):
         for kc in range(kernel_w):
             oh = ih_grid * stride_h - pad_h + kr * dilation_h + 0 * iw_grid
             ow = iw_grid * stride_w - pad_w + kc * dilation_w + 0 * ih_grid
             mask = (oh >= 0) & (oh < out_h) & (ow >= 0) & (ow < out_w)
-            ih_valid, iw_valid = np.where(mask)
+            ih_valid, iw_valid = xp.where(mask)
             if ih_valid.size == 0:
                 continue
 
-            oo_h = oh[ih_valid, iw_valid].astype(np.intp, copy=False)
-            oo_w = ow[ih_valid, iw_valid].astype(np.intp, copy=False)
+            oo_h = oh[ih_valid, iw_valid].astype(xp.intp, copy=False)
+            oo_w = ow[ih_valid, iw_valid].astype(xp.intp, copy=False)
             v = oo_h.size
 
             xv = x_group[:, :, ih_valid, iw_valid]
             ks = kernel_group[:, :, kr, kc]
             contrib = xv.swapaxes(1, 2) @ ks
 
-            flat = np.arange(batch_size * v * out_channels_per_group, dtype=np.intp)
+            flat = xp.arange(batch_size * v * out_channels_per_group, dtype=xp.intp)
             n_idx = flat // (v * out_channels_per_group)
             rem = flat % (v * out_channels_per_group)
             v_idx = rem // out_channels_per_group
@@ -376,7 +376,7 @@ def _conv_transpose2d_accumulate_group(
             oh_idx = oo_h[v_idx]
             ow_idx = oo_w[v_idx]
 
-            np.add.at(output, (n_idx, c_idx, oh_idx, ow_idx), contrib.ravel())
+            xp.add.at(output, (n_idx, c_idx, oh_idx, ow_idx), contrib.ravel())
 
 
 def _conv_transpose2d_backward_group(
@@ -397,15 +397,15 @@ def _conv_transpose2d_backward_group(
     pad_h, pad_w = padding
     dilation_h, dilation_w = dilation
 
-    ih_grid = np.arange(input_h, dtype=np.int64)[:, None]
-    iw_grid = np.arange(input_w, dtype=np.int64)[None, :]
+    ih_grid = xp.arange(input_h, dtype=xp.int64)[:, None]
+    iw_grid = xp.arange(input_w, dtype=xp.int64)[None, :]
 
     for kr in range(kernel_h):
         for kc in range(kernel_w):
             oh = ih_grid * stride_h - pad_h + kr * dilation_h + 0 * iw_grid
             ow = iw_grid * stride_w - pad_w + kc * dilation_w + 0 * ih_grid
             mask = (oh >= 0) & (oh < out_h) & (ow >= 0) & (ow < out_w)
-            ih_valid, iw_valid = np.where(mask)
+            ih_valid, iw_valid = xp.where(mask)
             if ih_valid.size == 0:
                 continue
 
@@ -416,8 +416,8 @@ def _conv_transpose2d_backward_group(
             gv = grad_group[:, :, oo_h, oo_w]
 
             ks = kernel_group[:, :, kr, kc]
-            grad_x_group[:, :, ih_valid, iw_valid] += np.einsum("cg,ngv->ncv", ks, gv)
-            grad_kernel_group[:, :, kr, kc] += np.einsum("ncv,ngv->cg", xv, gv)
+            grad_x_group[:, :, ih_valid, iw_valid] += xp.einsum("cg,ngv->ncv", ks, gv)
+            grad_kernel_group[:, :, kr, kc] += xp.einsum("ncv,ngv->cg", xv, gv)
 
 
 class ConvTranspose2D_Op(Node):
@@ -468,7 +468,7 @@ class ConvTranspose2D_Op(Node):
             self.output_padding,
         )
 
-        output = np.zeros((batch_size, out_channels, out_h, out_w), dtype=x_val.dtype)
+        output = xp.zeros((batch_size, out_channels, out_h, out_w), dtype=x_val.dtype)
 
         for group_index in range(self.groups):
             in_start, in_end = _group_bounds(in_channels, self.groups, group_index)
@@ -532,7 +532,7 @@ class ConvTranspose2D_Op(Node):
             )
 
         if self.bias is not None:
-            bias_node.grad += np.sum(self.grad, axis=(0, 2, 3))
+            bias_node.grad += xp.sum(self.grad, axis=(0, 2, 3))
 
 
 class ConvTranspose2D_ReLU_Op(ConvTranspose2D_Op):
@@ -541,7 +541,7 @@ class ConvTranspose2D_ReLU_Op(ConvTranspose2D_Op):
     def forward(self, x_val, kernel_val, bias_val=None):
         super().forward(x_val, kernel_val, bias_val=bias_val)
         self._relu_mask = self.value > 0
-        self.value = np.maximum(0, self.value)
+        self.value = xp.maximum(0, self.value)
 
     def backward(self):
         self.grad = self.grad * self._relu_mask
@@ -558,10 +558,10 @@ class ConvTranspose2D_LeakyReLU_Op(ConvTranspose2D_Op):
     def forward(self, x_val, kernel_val, bias_val=None):
         super().forward(x_val, kernel_val, bias_val=bias_val)
         self._leaky_mask = self.value > 0
-        self.value = np.where(self._leaky_mask, self.value, self.alpha * self.value)
+        self.value = xp.where(self._leaky_mask, self.value, self.alpha * self.value)
 
     def backward(self):
-        self.grad = self.grad * np.where(self._leaky_mask, 1.0, self.alpha)
+        self.grad = self.grad * xp.where(self._leaky_mask, 1.0, self.alpha)
         super().backward()
 
 
@@ -586,7 +586,7 @@ class MaxPool2d_Op(Node):
         out_H, out_W = self._im2col_context["output_size"]
         patches = cols
         patches = patches.reshape(N, out_H * out_W, C, k_h * k_w).transpose(0, 2, 1, 3)
-        max_vals = np.max(patches, axis=-1)
+        max_vals = xp.max(patches, axis=-1)
         self.max_mask = patches == max_vals[..., None]
         self.value = max_vals.reshape(N, C, out_H, out_W)
 

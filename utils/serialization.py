@@ -4,6 +4,7 @@ from pathlib import Path
 
 import numpy as np
 
+from ..core.device import asnumpy, xp
 from ..core.node import Variable
 
 
@@ -72,7 +73,7 @@ def _collect_model_arrays(layers):
                 continue
             seen_params.add(id(param))
             key = f"param_{len(params):04d}_{_safe_name(getattr(param, 'name', None))}"
-            value = np.asarray(param.value)
+            value = asnumpy(param.value)
             arrays[key] = value
             param_key_by_id[id(param)] = key
             params.append({
@@ -91,10 +92,10 @@ def _collect_model_arrays(layers):
             if not hasattr(layer, attr):
                 continue
             value = getattr(layer, attr)
-            if not isinstance(value, np.ndarray):
+            if not hasattr(value, "shape"):
                 continue
             key = f"buffer_{len(buffers):04d}_{_safe_name(layer_name)}_{attr}"
-            arrays[key] = np.asarray(value)
+            arrays[key] = asnumpy(value)
             buffers.append({
                 "key": key,
                 "name": attr,
@@ -132,7 +133,7 @@ def _collect_optimizer_arrays(optimizer, param_key_by_id):
             if param_key is None or value is None:
                 continue
             array_key = f"optimizer_{state_name}_{param_key}"
-            arrays[array_key] = np.asarray(value)
+            arrays[array_key] = asnumpy(value)
             entries.append({"param_key": param_key, "array_key": array_key})
         state_meta[state_name] = entries
 
@@ -239,13 +240,16 @@ def load_checkpoint(layers, optimizer=None, filepath="checkpoint"):
                     raise ValueError(
                         f"buffer 形状不匹配 {saved['key']}: checkpoint={value.shape}, model={current.shape}"
                     )
-                current[...] = value
+                # checkpoint 为 NumPy；运行期 buffer 可能在 CuPy 上，须先转到当前设备
+                arr = xp.asarray(value, dtype=current.dtype)
+                current[...] = arr
 
         _restore_optimizer(optimizer, metadata.get("optimizer", {}), data, saved_key_to_var)
 
     epoch = int(metadata.get("epoch", -1))
     best_acc = metadata.get("best_acc", 0.0)
-    print(f"--- 已成功加载断点，准备从 Epoch {epoch + 1} 继续训练 ---")
+    if optimizer is not None:
+        print(f"--- 已成功加载断点，准备从 Epoch {epoch + 1} 继续训练 ---")
     return epoch, 0.0 if best_acc is None else float(best_acc)
 
 
@@ -273,7 +277,7 @@ def _restore_optimizer(optimizer, optimizer_meta, data, saved_key_to_var):
         for entry in entries:
             var = saved_key_to_var.get(entry["param_key"])
             if var is not None:
-                state[var] = np.asarray(data[entry["array_key"]]).copy()
+                state[var] = xp.asarray(data[entry["array_key"]]).copy()
         setattr(optimizer, state_name, state)
 
 
@@ -307,8 +311,11 @@ def export_onnx(graph, filepath, input_nodes=None, output_names=None, opset=13):
             tensor_names[node] = f"{_safe_name(getattr(node, 'name', node.__class__.__name__))}_{len(tensor_names)}"
         return tensor_names[node]
 
+    def _onnx_numpy(value):
+        return np.asarray(asnumpy(value))
+
     def tensor_dtype(value):
-        value = np.asarray(value)
+        value = _onnx_numpy(value)
         if value.dtype == np.float32:
             return TensorProto.FLOAT
         if value.dtype == np.float64:
@@ -318,11 +325,16 @@ def export_onnx(graph, filepath, input_nodes=None, output_names=None, opset=13):
         return TensorProto.FLOAT
 
     def value_info(name, value):
-        value = np.asarray(value)
+        value = _onnx_numpy(value)
+        if np.issubdtype(value.dtype, np.floating):
+            value = value.astype(np.float32, copy=False)
         return helper.make_tensor_value_info(name, tensor_dtype(value), list(value.shape))
 
     def add_initializer(name, value):
-        initializers.append(numpy_helper.from_array(np.asarray(value), name=name))
+        arr = _onnx_numpy(value)
+        if np.issubdtype(arr.dtype, np.floating):
+            arr = arr.astype(np.float32, copy=False)
+        initializers.append(numpy_helper.from_array(arr, name=name))
 
     for node in graph.sorted_nodes:
         name = tensor_name(node)

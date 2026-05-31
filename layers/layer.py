@@ -1,4 +1,4 @@
-import numpy as np
+from ..core.device import xp
 from ..core.node import Variable
 from ..ops.basic import Linear
 from ..ops.convolution import Conv2D_Op, ConvTranspose2D_Op, MaxPool2d_Op, Flatten_Op
@@ -44,8 +44,8 @@ class Dense(Layer):
         super().__init__(name=name)
         
         # 参数初始化 (He 初始化，适合 ReLU)
-        w_init = np.random.randn(input_dim, output_dim) * np.sqrt(2.0 / input_dim)
-        b_init = np.zeros((1, output_dim))
+        w_init = xp.random.randn(input_dim, output_dim) * xp.sqrt(2.0 / input_dim)
+        b_init = xp.zeros((1, output_dim))
         
         self.W = Variable(w_init, trainable=True, name=f"{self.name}_W" if self.name else "W")
         self.b = Variable(b_init, trainable=True, name=f"{self.name}_b" if self.name else "b")
@@ -93,8 +93,8 @@ class Conv2D(Layer):
             raise ValueError("out_channels must be divisible by groups")
 
         fan_in = (in_channels // groups) * kernel_h * kernel_w
-        k_init = np.random.randn(out_channels, in_channels // groups, kernel_h, kernel_w) * np.sqrt(2. / fan_in)
-        b_init = np.zeros((out_channels,))
+        k_init = xp.random.randn(out_channels, in_channels // groups, kernel_h, kernel_w) * xp.sqrt(2. / fan_in)
+        b_init = xp.zeros((out_channels,))
 
         self.kernel = Variable(k_init, trainable=True, name=f"{self.name}_kernel" if self.name else "kernel")
         self.b = Variable(b_init, trainable=True, name=f"{self.name}_bias" if self.name else "bias")
@@ -292,8 +292,8 @@ class ConvTranspose2D(Layer):
             raise ValueError("output_padding must be smaller than max(stride, dilation)")
 
         fan_in = (out_channels // groups) * kernel_h * kernel_w
-        k_init = np.random.randn(in_channels, out_channels // groups, kernel_h, kernel_w) * np.sqrt(2. / fan_in)
-        b_init = np.zeros((out_channels,))
+        k_init = xp.random.randn(in_channels, out_channels // groups, kernel_h, kernel_w) * xp.sqrt(2. / fan_in)
+        b_init = xp.zeros((out_channels,))
 
         self.kernel = Variable(k_init, trainable=True, name=f"{self.name}_kernel" if self.name else "kernel")
         self.b = Variable(b_init, trainable=True, name=f"{self.name}_bias" if self.name else "bias")

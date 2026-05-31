@@ -1,4 +1,4 @@
-import numpy as np
+from ..core.device import xp
 from ..core.node import Variable
 from ..core.graph import Graph
 from ..core.tensor import Tensor
@@ -56,7 +56,7 @@ class Optimizer:
             for node, gradient in gradients.items():
                 if gradient is None:
                     continue  # 梯度为空，跳过  
-                gradient = np.asarray(Tensor.ensure(gradient).data)
+                gradient = xp.asarray(Tensor.ensure(gradient).data)
                 if node in self.acc_gradient:
                     self.acc_gradient[node] += gradient
                 else:
@@ -64,7 +64,7 @@ class Optimizer:
         else:
             # 直接设置梯度
             for node, gradient in gradients.items():
-                self.acc_gradient[node] = None if gradient is None else np.asarray(Tensor.ensure(gradient).data)
+                self.acc_gradient[node] = None if gradient is None else xp.asarray(Tensor.ensure(gradient).data)
 
     def update(self, var_gradients=None):
         """
@@ -152,11 +152,11 @@ class AdaGrad(Optimizer):
                 # 获取变量平均梯度
                 grad = self.get_gradient(node)
                 if node not in self.s:
-                    self.s[node] = np.power(grad, 2)
+                    self.s[node] = xp.power(grad, 2)
                 else:
-                    self.s[node] += np.power(grad, 2)
+                    self.s[node] += xp.power(grad, 2)
                 # 更新变量值
-                node.value -= self.learning_rate * grad / (np.sqrt(self.s[node] + self.eps))
+                node.value -= self.learning_rate * grad / (xp.sqrt(self.s[node] + self.eps))
 
 
 class RMSProp(Optimizer):
@@ -172,11 +172,11 @@ class RMSProp(Optimizer):
                 # 获取变量平均梯度
                 grad = self.get_gradient(node)
                 if node not in self.s:
-                    self.s[node] = np.power(grad, 2)
+                    self.s[node] = xp.power(grad, 2)
                 else:
-                    self.s[node] = self.beta * self.s[node] + (1 - self.beta) * np.power(grad, 2)
+                    self.s[node] = self.beta * self.s[node] + (1 - self.beta) * xp.power(grad, 2)
                 # 更新变量值
-                node.value -= self.learning_rate * grad / (np.sqrt(self.s[node] + self.eps))
+                node.value -= self.learning_rate * grad / (xp.sqrt(self.s[node] + self.eps))
 
 
 class Adam(Optimizer):
@@ -199,16 +199,16 @@ class Adam(Optimizer):
                 grad = self.get_gradient(node)
                 if node not in self.s:
                     self.v[node] = grad
-                    self.s[node] = np.power(grad, 2)
+                    self.s[node] = xp.power(grad, 2)
                 else:
                     self.v[node] = self.beta_1 * self.v[node] + (1 - self.beta_1) * grad
-                    self.s[node] = self.beta_2 * self.s[node] + (1 - self.beta_2) * np.power(grad, 2)
+                    self.s[node] = self.beta_2 * self.s[node] + (1 - self.beta_2) * xp.power(grad, 2)
 
                 # 修正偏差(Bias Correction)
-                v_correct = self.v[node] / (1 - np.power(self.beta_1, self.t))
-                s_correct = self.s[node] / (1 - np.power(self.beta_2, self.t))
+                v_correct = self.v[node] / (1 - xp.power(self.beta_1, self.t))
+                s_correct = self.s[node] / (1 - xp.power(self.beta_2, self.t))
                 
                 # 更新变量值
-                node.value -= self.learning_rate * v_correct / (np.sqrt(s_correct) + self.eps)
+                node.value -= self.learning_rate * v_correct / (xp.sqrt(s_correct) + self.eps)
 
                 

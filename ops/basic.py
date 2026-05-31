@@ -1,4 +1,4 @@
-import numpy as np
+from ..core.device import xp
 from ..core.node import Node
 
 class Add(Node):
@@ -32,19 +32,19 @@ class Add(Node):
                 if shape_dim == 1 and grad_dim != 1
             )
             if axes:
-                grad = np.sum(grad, axis=axes, keepdims=True)
+                grad = xp.sum(grad, axis=axes, keepdims=True)
         return grad.reshape(original_shape)
 
 
 class MatMul(Node):
     def forward(self, a, b):
-        self.value = np.dot(a, b)
+        self.value = xp.dot(a, b)
 
     def backward(self):
         a, b = self.parents
             
-        a.grad += np.dot(self.grad, b.value.T)
-        b.grad += np.dot(a.value.T, self.grad)
+        a.grad += xp.dot(self.grad, b.value.T)
+        b.grad += xp.dot(a.value.T, self.grad)
 
 
 class Linear(Node):
@@ -54,21 +54,21 @@ class Linear(Node):
         self.x_shape = x.shape
         self.w_shape = w.shape
         self.b_shape = b.shape
-        self.value = np.dot(x, w) + b
+        self.value = xp.dot(x, w) + b
 
     def backward(self):
         x, w, b = self.parents
-        x.grad += np.dot(self.grad, w.value.T)
-        w.grad += np.dot(x.value.T, self.grad)
+        x.grad += xp.dot(self.grad, w.value.T)
+        w.grad += xp.dot(x.value.T, self.grad)
 
         # bias 的梯度：将上游梯度按被广播维度求和，恢复成原始 b 形状
         grad = self.grad
         # 尽量对齐到 b 的 ndim，处理 (out,) / (1,out) 这类常见 bias
         while grad.ndim > b.value.ndim:
-            grad = np.sum(grad, axis=0)
+            grad = xp.sum(grad, axis=0)
         if grad.shape != b.value.shape:
             axes = tuple(i for i, (gd, bd) in enumerate(zip(grad.shape, b.value.shape)) if bd == 1 and gd != 1)
             if axes:
-                grad = np.sum(grad, axis=axes, keepdims=True)
+                grad = xp.sum(grad, axis=axes, keepdims=True)
         b.grad += grad.reshape(b.value.shape)
 

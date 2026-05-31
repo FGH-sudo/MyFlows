@@ -1,0 +1,4 @@
+# TensorBoard 训练可视化（SummaryWriter 需 torch）
+tensorboard>=2.14.0
+torch>=2.0.0
+torchvision>=0.15.0

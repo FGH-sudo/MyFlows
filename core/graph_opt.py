@@ -101,29 +101,107 @@ def fold_constant_adds(target_node: Node) -> tuple[Node, int]:
     return current_root, total_folded
 
 
+def _fold_bn_weights(conv_op, bn_op) -> None:
+    """将 eval 态 BN 参数折入 Conv 的 kernel/bias Variable（就地修改）。"""
+    from ..core.device import xp
+    from ..ops.convolution import Conv2D_Op
+
+    if not isinstance(conv_op, Conv2D_Op):
+        raise TypeError("fold_bn_into_conv 仅支持 Conv2D_Op")
+    kernel_var = conv_op.parents[1]
+    gamma_var, beta_var = bn_op.parents[1], bn_op.parents[2]
+    W = xp.asarray(kernel_var.value)
+    gamma = xp.asarray(gamma_var.value)
+    beta = xp.asarray(beta_var.value)
+    mean = xp.asarray(bn_op.running_mean)
+    var = xp.asarray(bn_op.running_var)
+    eps = float(bn_op.eps)
+    scale = gamma / xp.sqrt(var + eps)
+    C_out = int(W.shape[0])
+    if conv_op.bias is not None:
+        bias_var = conv_op.parents[2]
+        b = xp.asarray(bias_var.value)
+    else:
+        b = xp.zeros((C_out,), dtype=W.dtype)
+    W_new = W * scale.reshape(C_out, 1, 1, 1)
+    b_new = (b - mean) * scale + beta
+    kernel_var.value = W_new
+    if conv_op.bias is not None:
+        bias_var.value = b_new
+    else:
+        from .node import Variable
+
+        new_bias = Variable(b_new, trainable=True, name=f"{getattr(conv_op, 'name', 'conv')}_folded_bias")
+        conv_op.parents.append(new_bias)
+        conv_op.bias = new_bias
+
+
+def fold_bn_into_conv(target_node: Node) -> tuple[Node, int]:
+    """
+    推理态：将紧邻的 ``Conv2D_Op -> BatchNorm2d_Op(training=False)`` 折叠为单个 Conv。
+
+    修改 Conv 的 weight/bias Variable，并用 ``replace_node`` 跳过 BN。
+    """
+    from ..ops.batchnorm import BatchNorm2d_Op
+    from ..ops.convolution import Conv2D_Op
+
+    folded = 0
+    root = target_node
+    for node in list(_topo_sort(root)):
+        if not isinstance(node, BatchNorm2d_Op):
+            continue
+        if bool(getattr(node, "training", True)):
+            continue
+        if not node.parents:
+            continue
+        conv = node.parents[0]
+        if not isinstance(conv, Conv2D_Op):
+            continue
+        if len(conv.parents) < 2:
+            continue
+        _fold_bn_weights(conv, node)
+        if node is root:
+            root = conv
+        replace_node(node, conv)
+        folded += 1
+    return root, folded
+
+
 def apply_graph_optimizations(
     target_node: Node,
     *,
+    mode: str = "train",
     fold_constants: bool = True,
     fuse_linear: bool = True,
     fuse_activations: bool = True,
+    fold_bn: bool | None = None,
 ) -> tuple[Node, dict]:
     """
     对以 ``target_node`` 为输出的子图应用构建期优化。
 
+    ``mode``: ``"train"`` 或 ``"inference"``。推理模式下默认启用 BN 折叠。
+
     返回 ``(root_node, stats)``。``root_node`` 可能与传入的 ``target_node`` 不同
     （例如根被常量折叠替换时）。
     """
-    stats: dict = {"constant_folds": 0, "linear_fusions": 0, "conv_act_fusions": 0}
+    if fold_bn is None:
+        fold_bn = str(mode).lower() == "inference"
+
+    stats: dict = {
+        "constant_folds": 0,
+        "linear_fusions": 0,
+        "conv_act_fusions": 0,
+        "bn_folds": 0,
+    }
     root = target_node
     if fold_constants:
         root, stats["constant_folds"] = fold_constant_adds(root)
-    # 算子融合：MatMul+Add -> Linear
     if fuse_linear:
         root, stats["linear_fusions"] = fuse_linear_ops(root)
-    # 算子融合：Conv/Deconv + {ReLU, LeakyReLU}
     if fuse_activations:
         root, stats["conv_act_fusions"] = fuse_conv_activation_ops(root)
+    if fold_bn:
+        root, stats["bn_folds"] = fold_bn_into_conv(root)
     return root, stats
 
 
