@@ -92,9 +92,10 @@ class VGG11(Layer):
             self.params.extend(layer.params)
             self.sub_layers.append(layer)
         self.params.extend(self.flatten.params)
+        self.sub_layers.append(self.flatten)
         for fc in (self.fc1, self.fc2, self.fc3):
             self.params.extend(fc.params)
-            self.sub_layers.extend([self.fc1, self.fc2, self.fc3])
+            self.sub_layers.append(fc)
 
     def forward(self, input_node):
         x = input_node

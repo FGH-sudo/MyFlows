@@ -68,6 +68,9 @@ class MultiprocessDataLoader:
     return (n + self.batch_size - 1) // self.batch_size
 
   def _iter_inprocess(self) -> Iterator:
+    if self.load_fn is None:
+      raise ValueError("MultiprocessDataLoader 需要非空的 load_fn")
+
     import random
 
     indices = list(range(len(self.dataset)))
@@ -88,7 +91,9 @@ class MultiprocessDataLoader:
       yield batch_x, batch_meta
 
   def __iter__(self) -> Iterator:
-    if self.num_workers == 0 or self.load_fn is None:
+    if self.load_fn is None:
+      raise ValueError("MultiprocessDataLoader 需要非空的 load_fn")
+    if self.num_workers == 0:
       yield from self._iter_inprocess()
       return
 

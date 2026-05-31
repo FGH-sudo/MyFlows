@@ -103,7 +103,7 @@ def fold_constant_adds(target_node: Node) -> tuple[Node, int]:
 
 def _fold_bn_weights(conv_op, bn_op) -> None:
     """将 eval 态 BN 参数折入 Conv 的 kernel/bias Variable（就地修改）。"""
-    from ..core.device import xp
+    from .device import xp
     from ..ops.convolution import Conv2D_Op
 
     if not isinstance(conv_op, Conv2D_Op):
@@ -129,8 +129,6 @@ def _fold_bn_weights(conv_op, bn_op) -> None:
     if conv_op.bias is not None:
         bias_var.value = b_new
     else:
-        from .node import Variable
-
         new_bias = Variable(b_new, trainable=True, name=f"{getattr(conv_op, 'name', 'conv')}_folded_bias")
         conv_op.parents.append(new_bias)
         conv_op.bias = new_bias
