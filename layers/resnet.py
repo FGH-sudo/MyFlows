@@ -205,22 +205,28 @@ class ResNet18(Layer):
         return blocks
 
     def forward(self, input_node):
+        self._last_feature_nodes = {}
         # stem
         x = self.stem_conv(input_node)
         x = self.stem_bn(x)
         x = ReLU(x)
+        self._last_feature_nodes["stem"] = x
         if self.stem_type == "imagenet":
             from ..ops.convolution import MaxPool2d_Op
             x = MaxPool2d_Op(x, kernel_size=3, stride=2)
 
         for block in self.layer1:
             x = block(x)
+        self._last_feature_nodes["layer1"] = x
         for block in self.layer2:
             x = block(x)
+        self._last_feature_nodes["layer2"] = x
         for block in self.layer3:
             x = block(x)
+        self._last_feature_nodes["layer3"] = x
         for block in self.layer4:
             x = block(x)
+        self._last_feature_nodes["layer4"] = x
 
         x = self.avgpool(x)
         x = Linear(x, self.fc_W, self.fc_b)

@@ -41,6 +41,31 @@ class TensorBoardLogger:
             return
         self._writer.add_scalars(main_tag, dict(tag_scalar_dict), int(step))
 
+    def log_scalar_dict(self, prefix: str, values: Mapping[str, float], step: int) -> None:
+        if not self.active:
+            return
+        clean_prefix = str(prefix).strip("/")
+        for key, value in values.items():
+            self.log_scalar(f"{clean_prefix}/{key}", float(value), step)
+
+    def log_histogram(self, tag: str, values, step: int) -> None:
+        if not self.active:
+            return
+        arr = np.asarray(values)
+        if arr.size == 0:
+            return
+        self._writer.add_histogram(tag, arr, int(step))
+
+    def log_text(self, tag: str, text: str, step: int = 0) -> None:
+        if not self.active:
+            return
+        self._writer.add_text(tag, str(text), int(step))
+
+    def log_figure(self, tag: str, figure, step: int, *, close: bool = False) -> None:
+        if not self.active:
+            return
+        self._writer.add_figure(tag, figure, int(step), close=close)
+
     def log_image(
         self,
         tag: str,

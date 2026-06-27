@@ -98,9 +98,14 @@ class VGG11(Layer):
             self.sub_layers.append(fc)
 
     def forward(self, input_node):
+        self._last_feature_nodes = {}
         x = input_node
+        stage = 0
         for layer in self.feature_layers:
             x = layer(x)
+            if isinstance(layer, MaxPool2d):
+                stage += 1
+                self._last_feature_nodes[f"stage{stage}"] = x
         x = self.flatten(x)
         x = self.fc1(x)
         x = self.fc2(x)

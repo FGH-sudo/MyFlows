@@ -21,7 +21,6 @@ def _worker_loop(
     transform_fn: Callable | None,
     stop_event: mp.Event,
 ):
-  batch_x, batch_meta = [], []
   while not stop_event.is_set():
     try:
       idx = index_queue.get(timeout=0.5)
@@ -32,13 +31,7 @@ def _worker_loop(
     sample = load_fn(dataset[idx])
     if transform_fn is not None:
       sample = transform_fn(sample)
-    batch_x.append(sample[0])
-    batch_meta.append(sample[1] if len(sample) > 1 else None)
-    if len(batch_x) >= batch_size:
-      out_queue.put((batch_x, batch_meta))
-      batch_x, batch_meta = [], []
-  if batch_x:
-    out_queue.put((batch_x, batch_meta))
+    out_queue.put(sample)
 
 
 class MultiprocessDataLoader:
@@ -131,16 +124,23 @@ class MultiprocessDataLoader:
       p.start()
       workers.append(p)
 
-    produced = 0
-    total_batches = len(self)
+    received = 0
+    total_samples = len(indices)
+    batch_x, batch_meta = [], []
     try:
-      while produced < total_batches:
+      while received < total_samples:
         try:
-          batch = out_q.get(timeout=30.0)
+          sample = out_q.get(timeout=30.0)
         except queue.Empty:
           break
-        produced += 1
-        yield batch
+        received += 1
+        batch_x.append(sample[0])
+        batch_meta.append(sample[1] if len(sample) > 1 else None)
+        if len(batch_x) >= self.batch_size:
+          yield batch_x, batch_meta
+          batch_x, batch_meta = [], []
+      if batch_x:
+        yield batch_x, batch_meta
     finally:
       stop_event.set()
       for p in workers:
