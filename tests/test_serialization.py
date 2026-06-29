@@ -3,6 +3,8 @@
 
 import sys
 import tempfile
+import json
+import unittest
 from pathlib import Path
 
 PROJECT_PARENT = Path(__file__).resolve().parents[2]
@@ -31,11 +33,32 @@ def test_json_npz_checkpoint_roundtrip():
         layer.W.value = np.zeros_like(layer.W.value)
         layer.b.value = np.ones_like(layer.b.value)
 
-        epoch, best_acc = load_checkpoint([layer], filepath=base)
+        epoch, saved_score = load_checkpoint([layer], filepath=base)
         assert epoch == 7
-        assert best_acc == 0.8
+        assert saved_score == 0.8
         assert np.allclose(layer.W.value, original_w)
         assert np.allclose(layer.b.value, original_b)
+
+
+class CheckpointScoreMetadataTest(unittest.TestCase):
+    def test_json_npz_checkpoint_stores_loss_without_accuracy_field(self):
+        layer = Dense(3, 2, name="dense")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / "regression_checkpoint"
+            json_path, _ = save_checkpoint([layer], epoch=3, loss=0.125, filepath=base)
+
+            with Path(json_path).open("r", encoding="utf-8") as f:
+                metadata = json.load(f)
+
+            self.assertEqual(metadata["score_name"], "loss")
+            self.assertEqual(metadata["score_value"], 0.125)
+            self.assertEqual(metadata["best_loss"], 0.125)
+            self.assertNotIn("best_acc", metadata)
+
+            epoch, best_loss = load_checkpoint([layer], filepath=base)
+            self.assertEqual(epoch, 3)
+            self.assertEqual(best_loss, 0.125)
 
 
 def test_batchnorm_buffers_checkpoint_roundtrip():

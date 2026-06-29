@@ -16,15 +16,14 @@
 
 ## 主要变更
 
-### 1) 新增 VGG-11 分类网络
+### 1) 新增 VGG-11 回归网络
 
 - 位置：`layers/vgg.py`
 - 新增：
-  - `VGG11`：5 段 Conv+ReLU + MaxPool，通道 64→128→256→512→512，三层全连接 4096→4096→`num_classes`
+  - `VGG11`：5 段 Conv+ReLU + MaxPool，通道 64→128→256→512→512，三层全连接 4096→4096→`output_dim`
   - `vgg_fc_input_dim()`：根据输入高宽推算展平后特征维度
-  - `angle_to_class()`：将连续转向角离散为 3/5 类或其它分箱标签
 - 默认假设小图输入（`image_h=120`, `image_w=160`），便于 Donkey 数据集。
-- 顶层 `__init__.py` 已导出 `VGG11`、`angle_to_class`、`vgg_fc_input_dim`。
+- 顶层 `__init__.py` 已导出 `VGG11`、`vgg_fc_input_dim`。
 
 ### 2) 统一评估指标模块
 

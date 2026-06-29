@@ -49,7 +49,7 @@
 
 | 模块 | 路径 | 说明 |
 |------|------|------|
-| VGG-11 | `layers/vgg.py` | Donkey 小图分类 |
+| VGG-11 | `layers/vgg.py` | Donkey 小图回归 |
 | 指标 | `utils/metrics.py` | 回归/分类 + `DonkeyRegressionEvaluator` |
 | 增强 | `utils/transforms.py` | Crop/Rotation/ColorJitter/MixUp/CutMix |
 | 可视化 | `utils/viz.py`、`utils/tensorboard_logger.py` | PNG 曲线 + TensorBoard |

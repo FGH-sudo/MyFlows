@@ -153,16 +153,25 @@ def test_basicblock_forward_backward():
 
 def test_resnet18_cifar_forward():
     np.random.seed(4)
-    model = ResNet18(in_channels=3, num_classes=10, stem="cifar")
+    model = ResNet18(in_channels=3, output_dim=10, stem="cifar")
     x = Variable(np.random.randn(2, 3, 32, 32), name="x")
     out = model(x)
     g = Graph(out)
     g.forward()
     assert out.value.shape == (2, 10), f"got {out.value.shape}"
+    assert model.output_dim == 10
+
+
+def test_resnet18_rejects_num_classes_keyword():
+    try:
+        ResNet18(in_channels=3, num_classes=10, stem="cifar")
+    except TypeError:
+        return
+    raise AssertionError("ResNet18 should use output_dim instead of num_classes")
 
 
 def test_resnet18_train_eval_toggle():
-    model = ResNet18(in_channels=3, num_classes=10, stem="cifar")
+    model = ResNet18(in_channels=3, output_dim=10, stem="cifar")
     x = Variable(np.random.randn(1, 3, 32, 32), name="x")
     out = model(x)
     Graph(out).forward()
@@ -187,5 +196,6 @@ if __name__ == "__main__":
     test_globalavgpool2d_gradcheck(); print("OK: gap gradcheck")
     test_basicblock_forward_backward(); print("OK: basicblock")
     test_resnet18_cifar_forward(); print("OK: resnet18 cifar forward")
+    test_resnet18_rejects_num_classes_keyword(); print("OK: num_classes rejected")
     test_resnet18_train_eval_toggle(); print("OK: train/eval toggle")
     print("All tests passed.")

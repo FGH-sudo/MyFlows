@@ -133,12 +133,26 @@ class TrainingDashboard:
             if images:
                 self.tb.log_images_grid(f"activations/{last_name}/feature_grid", images, step, nrow=4)
 
-    def log_epoch(self, epoch: int, *, loss: float, learning_rate: float, epoch_time_s: float, accuracy: float | None = None) -> None:
+    def log_epoch(
+        self,
+        epoch: int,
+        *,
+        loss: float,
+        learning_rate: float,
+        epoch_time_s: float,
+        accuracy: float | None = None,
+        validation_loss: float | None = None,
+        validation_accuracy: float | None = None,
+    ) -> None:
         if not self.active:
             return
         self.tb.log_scalar("train/loss_epoch", loss, epoch)
         if accuracy is not None:
             self.tb.log_scalar("train/accuracy_epoch", accuracy, epoch)
+        if validation_loss is not None:
+            self.tb.log_scalar("val/loss_epoch", validation_loss, epoch)
+        if validation_accuracy is not None:
+            self.tb.log_scalar("val/accuracy_epoch", validation_accuracy, epoch)
         self.tb.log_scalar("train/lr", learning_rate, epoch)
         self.tb.log_scalar("train/epoch_time_s", epoch_time_s, epoch)
 

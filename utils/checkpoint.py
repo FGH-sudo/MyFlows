@@ -160,7 +160,22 @@ def _collect_optimizer_arrays(optimizer, param_key_by_id):
     }
 
 
-def save_checkpoint(layers, optimizer=None, epoch=0, acc=0.0, filepath="checkpoint"):
+def _resolve_score(acc=None, loss=None, score=None, score_name=None):
+    if loss is not None:
+        return "loss", float(loss), "best_loss"
+    if score is not None:
+        name = "score" if score_name is None else str(score_name)
+        key = "best_loss" if name == "loss" else None
+        if name in ("acc", "accuracy"):
+            name = "accuracy"
+            key = "best_acc"
+        return name, float(score), key
+    if acc is not None:
+        return "accuracy", float(acc), "best_acc"
+    return None, None, None
+
+
+def save_checkpoint(layers, optimizer=None, epoch=0, acc=None, filepath="checkpoint", *, loss=None, score=None, score_name=None):
     """以 JSON + NPZ 格式保存模型权重、BN buffer 与优化器状态。"""
     json_path, npz_path = resolve_checkpoint_paths(filepath)
     json_path.parent.mkdir(parents=True, exist_ok=True)
@@ -172,13 +187,18 @@ def save_checkpoint(layers, optimizer=None, epoch=0, acc=0.0, filepath="checkpoi
     arrays = {}
     arrays.update(model_arrays)
     arrays.update(opt_arrays)
+    metric_name, metric_value, legacy_metric_key = _resolve_score(
+        acc=acc,
+        loss=loss,
+        score=score,
+        score_name=score_name,
+    )
 
     metadata = {
         "format": "MyFlows checkpoint",
         "version": _CHECKPOINT_VERSION,
         "array_file": npz_path.name,
         "epoch": int(epoch),
-        "best_acc": None if acc is None else float(acc),
         "model": {
             "layers": layers_meta,
             "params": params,
@@ -186,6 +206,11 @@ def save_checkpoint(layers, optimizer=None, epoch=0, acc=0.0, filepath="checkpoi
         },
         "optimizer": optimizer_meta,
     }
+    if metric_name is not None:
+        metadata["score_name"] = metric_name
+        metadata["score_value"] = metric_value
+        if legacy_metric_key is not None:
+            metadata[legacy_metric_key] = metric_value
 
     with json_path.open("w", encoding="utf-8") as f:
         json.dump(metadata, f, ensure_ascii=False, indent=2)
@@ -193,8 +218,16 @@ def save_checkpoint(layers, optimizer=None, epoch=0, acc=0.0, filepath="checkpoi
     return str(json_path), str(npz_path)
 
 
+def _read_checkpoint_score(metadata):
+    if "score_value" in metadata:
+        return metadata.get("score_value")
+    if "best_loss" in metadata:
+        return metadata.get("best_loss")
+    return metadata.get("best_acc", 0.0)
+
+
 def load_checkpoint(layers, optimizer=None, filepath="checkpoint"):
-    """加载 JSON + NPZ checkpoint，并返回 ``(epoch, best_acc)``。"""
+    """Load JSON+NPZ checkpoint and return ``(epoch, score_value)``."""
     json_path, npz_path = resolve_checkpoint_paths(filepath)
     if not json_path.exists() or not npz_path.exists():
         print("未发现 Checkpoint，从零开始训练。")
@@ -240,10 +273,10 @@ def load_checkpoint(layers, optimizer=None, filepath="checkpoint"):
         _restore_optimizer(optimizer, metadata.get("optimizer", {}), data, saved_key_to_var)
 
     epoch = int(metadata.get("epoch", -1))
-    best_acc = metadata.get("best_acc", 0.0)
+    score_value = _read_checkpoint_score(metadata)
     if optimizer is not None:
         print(f"--- 已成功加载断点，准备从 Epoch {epoch + 1} 继续训练 ---")
-    return epoch, 0.0 if best_acc is None else float(best_acc)
+    return epoch, 0.0 if score_value is None else float(score_value)
 
 
 def _param_by_live_record(layers, live_record):

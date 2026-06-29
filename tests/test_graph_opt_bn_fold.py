@@ -16,7 +16,7 @@ from MyFlows.ops.convolution import Conv2D_Op
 
 class TestGraphOptBnFold(unittest.TestCase):
   def test_resnet18_eval_fold_matches(self):
-    model = ResNet18(in_channels=3, num_classes=5, stem="cifar", base_width=16)
+    model = ResNet18(in_channels=3, output_dim=5, stem="cifar", base_width=16)
     model.eval()
     rng = np.random.default_rng(0)
     x_np = rng.standard_normal((1, 3, 32, 32), dtype=np.float64) * 0.1
@@ -36,7 +36,7 @@ class TestGraphOptBnFold(unittest.TestCase):
     np.testing.assert_allclose(y1, y2, rtol=1e-4, atol=1e-4)
 
   def test_node_count_decreases(self):
-    model = ResNet18(in_channels=3, num_classes=5, stem="cifar", base_width=16)
+    model = ResNet18(in_channels=3, output_dim=5, stem="cifar", base_width=16)
     model.eval()
     x = Variable(xp.zeros((1, 3, 32, 32)), name="x")
     out = model(x)

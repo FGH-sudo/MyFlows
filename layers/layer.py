@@ -2,6 +2,8 @@ from ..core.device import xp
 from ..core.node import Variable
 from ..ops.basic import Linear
 from ..ops.convolution import Conv2D_Op, ConvTranspose2D_Op, MaxPool2d_Op, Flatten_Op
+from ..ops.dropout import Dropout_Op
+from ..utils.initializers import make_initializer
 
 
 def _pair(value, name, allow_zero=False):
@@ -40,11 +42,11 @@ class Layer:
 
 class Dense(Layer):
     """全连接层：实现 Z = XW + b"""
-    def __init__(self, input_dim, output_dim, activation=None, name=None):
+    def __init__(self, input_dim, output_dim, activation=None, name=None, initializer=None):
         super().__init__(name=name)
         
-        # 参数初始化 (He 初始化，适合 ReLU)
-        w_init = xp.random.randn(input_dim, output_dim) * xp.sqrt(2.0 / input_dim)
+        init = make_initializer(initializer)
+        w_init = xp.asarray(init((input_dim, output_dim)))
         b_init = xp.zeros((1, output_dim))
         
         self.W = Variable(w_init, trainable=True, name=f"{self.name}_W" if self.name else "W")
@@ -76,6 +78,7 @@ class Conv2D(Layer):
         activation=None,
         fuse_activation=True,
         name=None,
+        initializer=None,
     ):
         super().__init__(name=name)
 
@@ -93,7 +96,8 @@ class Conv2D(Layer):
             raise ValueError("out_channels must be divisible by groups")
 
         fan_in = (in_channels // groups) * kernel_h * kernel_w
-        k_init = xp.random.randn(out_channels, in_channels // groups, kernel_h, kernel_w) * xp.sqrt(2. / fan_in)
+        init = make_initializer(initializer)
+        k_init = xp.asarray(init((out_channels, in_channels // groups, kernel_h, kernel_w)))
         b_init = xp.zeros((out_channels,))
 
         self.kernel = Variable(k_init, trainable=True, name=f"{self.name}_kernel" if self.name else "kernel")
@@ -354,3 +358,29 @@ class MaxPool2d(Layer):
 class Flatten(Layer):
     def forward(self, input_node):
         return Flatten_Op(input_node)
+
+
+class Dropout(Layer):
+    """Inverted dropout layer. Active in train mode and identity in eval mode."""
+
+    def __init__(self, p=0.5, seed=None, name=None):
+        super().__init__(name=name)
+        self.p = float(p)
+        if self.p < 0.0 or self.p >= 1.0:
+            raise ValueError("dropout p must be in [0, 1)")
+        self.seed = seed
+        self.training = True
+        self._last_op = None
+
+    def forward(self, input_node):
+        op = Dropout_Op(input_node, p=self.p, training=self.training, seed=self.seed, name=self.name)
+        self._last_op = op
+        return op
+
+    def train(self, mode=True):
+        self.training = bool(mode)
+        if self._last_op is not None:
+            self._last_op.training = self.training
+
+    def eval(self):
+        self.train(False)
