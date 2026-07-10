@@ -66,7 +66,7 @@
 
 ## 父仓库 testmyflow（与本 git 仓库同级，需单独管理）
 
-以下文件位于 `D:\DL\testmyflow\` 根目录，**不在 MyFlows 子仓库的 git 跟踪范围内**，联调时请一并备份或在上级目录初始化仓库：
+以下文件位于父仓库根目录，**不在 MyFlows 子仓库的 git 跟踪范围内**，联调时请一并备份或在上级目录初始化仓库：
 
 | 类别 | 路径 |
 |------|------|
@@ -106,7 +106,7 @@
 
 ## 验证结果
 
-在 `PYTHONPATH` 包含 `D:\DL\testmyflow` 的前提下：
+在 `PYTHONPATH` 包含父仓库根目录的前提下：
 
 ```bash
 python -m unittest MyFlows.tests.test_graph_opt_bn_fold -v
