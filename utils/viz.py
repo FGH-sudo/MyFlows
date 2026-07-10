@@ -8,10 +8,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Sequence
 
-import matplotlib
 
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # noqa: E402
+def _pyplot():
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    return plt
 
 
 @dataclass
@@ -71,6 +75,7 @@ def plot_training_curves(
     out_dir = Path(save_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     saved: list[Path] = []
+    plt = _pyplot()
 
     if history.step_losses:
         fig, ax = plt.subplots(figsize=(8, 4))
@@ -146,6 +151,7 @@ def plot_metric_series(
     p = Path(save_path)
     p.parent.mkdir(parents=True, exist_ok=True)
     xs = list(x) if x is not None else list(range(len(values)))
+    plt = _pyplot()
 
     fig, ax = plt.subplots(figsize=(8, 4))
     ax.plot(xs, list(values), linewidth=1.2)
