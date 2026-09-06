@@ -25,7 +25,9 @@ PYTHON_SITE = Path(next(iter(_nvidia_spec.submodule_search_locations))).parent i
 TORCH_SITE = Path(next(iter(_torch_spec.submodule_search_locations))).parent if _torch_spec else Path()
 _MISSING = Path("__missing_native_dependency__")
 CUBLAS_DLL = next((PYTHON_SITE / "nvidia" / "cublas" / "bin").glob("cublas64_*.dll"), _MISSING)
-NVRTC_DLL = next((TORCH_SITE / "torch" / "lib").glob("nvrtc64_*.dll"), _MISSING)
+_NVRTC_DIR = TORCH_SITE / "torch" / "lib"
+NVRTC_DLL = (_NVRTC_DIR / "nvrtc64_120_0.dll" if (_NVRTC_DIR / "nvrtc64_120_0.dll").exists()
+             else next(_NVRTC_DIR.glob("nvrtc64_*.dll"), _MISSING))
 _DLL_DIR_HANDLES = []
 
 

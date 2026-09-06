@@ -189,8 +189,10 @@ bool ensure_initialized(const char* cublas_path, const char* nvrtc_path) {
     std::lock_guard<std::mutex> lock(init_mutex);
     if (initialized) return true;
     driver_module = LoadLibraryA("nvcuda.dll");
-    nvrtc_module = LoadLibraryA(nvrtc_path);
-    cublas_module = LoadLibraryA(cublas_path);
+    nvrtc_module = LoadLibraryExA(nvrtc_path, nullptr,
+                                  LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+    cublas_module = LoadLibraryExA(cublas_path, nullptr,
+                                   LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
     if (!driver_module || !nvrtc_module || !cublas_module) {
         last_error = "could not load CUDA driver, NVRTC, or cuBLAS DLL";
         return false;
