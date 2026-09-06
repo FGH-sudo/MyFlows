@@ -1,5 +1,24 @@
-from ..core.device import xp
+from ..core.device import xp, get_device
 from ..core.node import Node
+
+
+def _backend_name(backend):
+    if backend not in ("auto", "numpy", "cupy", "cuda_c", "cuda_im2col", "cuda_im2col_gemm"):
+        raise ValueError("backend must be auto, numpy, cupy, cuda_c, cuda_im2col or cuda_im2col_gemm")
+    return backend
+
+
+def _resolve_backend(backend, *arrays):
+    device = get_device()
+    actual = ("numpy" if device == "cpu" else "cupy") if backend == "auto" else backend
+    if (actual == "numpy") != (device == "cpu"):
+        raise ValueError(f"backend={actual} is incompatible with device={device}")
+    for value in arrays:
+        if value is not None and not isinstance(value, xp.ndarray):
+            raise TypeError("operator arrays must match the active device")
+        if value is not None and device == "cuda" and value.device.id != xp.cuda.runtime.getDevice():
+            raise ValueError("operator arrays must be on the current CUDA device")
+    return actual
 
 
 def _normalize_pair(value, name, allow_zero=False):
@@ -174,12 +193,19 @@ def col2im(rows, input_shape, kernel_size, stride=1, padding=0, dilation=1, cont
 
 
 class Conv2D_Op(Node):
-    def __init__(self, x, kernel, stride=1, padding=0, groups=1, dilation=1, bias=None):
+    def __init__(self, x, kernel, stride=1, padding=0, groups=1, dilation=1, bias=None, backend="auto"):
         # x: 图像, kernel: 卷积核；可选 bias 与输出通道对齐，前向融合加偏置（减少 Add 节点）
         if bias is None:
             super().__init__(x, kernel)
         else:
             super().__init__(x, kernel, bias)
+        self.backend = _backend_name(backend)
+        if backend in ("cuda_c", "cuda_im2col", "cuda_im2col_gemm"):
+            from .cuda.kernels import pair
+            pair(stride, "stride")
+            pair(padding, "padding", 0)
+            if groups != 1 or pair(dilation, "dilation") != (1, 1):
+                raise ValueError("CUDA C backends support only groups=1 and dilation=1")
         self.bias = bias
         self.stride = _normalize_pair(stride, "stride")
         self.padding = _normalize_pair(padding, "padding", allow_zero=True)
@@ -203,6 +229,23 @@ class Conv2D_Op(Node):
             )
 
     def forward(self, x_val, kernel_val, bias_val=None):
+        self.actual_backend = _resolve_backend(self.backend, x_val, kernel_val, bias_val)
+        if self.actual_backend in ("cuda_c", "cuda_im2col", "cuda_im2col_gemm"):
+            if self.bias is not None and bias_val is None:
+                raise ValueError("bias value is missing")
+            if self.actual_backend == "cuda_c":
+                from .cuda.kernels import conv2d_forward
+                self.value = conv2d_forward(x_val, kernel_val, bias_val, stride=self.stride, padding=self.padding)
+            elif self.actual_backend == "cuda_im2col":
+                from .cuda.kernels import conv2d_im2col_forward
+                self.value, self._cuda_im2col_cols = conv2d_im2col_forward(
+                    x_val, kernel_val, bias_val, stride=self.stride, padding=self.padding)
+            else:
+                from .cuda.kernels import conv2d_im2col_gemm_forward
+                self.value, self._cuda_im2col_cols = conv2d_im2col_gemm_forward(
+                    x_val, kernel_val, bias_val, stride=self.stride, padding=self.padding)
+            self._cuda_inputs = (x_val, kernel_val)
+            return
         # x_val: (N, C_in, H, W), kernel_val: (C_out, C_in, kH, kW)
         N, C_in, H, W = x_val.shape
         C_out, _, kH, kW = kernel_val.shape
@@ -251,6 +294,29 @@ class Conv2D_Op(Node):
             self.value = self.value + bias_val.reshape(1, C_out, 1, 1)
 
     def backward(self):
+        if not hasattr(self, "actual_backend"):
+            raise RuntimeError("forward must run before backward")
+        _resolve_backend(self.actual_backend, self.grad, *(p.value for p in self.parents))
+        if self.actual_backend in ("cuda_c", "cuda_im2col", "cuda_im2col_gemm"):
+            if self.actual_backend == "cuda_c":
+                from .cuda.kernels import conv2d_backward
+                grads = conv2d_backward(*self._cuda_inputs, self.grad, stride=self.stride,
+                                        padding=self.padding, need_bias_grad=self.bias is not None)
+            elif self.actual_backend == "cuda_im2col":
+                from .cuda.kernels import conv2d_im2col_backward
+                grads = conv2d_im2col_backward(*self._cuda_inputs, self.grad, self._cuda_im2col_cols,
+                                                stride=self.stride, padding=self.padding,
+                                                need_bias_grad=self.bias is not None)
+            else:
+                from .cuda.kernels import conv2d_im2col_gemm_backward
+                grads = conv2d_im2col_gemm_backward(*self._cuda_inputs, self.grad, self._cuda_im2col_cols,
+                                                    stride=self.stride, padding=self.padding,
+                                                    need_bias_grad=self.bias is not None)
+            for parent, grad in zip(self.parents, grads):
+                if parent.grad is None:
+                    parent.clear_grad()
+                parent.grad += grad
+            return
         if self.bias is None:
             x_node, kernel_node = self.parents
         else:
@@ -320,7 +386,7 @@ class Conv2D_LeakyReLU_Op(Conv2D_Op):
         self.value = xp.where(self._leaky_mask, self.value, self.alpha * self.value)
 
     def backward(self):
-        self.grad = self.grad * xp.where(self._leaky_mask, 1.0, self.alpha)
+        self.grad = xp.where(self._leaky_mask, self.grad, self.alpha * self.grad)
         super().backward()
 
 
@@ -566,13 +632,24 @@ class ConvTranspose2D_LeakyReLU_Op(ConvTranspose2D_Op):
 
 
 class MaxPool2d_Op(Node):
-    def __init__(self, x, kernel_size=2, stride=2):
+    def __init__(self, x, kernel_size=2, stride=2, backend="auto"):
         super().__init__(x)
+        self.backend = _backend_name(backend)
+        if backend == "cuda_c":
+            from .cuda.kernels import pair
+            pair(kernel_size, "kernel_size")
+            pair(stride, "stride")
         self.kernel_size = _normalize_pair(kernel_size, "kernel_size")
         self.stride = _normalize_pair(stride, "stride")
         self._im2col_context = None
 
     def forward(self, x_val):
+        self.actual_backend = _resolve_backend(self.backend, x_val)
+        if self.actual_backend == "cuda_c":
+            from .cuda.kernels import maxpool2d_forward
+            self.value, self._cuda_context = maxpool2d_forward(
+                x_val, kernel_size=self.kernel_size, stride=self.stride)
+            return
         N, C, H, W = x_val.shape
         k_h, k_w = self.kernel_size
         cols, self._im2col_context, _ = im2col(
@@ -587,10 +664,21 @@ class MaxPool2d_Op(Node):
         patches = cols
         patches = patches.reshape(N, out_H * out_W, C, k_h * k_w).transpose(0, 2, 1, 3)
         max_vals = xp.max(patches, axis=-1)
-        self.max_mask = patches == max_vals[..., None]
+        eq = patches == max_vals[..., None]
+        self.max_mask = eq & (eq.cumsum(axis=-1) == 1)
         self.value = max_vals.reshape(N, C, out_H, out_W)
 
     def backward(self):
+        if not hasattr(self, "actual_backend"):
+            raise RuntimeError("forward must run before backward")
+        _resolve_backend(self.actual_backend, self.grad, self.parents[0].value)
+        if self.actual_backend == "cuda_c":
+            from .cuda.kernels import maxpool2d_backward
+            parent = self.parents[0]
+            if parent.grad is None:
+                parent.clear_grad()
+            parent.grad += maxpool2d_backward(self.grad, self._cuda_context)
+            return
         x_node = self.parents[0]
         if x_node.grad is None:
             x_node.clear_grad()
