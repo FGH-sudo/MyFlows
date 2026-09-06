@@ -17,7 +17,7 @@ ms.use_cuda()  # 或 ms.set_device("cpu")
 |------|------|
 | `core/` | 设备、`Tensor` / `Variable` / `Node`、`Graph`、图优化 |
 | `ops/` | 基础算子、激活、卷积（im2col+GEMM）、BN、Dropout、损失 |
-| `ops/cuda/` | 自写 FP32 Conv/Pool CUDA 前反向及 NVRTC wrapper |
+| `ops/cuda_native/` | 原生 C/C++ 调度自写 Conv/Pool CUDA kernel，并调用 cuBLAS |
 | `distributed/` | CPU 同步 PS，server/worker/launcher、消息校验与计时 |
 | `examples/stage1_cnn.py` | 固定 32 样本 FP32 CNN 训练示例 |
 | `layers/` | Dense / Conv / Pool / Dropout、`ResNet18` |
@@ -86,13 +86,13 @@ import MyFlows as ms
 from MyFlows.utils.initializers import make_initializer
 
 ms.set_device("cuda")
-conv = ms.Conv2D(1, 4, kernel_size=3, padding=1, backend="cuda_c",
+conv = ms.Conv2D(1, 4, kernel_size=3, padding=1, backend="cuda_native_cublas",
                  dtype=np.float32, initializer=make_initializer(seed=0),
                  fuse_activation=False)
-pool = ms.MaxPool2d(2, 2, backend="cuda_c")
+pool = ms.MaxPool2d(2, 2, backend="cuda_native_cublas")
 ```
 
-`auto` 保留 CPU/NumPy 与 GPU/CuPy 默认行为。`cuda_c` 要求当前 GPU 上的 FP32 输入，支持 groups=1/dilation=1；`cuda_im2col` 在相同约束下将 im2col/col2im 迁移到 CUDA C，并复用 CuPy GEMM；`cuda_im2col_gemm` 进一步使用自写 CUDA GEMM。三条 CUDA 路径不支持的配置会报错。Pool 不带 padding，最大值相等时选择首个位置，重叠窗口梯度求和。输入须为有限值；wrapper 接受非连续 view 并连续化，普通调用不主动同步设备。
+`auto` 保留 CPU/NumPy 与 GPU/CuPy 默认行为。`cuda_native_cublas` 要求当前 GPU 上的 FP32 输入；卷积由原生 C/C++ 层调度自写 im2col/col2im kernel 和 cuBLAS，池化由同一原生层调度自写 max-pool kernel。当前原生卷积限定 groups=1、dilation=1，池化不带 padding；最大值相等时选择首个位置，重叠窗口梯度求和。输入须为有限值；wrapper 接受非连续 view 并连续化，普通调用不主动同步设备。
 
 父仓库 `benchmark.cuda_ops` 和 `benchmark.ps_demo` 提供完整运行入口，`benchmark.profile_cuda` 生成并检查真实 Nsight 报告。范围、命令和证据见 [第一阶段报告](../docs/experiments/semester_2026_fall/stage1/README.md)。
 

@@ -25,12 +25,12 @@ class BackendValidationTest(unittest.TestCase):
         set_device("cpu")
         x = Variable(np.ones((1, 1, 4, 4), np.float32))
         w = Variable(np.ones((1, 1, 3, 3), np.float32))
-        for backend in ("cuda_c", "cuda_im2col", "cuda_im2col_gemm", "cupy"):
+        for backend in ("cuda_native_cublas", "cupy"):
             with self.assertRaises(ValueError):
                 Graph(Conv2D_Op(x, w, backend=backend)).forward()
-        for kwargs in ({"groups": 2}, {"dilation": 2}, {"stride": (1.5, 1)}):
+        for kwargs in ({"groups": 2}, {"dilation": 2}):
             with self.assertRaises((ValueError, TypeError)):
-                Conv2D_Op(x, w, backend="cuda_c", **kwargs)
+                Conv2D_Op(x, w, backend="cuda_native_cublas", **kwargs)
         with self.assertRaises(ValueError):
             Conv2D_Op(x, w, backend="typo")
 
@@ -49,7 +49,7 @@ class CudaGraphIntegrationTest(unittest.TestCase):
         arrays = [np.random.default_rng(i).normal(size=s).astype(np.float32)
                   for i, s in enumerate(((2, 2, 5, 7), (3, 2, 3, 3), (3,)))]
         snapshots = []
-        for backend in ("cupy", "cuda_c", "cuda_im2col", "cuda_im2col_gemm"):
+        for backend in ("cupy", "cuda_native_cublas"):
             x, w, b = [Variable(xp.asarray(a)) for a in arrays]
             left = Conv2D_Op(x, w, padding=1, bias=b, backend=backend)
             right = Conv2D_Op(x, w, padding=1, bias=b, backend=backend)
@@ -65,22 +65,22 @@ class CudaGraphIntegrationTest(unittest.TestCase):
     def test_context_refresh_after_batch_and_spatial_change(self):
         x = Variable(xp.ones((1, 1, 5, 7), xp.float32))
         w = Variable(xp.ones((2, 1, 3, 3), xp.float32))
-        conv = Conv2D_Op(x, w, padding=1, backend="cuda_c")
-        pool = MaxPool2d_Op(conv, 3, 1, backend="cuda_c")
+        conv = Conv2D_Op(x, w, padding=1, backend="cuda_native_cublas")
+        pool = MaxPool2d_Op(conv, 3, 1, backend="cuda_native_cublas")
         graph = Graph(SumAll(pool))
         for shape in ((1, 1, 5, 7), (3, 1, 8, 6), (2, 1, 4, 5)):
             x.value = xp.ones(shape, xp.float32)
             graph.forward()
             graph.backward()
             self.assertEqual(x.grad.shape, shape)
-            self.assertEqual(pool._cuda_context.input_shape, conv.value.shape)
+            self.assertEqual(pool._native_context.input_shape, conv.value.shape)
             self.assertEqual(pool.value.shape, (shape[0], 2, shape[2] - 2, shape[3] - 2))
             self.assertTrue(bool(xp.isfinite(x.grad).all()))
 
     def test_backward_rejects_device_change(self):
         x = Variable(xp.ones((1, 1, 4, 4), xp.float32))
         w = Variable(xp.ones((1, 1, 3, 3), xp.float32))
-        op = Conv2D_Op(x, w, backend="cuda_c")
+        op = Conv2D_Op(x, w, backend="cuda_native_cublas")
         Graph(op).forward()
         op.grad = xp.ones_like(op.value)
         set_device("cpu")
@@ -90,17 +90,17 @@ class CudaGraphIntegrationTest(unittest.TestCase):
     def test_fusion_keeps_explicit_backend(self):
         for optimize, fuse_layer, activation in ((False, True, ReLU), (True, False, ReLU), (True, False, LeakyReLU)):
             x = Variable(xp.ones((1, 1, 4, 4), xp.float32))
-            conv = Conv2D(1, 2, backend="cuda_c", dtype=np.float32, activation=activation,
+            conv = Conv2D(1, 2, backend="cuda_native_cublas", dtype=np.float32, activation=activation,
                           fuse_activation=fuse_layer)
             graph = Graph(SumAll(conv(x)), optimize=optimize)
             graph.forward()
             graph.backward()
             conv_nodes = [n for n in graph.nodes if isinstance(n, Conv2D_Op)]
             self.assertEqual(len(conv_nodes), 1)
-            self.assertEqual(conv_nodes[0].actual_backend, "cuda_c")
+            self.assertEqual(conv_nodes[0].actual_backend, "cuda_native_cublas")
 
     def test_fp32_training_same_initial_values_gradients_updates_and_loss(self):
-        models = [build(backend) for backend in ("cupy", "cuda_c")]
+        models = [build(backend) for backend in ("cupy", "cuda_native_cublas")]
         for a, b in zip(models[0]["params"], models[1]["params"]):
             np.testing.assert_array_equal(asnumpy(a.value), asnumpy(b.value))
         for step in range(100):

@@ -86,14 +86,6 @@ class Conv2D(Layer):
 
         from ..ops.convolution import _backend_name
         self.backend = _backend_name(backend)
-        if backend == "cuda_c":
-            from ..ops.cuda.kernels import pair
-            pair(kernel_size, "kernel_size")
-            pair(stride, "stride")
-            pair(padding, "padding", 0)
-            if groups != 1 or pair(dilation, "dilation") != (1, 1):
-                raise ValueError("cuda_c supports only groups=1 and dilation=1")
-
         in_channels = _positive_int(in_channels, "in_channels")
         out_channels = _positive_int(out_channels, "out_channels")
         groups = _positive_int(groups, "groups")

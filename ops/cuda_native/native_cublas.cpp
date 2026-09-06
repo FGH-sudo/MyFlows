@@ -66,6 +66,8 @@ CUfunction im2col_function = nullptr;
 CUfunction col2im_function = nullptr;
 CUfunction add_bias_function = nullptr;
 CUfunction bias_grad_function = nullptr;
+CUfunction pool_forward_function = nullptr;
+CUfunction pool_backward_function = nullptr;
 std::mutex init_mutex;
 bool initialized = false;
 std::string last_error;
@@ -135,6 +137,41 @@ extern "C" __global__ void bias_grad_rows(
         sum += dy[row * CO + channel];
     db[channel] = sum;
 }
+
+extern "C" __global__ void maxpool2d_forward_native(
+    const float* x, float* y, int* argmax,
+    int N, int C, int H, int W, int OH, int OW, int KH, int KW, int SH, int SW) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N * C * OH * OW) return;
+    int ow = idx % OW, oh = (idx / OW) % OH, nc = idx / (OW * OH);
+    int first = (nc * H + oh * SH) * W + ow * SW;
+    int best = first;
+    float value = x[first];
+    for (int kh = 0; kh < KH; ++kh)
+        for (int kw = 0; kw < KW; ++kw) {
+            int at = first + kh * W + kw;
+            if (x[at] > value) { value = x[at]; best = at; }
+        }
+    y[idx] = value;
+    argmax[idx] = best;
+}
+
+extern "C" __global__ void maxpool2d_backward_native(
+    const float* dy, const int* argmax, float* dx,
+    int N, int C, int H, int W, int OH, int OW, int KH, int KW, int SH, int SW) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N * C * H * W) return;
+    int iw = idx % W, ih = (idx / W) % H, nc = idx / (W * H);
+    int oh0 = max(0, (ih - KH + SH) / SH), oh1 = min(OH - 1, ih / SH);
+    int ow0 = max(0, (iw - KW + SW) / SW), ow1 = min(OW - 1, iw / SW);
+    float sum = 0.0f;
+    for (int oh = oh0; oh <= oh1; ++oh)
+        for (int ow = ow0; ow <= ow1; ++ow) {
+            int out = (nc * OH + oh) * OW + ow;
+            if (argmax[out] == idx) sum += dy[out];
+        }
+    dx[idx] = sum;
+}
 )CUDA";
 
 template <typename T>
@@ -182,7 +219,9 @@ bool compile_kernels() {
     return cuModuleGetFunction(&im2col_function, cuda_module, "im2col_forward") == CUDA_SUCCESS &&
            cuModuleGetFunction(&col2im_function, cuda_module, "col2im_backward") == CUDA_SUCCESS &&
            cuModuleGetFunction(&add_bias_function, cuda_module, "add_bias") == CUDA_SUCCESS &&
-           cuModuleGetFunction(&bias_grad_function, cuda_module, "bias_grad_rows") == CUDA_SUCCESS;
+           cuModuleGetFunction(&bias_grad_function, cuda_module, "bias_grad_rows") == CUDA_SUCCESS &&
+           cuModuleGetFunction(&pool_forward_function, cuda_module, "maxpool2d_forward_native") == CUDA_SUCCESS &&
+           cuModuleGetFunction(&pool_backward_function, cuda_module, "maxpool2d_backward_native") == CUDA_SUCCESS;
 }
 
 bool ensure_initialized(const char* cublas_path, const char* nvrtc_path) {
@@ -247,6 +286,24 @@ int launch_bias_grad(CUstream stream, CUdeviceptr dy, CUdeviceptr db, int M, int
     return cuLaunchKernel(bias_grad_function, (CO + 255) / 256, 1, 1, 256, 1, 1, 0, stream, args, nullptr);
 }
 
+int launch_pool_forward(CUstream stream, CUdeviceptr x, CUdeviceptr y, CUdeviceptr argmax,
+                        int N, int C, int H, int W, int OH, int OW, int KH, int KW,
+                        int SH, int SW) {
+    int total = N * C * OH * OW;
+    void* args[] = {&x, &y, &argmax, &N, &C, &H, &W, &OH, &OW, &KH, &KW, &SH, &SW};
+    return cuLaunchKernel(pool_forward_function, (total + 255) / 256, 1, 1,
+                          256, 1, 1, 0, stream, args, nullptr);
+}
+
+int launch_pool_backward(CUstream stream, CUdeviceptr dy, CUdeviceptr argmax, CUdeviceptr dx,
+                         int N, int C, int H, int W, int OH, int OW, int KH, int KW,
+                         int SH, int SW) {
+    int total = N * C * H * W;
+    void* args[] = {&dy, &argmax, &dx, &N, &C, &H, &W, &OH, &OW, &KH, &KW, &SH, &SW};
+    return cuLaunchKernel(pool_backward_function, (total + 255) / 256, 1, 1,
+                          256, 1, 1, 0, stream, args, nullptr);
+}
+
 int gemm(CUstream stream, int trans_a, int trans_b, int m, int n, int k,
          CUdeviceptr a, int lda, CUdeviceptr b, int ldb, CUdeviceptr c, int ldc) {
     if (cublasSetStream(cublas_handle, stream) != CUBLAS_STATUS_SUCCESS) return 20;
@@ -308,4 +365,20 @@ extern "C" __declspec(dllexport) int mf_backward(
         if (rc != CUDA_SUCCESS) return 13;
     }
     return 0;
+}
+
+extern "C" __declspec(dllexport) int mf_pool_forward(
+    std::uint64_t x, std::uint64_t y, std::uint64_t argmax,
+    int N, int C, int H, int W, int OH, int OW, int KH, int KW, int SH, int SW,
+    std::uint64_t stream_ptr) {
+    return launch_pool_forward(reinterpret_cast<CUstream>(stream_ptr), x, y, argmax,
+                               N, C, H, W, OH, OW, KH, KW, SH, SW) == CUDA_SUCCESS ? 0 : 30;
+}
+
+extern "C" __declspec(dllexport) int mf_pool_backward(
+    std::uint64_t dy, std::uint64_t argmax, std::uint64_t dx,
+    int N, int C, int H, int W, int OH, int OW, int KH, int KW, int SH, int SW,
+    std::uint64_t stream_ptr) {
+    return launch_pool_backward(reinterpret_cast<CUstream>(stream_ptr), dy, argmax, dx,
+                                N, C, H, W, OH, OW, KH, KW, SH, SW) == CUDA_SUCCESS ? 0 : 31;
 }

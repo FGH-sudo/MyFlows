@@ -9,6 +9,7 @@ from __future__ import annotations
 import ctypes
 import importlib.util
 import os
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
@@ -24,15 +25,41 @@ _torch_spec = importlib.util.find_spec("torch")
 PYTHON_SITE = Path(next(iter(_nvidia_spec.submodule_search_locations))).parent if _nvidia_spec else Path()
 TORCH_SITE = Path(next(iter(_torch_spec.submodule_search_locations))).parent if _torch_spec else Path()
 _MISSING = Path("__missing_native_dependency__")
-CUBLAS_DLL = next((PYTHON_SITE / "nvidia" / "cublas" / "bin").glob("cublas64_*.dll"), _MISSING)
 _NVRTC_DIR = TORCH_SITE / "torch" / "lib"
-NVRTC_DLL = (_NVRTC_DIR / "nvrtc64_120_0.dll" if (_NVRTC_DIR / "nvrtc64_120_0.dll").exists()
-             else next(_NVRTC_DIR.glob("nvrtc64_*.dll"), _MISSING))
+_TOOLKIT_BIN = Path(os.environ.get("CUDA_PATH", "")) / "bin" if os.environ.get("CUDA_PATH") else _MISSING
+
+
+def _first_existing(*candidates):
+    return next((candidate for candidate in candidates if candidate.exists()), _MISSING)
+
+
+# Prefer Python-provided CUDA 12 DLLs when present, then fall back to the
+# installed Toolkit or the DLLs shipped in the local PyTorch wheel.
+CUBLAS_DLL = _first_existing(
+    *sorted((PYTHON_SITE / "nvidia" / "cublas" / "bin").glob("cublas64_*.dll")),
+    _TOOLKIT_BIN / "cublas64_12.dll",
+    _NVRTC_DIR / "cublas64_12.dll",
+)
+NVRTC_DLL = _first_existing(
+    _NVRTC_DIR / "nvrtc64_120_0.dll",
+    *sorted(_NVRTC_DIR.glob("nvrtc64_*.dll")),
+    _TOOLKIT_BIN / "nvrtc64_120_0.dll",
+)
 _DLL_DIR_HANDLES = []
 
 
 class NativeCudaError(RuntimeError):
     pass
+
+
+@dataclass
+class NativePoolContext:
+    input_shape: tuple
+    output_shape: tuple
+    kernel_size: tuple
+    stride: tuple
+    argmax: object
+    device_id: int
 
 
 def _u64(value):
@@ -54,6 +81,12 @@ def _configure(lib):
     lib.mf_forward.restype = ctypes.c_int
     lib.mf_backward.argtypes = backward_types
     lib.mf_backward.restype = ctypes.c_int
+    pool_forward_types = [ctypes.c_uint64] * 3 + [ctypes.c_int] * 10 + [ctypes.c_uint64]
+    pool_backward_types = [ctypes.c_uint64] * 3 + [ctypes.c_int] * 10 + [ctypes.c_uint64]
+    lib.mf_pool_forward.argtypes = pool_forward_types
+    lib.mf_pool_forward.restype = ctypes.c_int
+    lib.mf_pool_backward.argtypes = pool_backward_types
+    lib.mf_pool_backward.restype = ctypes.c_int
     return lib
 
 
@@ -157,3 +190,52 @@ def conv2d_backward(x, weight, grad_y, cols, *, stride=(1, 1), padding=(0, 0), n
         _u64(db.data.ptr if db is not None else 0),
         *[_i32(v) for v in dims], _u64(cp.cuda.get_current_stream().ptr)), lib)
     return dx, dw, db
+
+
+def _pool_dims(x, kernel_size, stride):
+    if x.ndim != 4:
+        raise ValueError("x must be an NCHW array")
+    kernel = tuple(int(v) for v in kernel_size)
+    stride = tuple(int(v) for v in stride)
+    if len(kernel) != 2 or len(stride) != 2 or min(kernel) <= 0 or min(stride) <= 0:
+        raise ValueError("kernel_size and stride must contain positive pairs")
+    n, c, h, w = map(int, x.shape)
+    oh = (h - kernel[0]) // stride[0] + 1
+    ow = (w - kernel[1]) // stride[1] + 1
+    if oh <= 0 or ow <= 0:
+        raise ValueError("pooling window is larger than the input")
+    return n, c, h, w, oh, ow, kernel[0], kernel[1], stride[0], stride[1]
+
+
+def maxpool2d_forward(x, *, kernel_size=(2, 2), stride=(2, 2)):
+    cp = _lazy_cupy()
+    x = _array(x, "x")
+    dims = _pool_dims(x, kernel_size, stride)
+    n, c, h, w, oh, ow, kh, kw, sh, sw = dims
+    y = cp.empty((n, c, oh, ow), dtype=cp.float32)
+    argmax = cp.empty((n, c, oh, ow), dtype=cp.int32)
+    lib = _library()
+    _check(lib.mf_pool_forward(
+        _u64(x.data.ptr), _u64(y.data.ptr), _u64(argmax.data.ptr),
+        *[_i32(v) for v in dims], _u64(cp.cuda.get_current_stream().ptr)), lib)
+    return y, NativePoolContext(x.shape, y.shape, (kh, kw), (sh, sw), argmax, x.device.id)
+
+
+def maxpool2d_backward(grad_y, context):
+    cp = _lazy_cupy()
+    if not isinstance(context, NativePoolContext) or context.device_id != cp.cuda.runtime.getDevice():
+        raise ValueError("context must come from maxpool2d_forward on the current device")
+    grad_y = _array(grad_y, "grad_y")
+    if grad_y.shape != context.output_shape:
+        raise ValueError("grad_y/context shape does not match pool output")
+    n, c, h, w = map(int, context.input_shape)
+    oh, ow = map(int, context.output_shape[2:])
+    kh, kw = context.kernel_size
+    sh, sw = context.stride
+    dx = cp.empty(context.input_shape, dtype=cp.float32)
+    dims = (n, c, h, w, oh, ow, kh, kw, sh, sw)
+    lib = _library()
+    _check(lib.mf_pool_backward(
+        _u64(grad_y.data.ptr), _u64(context.argmax.data.ptr), _u64(dx.data.ptr),
+        *[_i32(v) for v in dims], _u64(cp.cuda.get_current_stream().ptr)), lib)
+    return dx

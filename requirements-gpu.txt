@@ -1,6 +1,6 @@
 # GPU 训练加速（CuPy，需与本机 CUDA 版本匹配）
-# RTX 40 系列 + CUDA 12.x 常用：
-cupy-cuda12x>=13.0.0
+# 当前完整 Toolkit 为 CUDA 13.x：
+cupy-cuda12x>=14.0.1
 
 # ONNX 推理 / eval / serve_grpc / 仿真 pilot
 # pip install onnxruntime-gpu
