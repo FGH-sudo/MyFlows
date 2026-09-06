@@ -11,6 +11,7 @@ if str(PROJECT_PARENT) not in sys.path:
 
 from MyFlows.core.node import Variable
 from MyFlows.ops.basic import Linear
+from MyFlows.ops.loss import CrossEntropy, LogLoss, MSELoss, PerceptionLoss
 from MyFlows.ops.convolution import (
     Conv2D_Op,
     Conv2D_ReLU_Op,
@@ -160,6 +161,43 @@ class AutoDiffGradCheckTest(unittest.TestCase):
 
     def test_convtranspose_leaky_relu_gradcheck(self):
         self._deconv_gradcheck_kernel(ConvTranspose2D_LeakyReLU_Op, alpha=0.15)
+
+    def _loss_gradcheck(self, make_loss, pred, target, *, rtol=1e-4, atol=1e-5):
+        pred_node = Variable(pred.copy(), trainable=True)
+        target_node = Variable(target.copy())
+        loss = make_loss(pred_node, target_node)
+
+        def f():
+            loss.forward(pred_node.value, target_node.value)
+            return float(loss.value)
+
+        loss.forward(pred_node.value, target_node.value)
+        pred_node.clear_grad()
+        target_node.clear_grad()
+        loss.grad = np.asarray(1.0)
+        loss.backward()
+        numeric = _numerical_grad(pred_node.value, f)
+        _assert_allclose(self, pred_node.grad, numeric, rtol=rtol, atol=atol, name=loss.__class__.__name__)
+
+    def test_mse_loss_gradcheck(self):
+        pred = self.rng.normal(size=(4, 2)).astype(np.float64)
+        target = self.rng.normal(size=(4, 2)).astype(np.float64)
+        self._loss_gradcheck(MSELoss, pred, target)
+
+    def test_perception_loss_gradcheck(self):
+        target = np.array([[1.0], [-1.0], [1.0], [-1.0]], dtype=np.float64)
+        pred = np.array([[0.4], [-0.7], [1.2], [0.3]], dtype=np.float64)
+        self._loss_gradcheck(PerceptionLoss, pred, target)
+
+    def test_log_loss_gradcheck(self):
+        target = np.array([[1.0], [-1.0], [1.0], [-1.0]], dtype=np.float64)
+        pred = np.array([[0.5], [-0.8], [1.1], [0.2]], dtype=np.float64)
+        self._loss_gradcheck(LogLoss, pred, target)
+
+    def test_cross_entropy_gradcheck(self):
+        logits = self.rng.normal(size=(5, 3)).astype(np.float64)
+        labels = np.array([0, 2, 1, 0, 1], dtype=np.int64)
+        self._loss_gradcheck(CrossEntropy, logits, labels, rtol=1e-3, atol=1e-4)
 
 
 if __name__ == "__main__":

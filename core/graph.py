@@ -67,7 +67,7 @@ class Graph:
         for n in self.nodes:
             n.clear_grad()
             
-        self.target_node.grad = xp.asarray(1.0)  # 目标节点梯度为 1（与当前设备一致）
+        self.target_node.grad = xp.asarray(1.0, dtype=self.target_node.value.dtype)
         
         # 使用预先计算好的反向排序列表
         for node in reversed(self.sorted_nodes):

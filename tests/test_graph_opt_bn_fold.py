@@ -35,6 +35,16 @@ class TestGraphOptBnFold(unittest.TestCase):
     y2 = np.asarray(asnumpy(root2.value))
     np.testing.assert_allclose(y1, y2, rtol=1e-4, atol=1e-4)
 
+  def test_fold_does_not_mutate_original_conv_weights(self):
+    model = ResNet18(in_channels=3, output_dim=5, stem="cifar", base_width=16)
+    model.eval()
+    original = np.asarray(asnumpy(model.stem_conv.kernel.value)).copy()
+    x = Variable(xp.zeros((1, 3, 32, 32)), name="x")
+    out = model(x)
+    fold_bn_into_conv(out)
+    after = np.asarray(asnumpy(model.stem_conv.kernel.value))
+    np.testing.assert_array_equal(original, after)
+
   def test_node_count_decreases(self):
     model = ResNet18(in_channels=3, output_dim=5, stem="cifar", base_width=16)
     model.eval()

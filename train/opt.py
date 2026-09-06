@@ -131,6 +131,8 @@ class Momentum(Optimizer):
             if isinstance(node, Variable) and node.trainable:  # 如果节点是可训练的变量
                 # 获取该变量在当前epoch的平均梯度
                 grad = self.get_gradient(node)
+                if grad is None:
+                    continue
                 # 若该节点不在动量字典里，将当前梯度作为初始动量
                 if node not in self.v:
                     self.v[node] = -self.learning_rate * grad
@@ -151,6 +153,8 @@ class AdaGrad(Optimizer):
             if isinstance(node, Variable) and node.trainable:
                 # 获取变量平均梯度
                 grad = self.get_gradient(node)
+                if grad is None:
+                    continue
                 if node not in self.s:
                     self.s[node] = xp.power(grad, 2)
                 else:
@@ -171,6 +175,8 @@ class RMSProp(Optimizer):
             if isinstance(node, Variable) and node.trainable:
                 # 获取变量平均梯度
                 grad = self.get_gradient(node)
+                if grad is None:
+                    continue
                 if node not in self.s:
                     self.s[node] = xp.power(grad, 2)
                 else:
@@ -197,6 +203,8 @@ class Adam(Optimizer):
             if isinstance(node, Variable) and node.trainable:
                 # 获取变量平均梯度
                 grad = self.get_gradient(node)
+                if grad is None:
+                    continue
                 if node not in self.s:
                     self.v[node] = grad
                     self.s[node] = xp.power(grad, 2)
@@ -205,8 +213,8 @@ class Adam(Optimizer):
                     self.s[node] = self.beta_2 * self.s[node] + (1 - self.beta_2) * xp.power(grad, 2)
 
                 # 修正偏差(Bias Correction)
-                v_correct = self.v[node] / (1 - xp.power(self.beta_1, self.t))
-                s_correct = self.s[node] / (1 - xp.power(self.beta_2, self.t))
+                v_correct = self.v[node] / (1 - self.beta_1 ** self.t)
+                s_correct = self.s[node] / (1 - self.beta_2 ** self.t)
                 
                 # 更新变量值
                 node.value -= self.learning_rate * v_correct / (xp.sqrt(s_correct) + self.eps)

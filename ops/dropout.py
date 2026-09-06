@@ -16,12 +16,13 @@ class Dropout_Op(Node):
             raise ValueError("dropout p must be in [0, 1)")
         self.training = bool(training)
         self.seed = seed
+        self._rng = np.random.default_rng(int(seed)) if seed is not None else None
         self._mask = None
         super().__init__(x, name=name)
 
     def _random(self, shape):
-        if self.seed is not None:
-            return xp.asarray(np.random.default_rng(int(self.seed)).random(shape))
+        if self._rng is not None:
+            return xp.asarray(self._rng.random(shape))
         return xp.random.random(shape)
 
     def forward(self, x):

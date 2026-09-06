@@ -7,8 +7,17 @@ from ..ops.activation import ReLU
 from .layer import Conv2D, Dense, Dropout, Flatten, Layer, MaxPool2d
 
 
-# VGG11: 每段 [conv×n, MaxPool]；通道 64,128,256,512,512
+# 论文 VGG-11：每段 [conv×n, MaxPool]，卷积层数 1,1,2,2,2 共 8 层
 _VGG11_CFG = [
+    (1, 64),
+    (1, 128),
+    (2, 256),
+    (2, 512),
+    (2, 512),
+]
+
+# VGG-13：每段 2 个卷积，共 10 层。历史误命名为 VGG11，现有 checkpoint 基于此配置。
+_VGG13_CFG = [
     (2, 64),
     (2, 128),
     (2, 256),
@@ -50,14 +59,10 @@ def vgg_fc_input_dim(image_h: int, image_w: int, last_channels: int = 512, num_p
     return last_channels * fh * fw
 
 
-class VGG11(Layer):
-    """
-    VGG-11 回归网络，适配 Donkey 小分辨率输入。
+class _VGGRegressor(Layer):
+    """VGG 回归网络公共实现，适配 Donkey 小分辨率输入。"""
 
-    参数:
-      in_channels: 输入通道（RGB=3）
-      output_dim: 输出维度；DonkeyCar 控制回归默认为 [angle, throttle] 两维
-    """
+    _cfg: list[tuple[int, int]] = _VGG13_CFG
 
     def __init__(
         self,
@@ -69,13 +74,17 @@ class VGG11(Layer):
         name: str | None = None,
         dropout: float = 0.0,
         initializer=None,
+        cfg: list[tuple[int, int]] | None = None,
     ):
         super().__init__(name=name)
         self.output_dim = int(output_dim)
         self.image_h = int(image_h)
         self.image_w = int(image_w)
+        feature_cfg = list(cfg if cfg is not None else self._cfg)
 
-        self.feature_layers, self._last_conv_ch = _make_vgg_features(in_channels, _VGG11_CFG, initializer=initializer)
+        self.feature_layers, self._last_conv_ch = _make_vgg_features(
+            in_channels, feature_cfg, initializer=initializer
+        )
         self.flatten = Flatten(name=f"{name}_flatten" if name else "flatten")
 
         self._fc_in = vgg_fc_input_dim(self.image_h, self.image_w, self._last_conv_ch)
@@ -124,3 +133,19 @@ class VGG11(Layer):
 
     def eval(self) -> None:
         self.train(False)
+
+
+class VGG13(_VGGRegressor):
+    """VGG-13 回归网络（10 个 3x3 卷积）。历史 checkpoint 与训练脚本使用此配置。"""
+
+    _cfg = _VGG13_CFG
+
+
+class VGG11Standard(_VGGRegressor):
+    """论文口径的 VGG-11（8 个 3x3 卷积：1,1,2,2,2）。与现有 DonkeyCar checkpoint 不兼容。"""
+
+    _cfg = _VGG11_CFG
+
+
+# 兼容别名：旧代码与 JSON+NPZ checkpoint 均按 10 卷积 VGG-13 构建。
+VGG11 = VGG13

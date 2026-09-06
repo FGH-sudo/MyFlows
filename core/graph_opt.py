@@ -101,8 +101,17 @@ def fold_constant_adds(target_node: Node) -> tuple[Node, int]:
     return current_root, total_folded
 
 
+def _replace_parent(node: Node, index: int, new_parent: Node) -> None:
+    old = node.parents[index]
+    node.parents[index] = new_parent
+    if node in getattr(old, "children", []):
+        old.children.remove(node)
+    if node not in new_parent.children:
+        new_parent.children.append(node)
+
+
 def _fold_bn_weights(conv_op, bn_op) -> None:
-    """将 eval 态 BN 参数折入 Conv 的 kernel/bias Variable（就地修改）。"""
+    """将 eval 态 BN 参数折入 Conv 的拷贝 kernel/bias，不修改原模型权重。"""
     from .device import xp
     from ..ops.convolution import Conv2D_Op
 
@@ -122,23 +131,36 @@ def _fold_bn_weights(conv_op, bn_op) -> None:
         bias_var = conv_op.parents[2]
         b = xp.asarray(bias_var.value)
     else:
+        bias_var = None
         b = xp.zeros((C_out,), dtype=W.dtype)
     W_new = W * scale.reshape(C_out, 1, 1, 1)
     b_new = (b - mean) * scale + beta
-    kernel_var.value = W_new
-    if conv_op.bias is not None:
-        bias_var.value = b_new
+    new_kernel = Variable(
+        W_new.copy() if hasattr(W_new, "copy") else W_new,
+        trainable=bool(getattr(kernel_var, "trainable", True)),
+        name=f"{getattr(kernel_var, 'name', 'kernel')}_bn_folded",
+    )
+    _replace_parent(conv_op, 1, new_kernel)
+    if bias_var is not None:
+        new_bias = Variable(
+            b_new.copy() if hasattr(b_new, "copy") else b_new,
+            trainable=bool(getattr(bias_var, "trainable", True)),
+            name=f"{getattr(bias_var, 'name', 'bias')}_bn_folded",
+        )
+        _replace_parent(conv_op, 2, new_bias)
+        conv_op.bias = new_bias
     else:
         new_bias = Variable(b_new, trainable=True, name=f"{getattr(conv_op, 'name', 'conv')}_folded_bias")
         conv_op.parents.append(new_bias)
         conv_op.bias = new_bias
+        new_bias.children.append(conv_op)
 
 
 def fold_bn_into_conv(target_node: Node) -> tuple[Node, int]:
     """
     推理态：将紧邻的 ``Conv2D_Op -> BatchNorm2d_Op(training=False)`` 折叠为单个 Conv。
 
-    修改 Conv 的 weight/bias Variable，并用 ``replace_node`` 跳过 BN。
+    把 BN 参数折入 Conv 权重的拷贝，不污染原模型 Variable；再用 ``replace_node`` 跳过 BN。
     """
     from ..ops.batchnorm import BatchNorm2d_Op
     from ..ops.convolution import Conv2D_Op
@@ -277,6 +299,7 @@ def fuse_conv_activation_ops(target_node: Node) -> tuple[Node, int]:
                     groups=parent.groups,
                     dilation=parent.dilation,
                     bias=bias,
+                    backend=parent.backend,
                 )
             else:
                 fused_node = Conv2D_LeakyReLU_Op(
@@ -287,6 +310,7 @@ def fuse_conv_activation_ops(target_node: Node) -> tuple[Node, int]:
                     groups=parent.groups,
                     dilation=parent.dilation,
                     bias=bias,
+                    backend=parent.backend,
                     alpha=getattr(node, "alpha", 0.01),
                 )
 

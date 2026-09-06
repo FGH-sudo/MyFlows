@@ -16,29 +16,30 @@ def _worker_loop(
     index_queue: mp.Queue,
     out_queue: mp.Queue,
     dataset: Sequence,
-    batch_size: int,
     load_fn: Callable,
     transform_fn: Callable | None,
     stop_event: mp.Event,
 ):
-  batch_x, batch_meta = [], []
   while not stop_event.is_set():
     try:
-      idx = index_queue.get(timeout=0.5)
+      task = index_queue.get(timeout=0.5)
     except queue.Empty:
       continue
-    if idx is None:
+    if task is None:
       break
-    sample = load_fn(dataset[idx])
-    if transform_fn is not None:
-      sample = transform_fn(sample)
-    batch_x.append(sample[0])
-    batch_meta.append(sample[1] if len(sample) > 1 else None)
-    if len(batch_x) >= batch_size:
-      out_queue.put((batch_x, batch_meta))
-      batch_x, batch_meta = [], []
-  if batch_x:
-    out_queue.put((batch_x, batch_meta))
+    batch_id, indices = task
+    batch_x, batch_meta = [], []
+    try:
+      for idx in indices:
+        sample = load_fn(dataset[idx])
+        if transform_fn is not None:
+          sample = transform_fn(sample)
+        batch_x.append(sample[0])
+        batch_meta.append(sample[1] if len(sample) > 1 else None)
+    except Exception as exc:
+      out_queue.put((batch_id, None, f"{type(exc).__name__}: {exc}"))
+      return
+    out_queue.put((batch_id, batch_x, batch_meta))
   out_queue.put(None)
 
 
@@ -111,8 +112,9 @@ class MultiprocessDataLoader:
     if self.shuffle:
       rng = random.Random(self.seed)
       rng.shuffle(indices)
-    for idx in indices:
-      index_q.put(idx)
+    # Assign whole batches so uneven scheduling cannot produce multiple tails.
+    for batch_id, offset in enumerate(range(0, len(indices), self.batch_size)):
+      index_q.put((batch_id, indices[offset:offset + self.batch_size]))
     for _ in range(self.num_workers):
       index_q.put(None)
 
@@ -124,7 +126,6 @@ class MultiprocessDataLoader:
               index_q,
               out_q,
               self.dataset,
-              self.batch_size,
               self.load_fn,
               self.transform_fn,
               stop_event,
@@ -135,19 +136,37 @@ class MultiprocessDataLoader:
       workers.append(p)
 
     finished_workers = 0
+    pending = {}
+    next_batch = 0
     try:
       while finished_workers < self.num_workers:
         try:
-          batch = out_q.get(timeout=30.0)
+          batch = out_q.get(timeout=0.5)
         except queue.Empty:
-          break
+          if any(p.exitcode not in (None, 0) for p in workers):
+            raise RuntimeError("DataLoader worker exited before completing its batches")
+          if all(p.exitcode is not None for p in workers):
+            raise RuntimeError("DataLoader workers exited with missing results")
+          continue
         if batch is None:
           finished_workers += 1
           continue
-        yield batch
+        batch_id, batch_x, batch_meta = batch
+        if batch_x is None:
+          raise RuntimeError(f"DataLoader batch {batch_id} failed: {batch_meta}")
+        pending[batch_id] = (batch_x, batch_meta)
+        while next_batch in pending:
+          yield pending.pop(next_batch)
+          next_batch += 1
+      if next_batch != len(self):
+        raise RuntimeError("DataLoader returned an incomplete epoch")
     finally:
       stop_event.set()
       for p in workers:
         p.join(timeout=2.0)
         if p.is_alive():
           p.terminate()
+          p.join(timeout=2.0)
+      for channel in (index_q, out_q):
+        channel.cancel_join_thread()
+        channel.close()

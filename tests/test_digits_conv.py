@@ -20,6 +20,7 @@ from MyFlows.layers.layer import Conv2D, Dense, Flatten, MaxPool2d
 from MyFlows.ops.activation import ReLU
 from MyFlows.ops.loss import CrossEntropy
 from MyFlows.train.opt import Adam
+from MyFlows.utils.initializers import make_initializer
 
 
 def accuracy(logits, labels):
@@ -49,15 +50,15 @@ class DigitsConvSmokeTest(unittest.TestCase):
         x_test = x_data[test_indices][:, None, :, :]
         y_test = y_data[test_indices].reshape(-1, 1)
 
-        np.random.seed(0)
+        initializer = make_initializer(seed=0)
         x_node = Variable(x_train, name="digits")
         y_node = Variable(y_train, name="labels")
 
-        conv = Conv2D(1, 4, kernel_size=3, stride=1, padding=1, activation=ReLU, name="conv")
+        conv = Conv2D(1, 4, kernel_size=3, stride=1, padding=1, activation=ReLU, name="conv", initializer=initializer)
         pool = MaxPool2d(2, 2, name="pool")
         flatten = Flatten(name="flatten")
-        dense1 = Dense(4 * 4 * 4, 16, activation=ReLU, name="dense1")
-        dense2 = Dense(16, 2, name="dense2")
+        dense1 = Dense(4 * 4 * 4, 16, activation=ReLU, name="dense1", initializer=initializer)
+        dense2 = Dense(16, 2, name="dense2", initializer=initializer)
 
         logits = dense2(dense1(flatten(pool(conv(x_node)))))
         loss = CrossEntropy(logits, y_node)

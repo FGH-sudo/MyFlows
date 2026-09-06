@@ -84,6 +84,7 @@ def naive_maxpool_backward(x, grad_y, kernel_size=(2, 2), stride=(2, 2)):
     kernel_h, kernel_w = kernel_size
     stride_h, stride_w = stride
     grad_x = np.zeros_like(x)
+    batch_size, channels, _, _ = x.shape
     _, _, out_h, out_w = grad_y.shape
 
     for i in range(out_h):
@@ -91,8 +92,14 @@ def naive_maxpool_backward(x, grad_y, kernel_size=(2, 2), stride=(2, 2)):
             h_start = i * stride_h
             w_start = j * stride_w
             window = x[:, :, h_start:h_start + kernel_h, w_start:w_start + kernel_w]
-            mask = window == np.max(window, axis=(2, 3), keepdims=True)
-            grad_x[:, :, h_start:h_start + kernel_h, w_start:w_start + kernel_w] += mask * grad_y[:, :, i, j][:, :, None, None]
+            flat = window.reshape(batch_size, channels, -1)
+            mask_flat = np.zeros_like(flat)
+            argmax = np.argmax(flat, axis=-1)
+            mask_flat[np.arange(batch_size)[:, None], np.arange(channels)[None, :], argmax] = 1.0
+            mask = mask_flat.reshape(window.shape)
+            grad_x[:, :, h_start:h_start + kernel_h, w_start:w_start + kernel_w] += (
+                mask * grad_y[:, :, i, j][:, :, None, None]
+            )
     return grad_x
 
 
@@ -204,6 +211,17 @@ class ConvolutionOpsTest(unittest.TestCase):
 
         expected_x_grad = naive_maxpool_backward(x, upstream_grad, kernel_size=(2, 3), stride=(2, 1))
         self.assertTrue(np.allclose(x_node.grad, expected_x_grad, atol=1e-10))
+
+    def test_maxpool_backward_assigns_tied_max_to_first_index(self):
+        x = np.array([[[[1.0, 1.0], [0.0, 0.5]]]], dtype=np.float64)
+        x_node = Variable(x.copy())
+        op = MaxPool2d_Op(x_node, kernel_size=2, stride=2)
+        op.forward(x_node.value)
+        x_node.clear_grad()
+        op.grad = np.ones_like(op.value)
+        op.backward()
+        expected = np.array([[[[1.0, 0.0], [0.0, 0.0]]]], dtype=np.float64)
+        self.assertTrue(np.allclose(x_node.grad, expected, atol=1e-10))
 
     def test_conv2d_layer_supports_non_square_kernel(self):
         np.random.seed(0)

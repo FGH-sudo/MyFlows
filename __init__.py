@@ -35,7 +35,7 @@ from .layers.resnet import (
     BasicBlock,
     ResNet18,
 )
-from .layers.vgg import VGG11, vgg_fc_input_dim
+from .layers.vgg import VGG11, VGG11Standard, VGG13, vgg_fc_input_dim
 from .utils.serialization import save_checkpoint, load_checkpoint, export_onnx
 
 # --- 操作符 (ops) ---
@@ -105,7 +105,7 @@ __all__ = [
     # Layers
     'Layer', 'Dense', 'Conv2D', 'GroupedConv2D', 'DepthwiseConv2D', 'DepthwiseSeparableConv2D', 'DilatedConv2D', 'ConvTranspose2D', 'Dropout', 'MaxPool2d', 'Flatten', 'save_checkpoint', 'load_checkpoint', 'export_onnx',
     'BatchNorm2d', 'GlobalAvgPool2d', 'BasicBlock', 'ResNet18',
-    'VGG11', 'vgg_fc_input_dim',
+    'VGG11', 'VGG11Standard', 'VGG13', 'vgg_fc_input_dim',
     # Ops
     'Add', 'MatMul', 'PerceptionLoss', 'LogLoss', 'CrossEntropy', 'MSELoss', 'Logistic', 'Softmax', 'Tanh', 'ReLU', 'LeakyReLU', 'Conv2D_Op', 'ConvTranspose2D_Op', 'Dropout_Op', 'MaxPool2d_Op', 'Flatten_Op', 'effective_kernel_size', 'im2col', 'col2im',
     'BatchNorm2d_Op', 'GlobalAvgPool2d_Op',

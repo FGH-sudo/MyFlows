@@ -15,6 +15,7 @@ from MyFlows.layers.layer import Conv2D, Dense, Flatten
 from MyFlows.ops.activation import ReLU
 from MyFlows.ops.loss import CrossEntropy, LogLoss
 from MyFlows.train.opt import Adam, MBGD
+from MyFlows.utils.initializers import make_initializer
 
 
 def binary_accuracy(logits, labels):
@@ -38,10 +39,10 @@ class FrameworkIntegrationTest(unittest.TestCase):
             np.ones((32, 1), dtype=np.float64),
         ])
 
-        np.random.seed(0)
+        initializer = make_initializer(seed=0)
         x_node = Variable(x_data, name="x")
         y_node = Variable(y_data, name="y")
-        dense = Dense(2, 1, name="linear")
+        dense = Dense(2, 1, name="linear", initializer=initializer)
         logits = dense(x_node)
         loss = LogLoss(logits, y_node)
         graph = Graph(loss)
@@ -78,13 +79,13 @@ class FrameworkIntegrationTest(unittest.TestCase):
         )
         y_data = np.array([[0], [0], [1], [1], [0], [0], [1], [1]], dtype=np.int64)
 
-        np.random.seed(1)
+        initializer = make_initializer(seed=1)
         x_node = Variable(x_data, name="images")
         y_node = Variable(y_data, name="labels")
 
-        conv = Conv2D(1, 2, kernel_size=2, stride=1, padding=0, activation=ReLU, name="conv")
+        conv = Conv2D(1, 2, kernel_size=2, stride=1, padding=0, activation=ReLU, name="conv", initializer=initializer)
         flatten = Flatten(name="flatten")
-        dense = Dense(18, 2, name="classifier")
+        dense = Dense(18, 2, name="classifier", initializer=initializer)
 
         logits = dense(flatten(conv(x_node)))
         loss = CrossEntropy(logits, y_node)

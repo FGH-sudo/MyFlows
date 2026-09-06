@@ -12,7 +12,7 @@ if str(PROJECT_PARENT) not in sys.path:
 import MyFlows as ms
 from MyFlows.core.graph import Graph
 from MyFlows.core.node import Variable
-from MyFlows.layers.vgg import VGG11, vgg_fc_input_dim
+from MyFlows.layers.vgg import VGG11, VGG11Standard, VGG13, vgg_fc_input_dim
 from MyFlows.ops.loss import MSELoss
 from MyFlows.train.opt import Adam
 
@@ -40,6 +40,15 @@ class VGGSmokeTest(unittest.TestCase):
         opt.one_step()
         self.assertIsNotNone(model.fc3.W.grad)
         opt.update()
+
+    def test_vgg11_alias_keeps_vgg13_config_and_standard_is_true_vgg11(self):
+        self.assertIs(VGG11, VGG13)
+        vgg13 = VGG13(3, output_dim=2, image_h=32, image_w=32)
+        vgg11_std = VGG11Standard(3, output_dim=2, image_h=32, image_w=32)
+        n_conv_13 = sum(1 for layer in vgg13.feature_layers if layer.__class__.__name__ == "Conv2D")
+        n_conv_11 = sum(1 for layer in vgg11_std.feature_layers if layer.__class__.__name__ == "Conv2D")
+        self.assertEqual(n_conv_13, 10)
+        self.assertEqual(n_conv_11, 8)
 
 
 if __name__ == "__main__":

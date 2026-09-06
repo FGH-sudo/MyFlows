@@ -8,24 +8,26 @@ class PerceptionLoss(Node):
     """
     def __init__(self, y_pred, y_true, name="PerceptionLoss"):
         super().__init__(y_pred, y_true, name=name)
+        self.y_pred = y_pred
+        self.y_true = y_true
 
     def forward(self, y_pred_val, y_true_val):
         # 存储值以便反向传播
         self.y_pred_val = y_pred_val
         self.y_true_val = y_true_val
-        
-       
+
         losses = xp.where(self.y_true_val * self.y_pred_val < 0, -self.y_true_val * self.y_pred_val, 0)
-        
+
         # 返回平均损失
         self.value = xp.mean(losses)
 
     def backward(self):
         # 损失对 y_pred 的梯度
         grad_signal = xp.where(self.y_true_val * self.y_pred_val < 0, -self.y_true_val, 0)
-        
-        # 梯度平均
-        y_pred.grad += self.grad * (grad_signal / len(self.y_true_val))
+        n = max(int(self.y_true_val.size), 1)
+        if self.y_pred.grad is None:
+            self.y_pred.clear_grad()
+        self.y_pred.grad += self.grad * (grad_signal / n)
 
 
 class LogLoss(Node):
@@ -75,9 +77,9 @@ class CrossEntropy(Node):
         # 处理标签维度 (兼容整数索引或 One-hot)
         if y_true_val.ndim == 1 or y_true_val.shape[1] == 1:
             num_classes = logits_val.shape[1]
-            self.y_true_final = xp.eye(num_classes)[y_true_val.reshape(-1).astype(int)]
+            self.y_true_final = xp.eye(num_classes, dtype=logits_val.dtype)[y_true_val.reshape(-1).astype(int)]
         else:
-            self.y_true_final = y_true_val
+            self.y_true_final = y_true_val.astype(logits_val.dtype, copy=False)
 
         # 计算 Loss 值
         self.value = -xp.mean(xp.sum(self.y_true_final * xp.log(self.probs + 1e-10), axis=-1))

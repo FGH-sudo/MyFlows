@@ -59,6 +59,10 @@ class InitializersRegularizationDropoutInspectorTest(unittest.TestCase):
         Graph(y2).forward()
         np.testing.assert_allclose(first, y2.value)
 
+        graph.forward()
+        second = y.value.copy()
+        self.assertFalse(np.allclose(first, second))
+
         dropout.eval()
         graph.forward()
         np.testing.assert_allclose(y.value, np.ones((2, 4)))

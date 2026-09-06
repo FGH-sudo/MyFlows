@@ -42,12 +42,12 @@ class Layer:
 
 class Dense(Layer):
     """全连接层：实现 Z = XW + b"""
-    def __init__(self, input_dim, output_dim, activation=None, name=None, initializer=None):
+    def __init__(self, input_dim, output_dim, activation=None, name=None, initializer=None, dtype=None):
         super().__init__(name=name)
         
         init = make_initializer(initializer)
-        w_init = xp.asarray(init((input_dim, output_dim)))
-        b_init = xp.zeros((1, output_dim))
+        w_init = xp.asarray(init((input_dim, output_dim)), dtype=dtype)
+        b_init = xp.zeros((1, output_dim), dtype=w_init.dtype)
         
         self.W = Variable(w_init, trainable=True, name=f"{self.name}_W" if self.name else "W")
         self.b = Variable(b_init, trainable=True, name=f"{self.name}_b" if self.name else "b")
@@ -79,8 +79,20 @@ class Conv2D(Layer):
         fuse_activation=True,
         name=None,
         initializer=None,
+        dtype=None,
+        backend="auto",
     ):
         super().__init__(name=name)
+
+        from ..ops.convolution import _backend_name
+        self.backend = _backend_name(backend)
+        if backend == "cuda_c":
+            from ..ops.cuda.kernels import pair
+            pair(kernel_size, "kernel_size")
+            pair(stride, "stride")
+            pair(padding, "padding", 0)
+            if groups != 1 or pair(dilation, "dilation") != (1, 1):
+                raise ValueError("cuda_c supports only groups=1 and dilation=1")
 
         in_channels = _positive_int(in_channels, "in_channels")
         out_channels = _positive_int(out_channels, "out_channels")
@@ -97,8 +109,8 @@ class Conv2D(Layer):
 
         fan_in = (in_channels // groups) * kernel_h * kernel_w
         init = make_initializer(initializer)
-        k_init = xp.asarray(init((out_channels, in_channels // groups, kernel_h, kernel_w)))
-        b_init = xp.zeros((out_channels,))
+        k_init = xp.asarray(init((out_channels, in_channels // groups, kernel_h, kernel_w)), dtype=dtype)
+        b_init = xp.zeros((out_channels,), dtype=k_init.dtype)
 
         self.kernel = Variable(k_init, trainable=True, name=f"{self.name}_kernel" if self.name else "kernel")
         self.b = Variable(b_init, trainable=True, name=f"{self.name}_bias" if self.name else "bias")
@@ -129,6 +141,7 @@ class Conv2D(Layer):
                         groups=self.groups,
                         dilation=self.dilation,
                         bias=self.b,
+                        backend=self.backend,
                     )
                     return conv_out
             except Exception:
@@ -143,6 +156,7 @@ class Conv2D(Layer):
             groups=self.groups,
             dilation=self.dilation,
             bias=self.b,
+            backend=self.backend,
         )
         return self.activation(conv_out) if self.activation else conv_out
 
@@ -347,12 +361,14 @@ class ConvTranspose2D(Layer):
         return self.activation(conv_out) if self.activation else conv_out
 
 class MaxPool2d(Layer):
-    def __init__(self, kernel_size=2, stride=2, name=None):
+    def __init__(self, kernel_size=2, stride=2, name=None, backend="auto"):
         super().__init__(name=name)
+        from ..ops.convolution import _backend_name
+        self.backend = _backend_name(backend)
         self.k, self.s = kernel_size, stride
         self.params = []
     def forward(self, input_node):
-        return MaxPool2d_Op(input_node, self.k, self.s)
+        return MaxPool2d_Op(input_node, self.k, self.s, backend=self.backend)
 
 
 class Flatten(Layer):

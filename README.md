@@ -17,19 +17,21 @@ ms.use_cuda()  # 或 ms.set_device("cpu")
 |------|------|
 | `core/` | 设备、`Tensor` / `Variable` / `Node`、`Graph`、图优化 |
 | `ops/` | 基础算子、激活、卷积（im2col+GEMM）、BN、Dropout、损失 |
-| `layers/` | Dense / Conv / Pool / Dropout、`ResNet18`、`VGG11` |
+| `ops/cuda/` | 自写 FP32 Conv/Pool CUDA 前反向及 NVRTC wrapper |
+| `distributed/` | CPU 同步 PS，server/worker/launcher、消息校验与计时 |
+| `examples/stage1_cnn.py` | 固定 32 样本 FP32 CNN 训练示例 |
+| `layers/` | Dense / Conv / Pool / Dropout、`ResNet18` |
 | `train/` | 优化器（MBGD / Momentum / AdaGrad / RMSProp / Adam）、L1/L2 正则 |
 | `data/` | `MultiprocessDataLoader` 生产者-消费者流水线 |
 | `utils/` | checkpoint、ONNX、指标、增强、可视化、Grad-CAM、量化、初始化、模型检查 |
 | `tests/` | `unittest` 测试套件 |
-| `update_logs/` | 功能变更记录 |
 
 ## 主要能力
 
 - **动态图**：`ms.Graph(logits)` 自动拓扑排序，支持 `forward()` / `backward()`
 - **设备**：`set_device` / `use_cuda` / `cuda_available`；Windows 下可复用本机 CUDA DLL
-- **CNN**：Conv2D（含分组 / 深度 / 空洞 / 转置）、MaxPool、BN、GlobalAvgPool；卷积实现为 im2col + GEMM
-- **模型**：`ResNet18`、`VGG11`，回归头使用 `output_dim`（DonkeyCar 为 2）
+- **CNN**：Conv2D（含分组 / 深度 / 空洞 / 转置）、MaxPool、BN、GlobalAvgPool；默认卷积为 im2col + GEMM，可显式选用阶段一直接 CUDA C 或阶段二 CUDA im2col/col2im 实验后端
+- **模型**：当前训练和评估主线使用 `ResNet18`，回归头使用 `output_dim`（DonkeyCar 为 2）
 - **训练周边**：Dropout、权重正则、Xavier / Kaiming 等初始化、早停与诊断由父仓库训练脚本编排
 - **图优化**：常量折叠、Linear 融合、Conv+ReLU、推理态 Conv+BN 折叠（`Graph(optimize=True)`）
 - **序列化**：JSON + NPZ checkpoint；`export_onnx` 导出部署图
@@ -64,15 +66,35 @@ from MyFlows.utils.checkpoint import save_checkpoint, load_checkpoint
 在父仓库根目录执行：
 
 ```bash
-python -m unittest discover -s MyFlows/tests -p "test_*.py"
+python -m tools.run_tests --scope framework
 ```
 
 单测示例：
 
 ```bash
 python -m unittest MyFlows.tests.test_convolution -v
-python -m unittest MyFlows.tests.test_resnet18_smoke MyFlows.tests.test_vgg_smoke -v
+python -m tools.run_tests --scope framework --pattern test_resnet18_smoke.py
 ```
+
+## 第一阶段 CUDA 与 PS
+
+在父仓库使用 `requirements-stage1-lock.txt` 创建独立 Python 3.11 环境；CuPy 的 CUDA 用户态依赖由 pip 安装，无须安装 PyTorch 才能运行新算子。旧 TensorBoard logger 仍可选依赖 PyTorch。
+
+```python
+import numpy as np
+import MyFlows as ms
+from MyFlows.utils.initializers import make_initializer
+
+ms.set_device("cuda")
+conv = ms.Conv2D(1, 4, kernel_size=3, padding=1, backend="cuda_c",
+                 dtype=np.float32, initializer=make_initializer(seed=0),
+                 fuse_activation=False)
+pool = ms.MaxPool2d(2, 2, backend="cuda_c")
+```
+
+`auto` 保留 CPU/NumPy 与 GPU/CuPy 默认行为。`cuda_c` 要求当前 GPU 上的 FP32 输入，支持 groups=1/dilation=1；`cuda_im2col` 在相同约束下将 im2col/col2im 迁移到 CUDA C，并复用 CuPy GEMM；`cuda_im2col_gemm` 进一步使用自写 CUDA GEMM。三条 CUDA 路径不支持的配置会报错。Pool 不带 padding，最大值相等时选择首个位置，重叠窗口梯度求和。输入须为有限值；wrapper 接受非连续 view 并连续化，普通调用不主动同步设备。
+
+父仓库 `benchmark.cuda_ops` 和 `benchmark.ps_demo` 提供完整运行入口，`benchmark.profile_cuda` 生成并检查真实 Nsight 报告。范围、命令和证据见 [第一阶段报告](../docs/experiments/semester_2026_fall/stage1/README.md)。
 
 ## 与父项目的关系
 
@@ -85,7 +107,6 @@ python -m unittest MyFlows.tests.test_resnet18_smoke MyFlows.tests.test_vgg_smok
 
 ```bash
 python -m apps.train.train_myflows_donkey --max-samples 200 --epochs 1 --device auto
-python -m apps.train.train_vgg_donkey_regression --max-samples 64 --epochs 1 --device cpu
 ```
 
 ONNX 导出由训练脚本 `--export-onnx` 触发，底层调用本仓库的 `utils/onnx_exporter.py`。
@@ -105,7 +126,3 @@ graph = ms.Graph(logits)
 graph.forward()
 print(logits.value.shape)  # (2, 2)
 ```
-
-## 变更记录
-
-功能演进说明见 [`update_logs/`](update_logs/)。
