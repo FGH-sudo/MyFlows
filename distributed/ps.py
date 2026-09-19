@@ -1,63 +1,90 @@
-"""Synchronous parameter owner and the only process applying optimizer updates."""
+"""PS process entry: serve the shared engine over Socket or gRPC."""
 
-import time
+from __future__ import annotations
+
 import traceback
+import threading
 
-from .model import SmallMLP
-from .protocol import aggregate, clone, event, payload_bytes, payload_hash, receive, schema_hash, send, validate_gradient
+from .constants import (
+    BIND_HOST,
+    DEFAULT_PS_DIGEST_ROUNDS,
+    DEFAULT_PS_RETAIN_ROUNDS,
+)
+from .engine import PSEngine
+from .monitor import emit
+from .session import TrainSession
+from .shards import split_global_batch
+from .transport_socket import serve_socket
 
 
-def server_main(config, incoming, replies, events, results, stop):
-    model = SmallMLP(config["seed"])
-    history, losses = [model.snapshot()], []
-    step = -1
+def build_engine(config):
+    snapshot = TrainSession(config, for_compute=False)
+    sizes = split_global_batch(int(config["global_batch"]), int(config["train_workers"]),
+                               config.get("shard_sizes"))
+    engine = PSEngine(
+        run_id=config["run_id"],
+        n_workers=int(config["train_workers"]),
+        init_parameters=snapshot.named_parameters_cpu(),
+        optimizer_meta=snapshot.optimizer_meta(),
+        shard_sizes=sizes,
+        heartbeat_timeout_s=float(config.get("heartbeat_timeout_s", 5.0)),
+        reconnect_wait_s=float(config.get("reconnect_wait_s", 10.0)),
+        retain_rounds=int(config.get("retain_rounds", DEFAULT_PS_RETAIN_ROUNDS)),
+        digest_rounds=int(config.get("digest_rounds", DEFAULT_PS_DIGEST_ROUNDS)),
+    )
+    engine.committed_version = snapshot.local_version
+    engine.initial_version = snapshot.local_version
+    return engine, snapshot
+
+
+def server_main(config, events, results, stop):
+    engine = None
     try:
-        for step in range(config["steps"] + 1):
-            step_start = time.perf_counter()
-            params = model.snapshot()
-            parameter_hash = payload_hash(params)
-            for reply in replies:
-                send(reply, {"kind": "parameters", "run_id": config["run_id"], "step_id": step,
-                             "parameter_version": step, "parameters": clone(params),
-                             "schema_hash": schema_hash(params), "parameter_hash": parameter_hash}, stop, config["timeout"])
-            broadcast_s = time.perf_counter() - step_start
-            received = {}
-            collect_start = time.perf_counter()
-            while len(received) < config["workers"]:
-                message = receive(incoming, stop, config["timeout"])
-                if step == config["steps"]:
-                    worker = message.get("worker_id")
-                    expected = {"kind": "done", "run_id": config["run_id"], "worker_id": worker,
-                                "parameter_version": step, "parameter_hash": parameter_hash}
-                    if message != expected or type(worker) is not int or not 0 <= worker < config["workers"] or worker in received:
-                        raise ValueError("invalid/duplicate final acknowledgement")
-                else:
-                    worker = validate_gradient(message, run_id=config["run_id"], step=step,
-                                               parameter_hash=parameter_hash, reference=params,
-                                               shard_sizes=config["shard_sizes"], received=received)
-                    send(replies[worker], {"kind": "ack", "run_id": config["run_id"],
-                                          "worker_id": worker, "step_id": step}, stop, config["timeout"])
-                received[worker] = message
-            collect_s = time.perf_counter() - collect_start
-            if step == config["steps"]:
-                break
-            aggregate_start = time.perf_counter()
-            gradients, loss, total = aggregate([received[i] for i in range(config["workers"])])
-            aggregate_s = time.perf_counter() - aggregate_start
-            update_start = time.perf_counter()
-            model.update(gradients)
-            update_s = time.perf_counter() - update_start
-            history.append(model.snapshot())
-            losses.append(loss)
-            event(events, stop, config, "server", None, step, "updated", parameter_version=step + 1,
-                  n_samples=total, loss=loss, collect_wait_s=collect_s, aggregate_s=aggregate_s,
-                  update_s=update_s, broadcast_submit_s=broadcast_s, step_s=time.perf_counter() - step_start,
-                  parameter_payload_bytes=payload_bytes(params) * config["workers"],
-                  gradient_payload_bytes=sum(payload_bytes(m["gradients"]) for m in received.values()))
-        send(results, {"status": "passed", "history": history, "losses": losses}, stop, config["timeout"])
+        engine, snapshot = build_engine(config)
+        def watchdog():
+            while not stop.wait(0.1):
+                missing = engine.check_liveness()
+                if missing:
+                    emit(events, config, 'server', None, -1, 'heartbeat_timeout', missing=missing)
+                    stop.set()
+                    return
+        threading.Thread(target=watchdog, daemon=True).start()
+        emit(events, config, "server", None, -1, "listening",
+             port=config.get("ps_port"), transport=config.get("transport"))
+        transport = config.get("transport", "socket_json")
+        if transport == "socket_json":
+            serve_socket(engine, config["ps_port"], stop, host=config.get("bind_host", BIND_HOST),
+                         timeout=float(config.get("timeout", 30)))
+        elif transport == "grpc_proto":
+            from .transport_grpc import serve_ps_grpc
+            serve_ps_grpc(engine, config["ps_port"], stop, timeout=float(config.get("timeout", 30)))
+        else:
+            raise ValueError(f"unsupported PS transport {transport}")
+        if engine.aborted:
+            raise RuntimeError(engine.aborted)
+        emit(events, config, "server", None, -1, "cache_stats",
+             cache_sizes=engine.cache_sizes(),
+             cache_footprint_bytes=engine.cache_footprint_bytes(),
+             retained_payload_bytes=engine.retained_payload_bytes())
+        try:
+            results.put({
+                "status": "passed" if not engine.aborted else "failed",
+                "error": engine.aborted,
+                "init_parameter_hash": snapshot.parameter_hash(),
+                "schema_hash": snapshot.schema_hash(),
+            }, timeout=1)
+        except Exception:
+            pass
     except BaseException as exc:
-        # The result channel is drained by the launcher even after a stop signal.
-        results.put({"status": "failed", "error": f"{type(exc).__name__}: {exc}",
-                     "failed_step": step, "traceback": traceback.format_exc()}, timeout=1)
+        if engine is not None:
+            engine.abort(str(exc))
+        try:
+            results.put({
+                "status": "failed",
+                "error": f"{type(exc).__name__}: {exc}",
+                "traceback": traceback.format_exc(),
+            }, timeout=1)
+        except Exception:
+            pass
         stop.set()
         raise SystemExit(1) from None

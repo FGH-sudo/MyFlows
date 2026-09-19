@@ -3,11 +3,38 @@
 
 from __future__ import annotations
 
+import importlib.util
+import os
+from pathlib import Path
+
 import numpy as np
 
 _DEVICE = "cpu"
 _CUPY = None
 _CUDA_PATH_CONFIGURED = False
+
+
+def _bundled_cuda_runtime_root() -> str | None:
+    """Return the Python-provided CUDA runtime root when its headers exist.
+
+    The project pins ``cupy-cuda12x`` together with the CUDA 12 runtime,
+    NVRTC, and cuBLAS wheels.  On Windows, CuPy gives ``CUDA_PATH`` priority
+    over those wheels.  A machine-wide CUDA 13 toolkit can therefore make
+    NVRTC 12.x parse incompatible CUDA 13 headers.  Keep this selection at
+    the framework boundary so the system toolkit remains available to
+    ``nvcc``/CMake processes outside the runtime.
+    """
+    try:
+        spec = importlib.util.find_spec("nvidia.cuda_runtime")
+        locations = list(spec.submodule_search_locations or ()) if spec else []
+        if not locations:
+            return None
+        root = Path(locations[0])
+        if (root / "include" / "cuda_runtime_api.h").is_file():
+            return str(root)
+    except (ImportError, AttributeError, OSError):
+        return None
+    return None
 
 
 def configure_cuda_dll_path() -> None:
@@ -22,11 +49,15 @@ def _configure_cuda_lib_path() -> None:
         return
     _CUDA_PATH_CONFIGURED = True
 
-    import os
     import sys
 
     candidates = []
-    cuda_path = os.environ.get("CUDA_PATH")
+    cuda_path = _bundled_cuda_runtime_root() or os.environ.get("CUDA_PATH")
+    if cuda_path:
+        # CuPy 14 reads CUDA_PATH when it resolves NVRTC include headers.
+        # Prefer the wheel-matched CUDA 12 headers over a machine-wide CUDA
+        # toolkit that may be a different major version.
+        os.environ["CUDA_PATH"] = cuda_path
     if cuda_path:
         candidates.append(os.path.join(cuda_path, "bin"))
     try:
