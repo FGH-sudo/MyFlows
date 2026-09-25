@@ -1,6 +1,7 @@
 """Optional, durable experiment measurements; never transports model updates."""
 
 import json
+import os
 from pathlib import Path
 import time
 
@@ -148,7 +149,7 @@ class Recorder:
                 initial['val'] = evaluate(self.session, self.data, 'val', self.config.get('eval_batch', self.config['global_batch']))
         write_json(self.directory / 'initial.json', initial)
         self.barrier('prepared')
-        write_json(self.directory / 'prepare.json', {'prepare_s': time.perf_counter()-self.started})
+        write_json(self.directory / 'prepare.json', {'prepare_s': time.perf_counter()-self.started, 'pid': os.getpid()})
 
     def start_epoch(self, epoch):
         if self.root:

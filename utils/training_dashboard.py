@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import json
+import time
 from pathlib import Path
 from typing import Mapping
 
@@ -38,8 +40,14 @@ class TrainingDashboard:
         log_interval: int = 10,
         max_hist_params: int = 24,
         feature_channels: int = 16,
+        jsonl_path: str | Path | None = None,
     ):
         self.log_dir = Path(log_dir)
+        self.jsonl_path = Path(jsonl_path) if jsonl_path else None
+        self._jsonl = None
+        if self.jsonl_path is not None:
+            self.jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+            self._jsonl = self.jsonl_path.open("a", encoding="utf-8", buffering=1)
         self.tb = TensorBoardLogger(self.log_dir, enabled=enabled)
         self.grad_interval = int(grad_interval)
         self.param_interval = int(param_interval)
@@ -52,6 +60,12 @@ class TrainingDashboard:
     @property
     def active(self) -> bool:
         return self.tb.active
+
+    def _write_jsonl(self, row: dict) -> None:
+        if self._jsonl is None:
+            return
+        row = {"monotonic_s": time.perf_counter(), "unix_s": time.time(), **row}
+        self._jsonl.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     def log_run_config(self, args, extra: Mapping[str, object] | None = None, step: int = 0) -> None:
         if self.active:
@@ -101,7 +115,16 @@ class TrainingDashboard:
         task: str,
         num_classes: int | None = None,
         force: bool = False,
+        epoch: int | None = None,
     ) -> None:
+        samples_per_sec = float(batch_size) / max(step_time_ms / 1000.0, 1e-12)
+        self._write_jsonl({
+            "kind": "step", "epoch": epoch, "step": int(step), "loss": float(loss),
+            "running_loss": None if running_loss is None else float(running_loss),
+            "accuracy": None if accuracy is None else float(accuracy),
+            "data_load_ms": float(data_load_ms), "train_step_ms": float(train_step_ms),
+            "step_time_ms": float(step_time_ms), "batch_size": int(batch_size), "samples_per_sec": samples_per_sec,
+        })
         if not self.active:
             return
         if not force and (self.log_interval <= 0 or step % self.log_interval != 0):
@@ -114,7 +137,7 @@ class TrainingDashboard:
         self.tb.log_scalar("train/data_load_ms", data_load_ms, step)
         self.tb.log_scalar("train/train_step_ms", train_step_ms, step)
         self.tb.log_scalar("train/step_time_ms", step_time_ms, step)
-        self.tb.log_scalar("train/samples_per_sec", float(batch_size) / max(step_time_ms / 1000.0, 1e-12), step)
+        self.tb.log_scalar("train/samples_per_sec", samples_per_sec, step)
         if task == "classification":
             if num_classes is None:
                 raise ValueError("num_classes is required for classification batch stats")
@@ -144,6 +167,13 @@ class TrainingDashboard:
         validation_loss: float | None = None,
         validation_accuracy: float | None = None,
     ) -> None:
+        self._write_jsonl({
+            "kind": "epoch", "epoch": int(epoch), "loss": float(loss),
+            "accuracy": None if accuracy is None else float(accuracy),
+            "val_loss": None if validation_loss is None else float(validation_loss),
+            "val_accuracy": None if validation_accuracy is None else float(validation_accuracy),
+            "learning_rate": float(learning_rate), "epoch_time_s": float(epoch_time_s),
+        })
         if not self.active:
             return
         self.tb.log_scalar("train/loss_epoch", loss, epoch)
@@ -162,6 +192,11 @@ class TrainingDashboard:
 
     def flush(self) -> None:
         self.tb.flush()
+        if self._jsonl is not None:
+            self._jsonl.flush()
 
     def close(self) -> None:
         self.tb.close()
+        if self._jsonl is not None:
+            self._jsonl.close()
+            self._jsonl = None
