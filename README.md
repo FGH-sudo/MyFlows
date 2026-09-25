@@ -96,6 +96,19 @@ pool = ms.MaxPool2d(2, 2, backend="cuda_native_cublas")
 
 父仓库 `benchmark.cuda_ops` 和 `benchmark.ps_demo` 提供完整运行入口，`benchmark.profile_cuda` 生成并检查真实 Nsight 报告。范围、命令和证据见 [第一阶段报告](../docs/experiments/semester_2026_fall/stage1/README.md)。
 
+## PS 等待策略
+
+`run_training(mode="ps", ps_wait_strategy="poll", ...)` 默认保留服务端 20 ms 轮询。
+设置 `ps_wait_strategy="notify"` 可在梯度齐备、更新完成或中止时通过条件变量立即唤醒等待者；
+每步同步、加权平均、版本控制和参数/优化器状态校验保持相同。
+父仓库统一入口对应 `--ps-wait-strategy notify`，实验 JSON 对应 `"ps_wait_strategy": "notify"`。
+
+2026-09-26 单张 RTX 4060 Laptop GPU 的三次交错重复中，MNIST 双 Worker PS 从
+11.813 s/epoch 降到 3.979 s；ResNet18 从 14.929 s 增到 15.700 s。
+因此 notify 是可选策略，尚不能作为所有任务的默认；两任务仍未超过各自单进程。
+Ring 已使用条件通知，不受该配置影响。详细口径与完整数据见父仓库的
+[双 Worker 性能研究](../docs/experiments/semester_2026_fall/distributed_gpu/20260926_two_workers/README.md)。
+
 ## 与父项目的关系
 
 | 层级 | 职责 |
