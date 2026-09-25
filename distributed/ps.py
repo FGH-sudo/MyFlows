@@ -31,7 +31,6 @@ def build_engine(config):
         reconnect_wait_s=float(config.get("reconnect_wait_s", 10.0)),
         retain_rounds=int(config.get("retain_rounds", DEFAULT_PS_RETAIN_ROUNDS)),
         digest_rounds=int(config.get("digest_rounds", DEFAULT_PS_DIGEST_ROUNDS)),
-        wait_strategy=config.get("ps_wait_strategy", "poll"),
     )
     engine.committed_version = snapshot.local_version
     engine.initial_version = snapshot.local_version

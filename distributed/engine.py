@@ -65,7 +65,6 @@ class PSEngine:
         reconnect_wait_s=10.0,
         retain_rounds=DEFAULT_PS_RETAIN_ROUNDS,
         digest_rounds=DEFAULT_PS_DIGEST_ROUNDS,
-        wait_strategy="poll",
     ):
         self.run_id = run_id
         self.n_workers = int(n_workers)
@@ -82,9 +81,6 @@ class PSEngine:
         self.reconnect_wait_s = float(reconnect_wait_s)
         self.retain_rounds = int(retain_rounds)
         self.digest_rounds = int(digest_rounds)
-        if wait_strategy not in ("poll", "notify"):
-            raise ValueError("wait_strategy must be poll or notify")
-        self.wait_strategy = wait_strategy
         if self.retain_rounds < 0:
             raise ValueError("retain_rounds must be >= 0")
         if self.digest_rounds < 1:
@@ -92,7 +88,6 @@ class PSEngine:
         if self.digest_rounds < self.retain_rounds:
             raise ValueError("digest_rounds must be >= retain_rounds")
         self.lock = threading.RLock()
-        self.cv = threading.Condition(self.lock)
         self.heartbeats = {i: time.monotonic() for i in range(self.n_workers)}
         self.initialized = set()
         self.committed_version = 0
@@ -131,7 +126,6 @@ class PSEngine:
     def abort(self, reason):
         with self.lock:
             self.aborted = str(reason)
-            self.cv.notify_all()
             return self.aborted
 
     def init_ready(self):
@@ -190,7 +184,6 @@ class PSEngine:
         with self.lock:
             self.stopped = True
             self.aborted = self.aborted or "stopped"
-            self.cv.notify_all()
             return self._reply(message, STATUS_OK)
 
     def _init(self, message):
@@ -291,35 +284,15 @@ class PSEngine:
                 "target_parameter_version": version + 1,
                 "payload_hash": payload_hash(avg),
             }
-            self.cv.notify_all()
         return self._reply(message, STATUS_OK, accepted=True, global_step=step)
 
     def _poll(self, once, message, wait_s):
-        if self.wait_strategy == "notify":
-            return self._wait_for_state(once, message, wait_s)
-        # Keep the established scheduling behavior as the default: removing
-        # these waits helped tiny MLPs but regressed shared-GPU ResNet runs.
         deadline = time.monotonic() + max(0.0, float(wait_s))
         while True:
             reply = once(message)
             if reply.get("status") != STATUS_WAITING or time.monotonic() >= deadline:
                 return reply
             time.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
-
-    def _wait_for_state(self, once, message, wait_s):
-        deadline = time.monotonic() + max(0.0, float(wait_s))
-        # Check and wait under the same lock as state transitions. Condition
-        # wait releases the lock, allowing peer RPCs and heartbeats to progress,
-        # and avoids both lost notifications and 20 ms polling delays.
-        with self.cv:
-            while True:
-                if self.aborted:
-                    return self._reply(message, STATUS_ABORTED, self.aborted)
-                reply = once(message)
-                remaining = deadline - time.monotonic()
-                if reply.get("status") != STATUS_WAITING or remaining <= 0:
-                    return reply
-                self.cv.wait(remaining)
 
     def _pull_once(self, message):
         with self.lock:
@@ -391,7 +364,6 @@ class PSEngine:
             reply = self._reply(message, STATUS_OK, **rnd.ready)
             self._store_ok(message, reply)
             self._gc_locked()
-            self.cv.notify_all()
             return reply
 
     def _checked_update_summary(self, message, rnd):

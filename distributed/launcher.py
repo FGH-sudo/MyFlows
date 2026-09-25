@@ -49,9 +49,6 @@ def normalize_config(**kwargs):
     config.setdefault("fault_step", 0)
     config.setdefault("collect_history", True)
     config.setdefault("bind_host", BIND_HOST)
-    config.setdefault("ps_wait_strategy", "poll")
-    if config["ps_wait_strategy"] not in ("poll", "notify"):
-        raise ValueError("ps_wait_strategy must be poll or notify")
     config["train_workers"] = int(config.get("train_workers") or config.get("workers") or 2)
     config["workers"] = config["train_workers"]
     if str(config["task"]) not in KNOWN_TASKS:
