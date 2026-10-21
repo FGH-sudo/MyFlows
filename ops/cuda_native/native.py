@@ -19,7 +19,7 @@ from ...core.device import _lazy_cupy
 
 
 ROOT = Path(__file__).resolve().parents[3]
-DLL_PATH = ROOT / ".codex" / "native-cuda" / "native_cublas.dll"
+DLL_PATH = ROOT / "build" / "native-cuda" / "native_cublas.dll"
 _nvidia_spec = importlib.util.find_spec("nvidia")
 _torch_spec = importlib.util.find_spec("torch")
 PYTHON_SITE = Path(next(iter(_nvidia_spec.submodule_search_locations))).parent if _nvidia_spec else Path()
