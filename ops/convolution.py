@@ -1,10 +1,17 @@
-from ..core.device import xp, get_device
+from functools import cache
+
+from ..core.device import _lazy_cupy, xp, get_device
 from ..core.node import Node
 
 
+# 原生 CUDA 后端 -> GEMM 引擎：im2col/col2im、尾处理与池化都是项目自己的 kernel，卷积的三个 GEMM 用
+# 第 19 讲的寄存器分块 kernel（register）或 cuBLAS（cublas）
+NATIVE_BACKENDS = {"cuda_native_register": "register", "cuda_native_cublas": "cublas"}
+
+
 def _backend_name(backend):
-    if backend not in ("auto", "numpy", "cupy", "cuda_native_cublas"):
-        raise ValueError("backend must be auto, numpy, cupy or cuda_native_cublas")
+    if backend not in ("auto", "numpy", "cupy", *NATIVE_BACKENDS):
+        raise ValueError("backend must be auto, numpy, cupy, cuda_native_register or cuda_native_cublas")
     return backend
 
 
@@ -19,6 +26,11 @@ def _resolve_backend(backend, *arrays):
         if value is not None and device == "cuda" and value.device.id != xp.cuda.runtime.getDevice():
             raise ValueError("operator arrays must be on the current CUDA device")
     return actual
+
+
+def _needs_grad(node):
+    # 输入图像、标签等 requires_grad=False 的叶子变量不需要梯度，可以跳过 dX 的 GEMM 与 col2im
+    return getattr(node, "requires_grad", True)
 
 
 def _normalize_pair(value, name, allow_zero=False):
@@ -120,6 +132,36 @@ def _scatter_patches(rows, output_shape, k_idx, i_idx, j_idx):
     return output
 
 
+@cache
+def _col2im_gather_kernel():
+    # 每个输入像素按固定顺序收集覆盖它的所有窗口位置：结果确定（xp.add.at 在 CuPy 上是原子加，
+    # 累加顺序随调度变化），也省去全零缓冲、padding 区域与切片拷贝
+    return _lazy_cupy().ElementwiseKernel(
+        "raw T rows, int32 C, int32 H, int32 W, int32 KH, int32 KW, int32 SH, int32 SW, "
+        "int32 PH, int32 PW, int32 DH, int32 DW, int32 OH, int32 OW",
+        "T out",
+        """
+        long long t = i;
+        const int w = (int)(t % W); t /= W;
+        const int h = (int)(t % H); t /= H;
+        const int c = (int)(t % C);
+        const long long n = t / C;
+        const long long features = (long long)C * KH * KW;
+        T acc = 0;
+        for (int ki = 0; ki < KH; ++ki) {
+            const int hp = h + PH - ki * DH;
+            if (hp < 0 || hp % SH != 0 || hp / SH >= OH) continue;
+            for (int kj = 0; kj < KW; ++kj) {
+                const int wp = w + PW - kj * DW;
+                if (wp < 0 || wp % SW != 0 || wp / SW >= OW) continue;
+                acc += rows[(n * OH * OW + (long long)(hp / SH) * OW + wp / SW) * features + (c * KH + ki) * KW + kj];
+            }
+        }
+        out = acc;
+        """,
+        "mf_col2im_gather")
+
+
 def _build_im2col_context(input_shape, kernel_size, stride, padding, dilation=(1, 1), context=None):
     channels, height, width = input_shape[1:]
     signature = (channels, height, width, kernel_size, stride, padding, dilation)
@@ -177,6 +219,13 @@ def col2im(rows, input_shape, kernel_size, stride=1, padding=0, dilation=1, cont
     dilation = _normalize_pair(dilation, "dilation")
     context = _build_im2col_context(input_shape, kernel_size, stride, padding, dilation, context)
 
+    if get_device() == "cuda" and isinstance(rows, _lazy_cupy().ndarray):
+        out_h, out_w = context["output_size"]
+        output = xp.empty(tuple(input_shape), dtype=rows.dtype)
+        _col2im_gather_kernel()(xp.ascontiguousarray(rows), *input_shape[1:], *kernel_size, *stride, *padding,
+                                *dilation, out_h, out_w, output)
+        return output, context
+
     padded_h, padded_w = context["padded_size"]
     output = _scatter_patches(
         rows,
@@ -193,6 +242,13 @@ def col2im(rows, input_shape, kernel_size, stride=1, padding=0, dilation=1, cont
 
 
 class Conv2D_Op(Node):
+    def _fused_activation(self):
+        # 子类在原生后端把激活融合进卷积尾处理时返回 "relu"/"leaky_relu"
+        return None
+
+    def _activation_alpha(self):
+        return 0.0
+
     def __init__(self, x, kernel, stride=1, padding=0, groups=1, dilation=1, bias=None, backend="auto"):
         # x: 图像, kernel: 卷积核；可选 bias 与输出通道对齐，前向融合加偏置（减少 Add 节点）
         if bias is None:
@@ -200,15 +256,16 @@ class Conv2D_Op(Node):
         else:
             super().__init__(x, kernel, bias)
         self.backend = _backend_name(backend)
-        if backend == "cuda_native_cublas":
+        if backend in NATIVE_BACKENDS:
             if groups != 1 or _normalize_pair(dilation, "dilation") != (1, 1):
-                raise ValueError("cuda_native_cublas supports only groups=1 and dilation=1")
+                raise ValueError(f"{backend} supports only groups=1 and dilation=1")
         self.bias = bias
         self.stride = _normalize_pair(stride, "stride")
         self.padding = _normalize_pair(padding, "padding", allow_zero=True)
         self.groups = _normalize_groups(groups)
         self.dilation = _normalize_pair(dilation, "dilation")
         self._im2col_contexts = []
+        self._activation_fused = False
 
     def _validate_kernel(self, x_val, kernel_val):
         in_channels = x_val.shape[1]
@@ -227,12 +284,18 @@ class Conv2D_Op(Node):
 
     def forward(self, x_val, kernel_val, bias_val=None):
         self.actual_backend = _resolve_backend(self.backend, x_val, kernel_val, bias_val)
-        if self.actual_backend == "cuda_native_cublas":
+        self._activation_fused = False
+        if self.actual_backend in NATIVE_BACKENDS:
             if self.bias is not None and bias_val is None:
                 raise ValueError("bias value is missing")
             from .cuda_native.native import conv2d_forward
+            activation = self._fused_activation()
+            # 输出直接是连续的 NCHW；bias 与激活在同一个尾处理 kernel 中完成
             self.value, self._cuda_im2col_cols = conv2d_forward(
-                x_val, kernel_val, bias_val, stride=self.stride, padding=self.padding)
+                x_val, kernel_val, bias_val, stride=self.stride, padding=self.padding,
+                activation=activation, alpha=self._activation_alpha(),
+                engine=NATIVE_BACKENDS[self.actual_backend])
+            self._activation_fused = activation is not None
             self._cuda_inputs = (x_val, kernel_val)
             return
         # x_val: (N, C_in, H, W), kernel_val: (C_out, C_in, kH, kW)
@@ -286,12 +349,18 @@ class Conv2D_Op(Node):
         if not hasattr(self, "actual_backend"):
             raise RuntimeError("forward must run before backward")
         _resolve_backend(self.actual_backend, self.grad, *(p.value for p in self.parents))
-        if self.actual_backend == "cuda_native_cublas":
+        if self.actual_backend in NATIVE_BACKENDS:
             from .cuda_native.native import conv2d_backward
             grads = conv2d_backward(*self._cuda_inputs, self.grad, self._cuda_im2col_cols,
                                     stride=self.stride, padding=self.padding,
-                                    need_bias_grad=self.bias is not None)
+                                    need_bias_grad=self.bias is not None,
+                                    need_input_grad=_needs_grad(self.parents[0]),
+                                    activation=self._fused_activation() if self._activation_fused else None,
+                                    alpha=self._activation_alpha(), output=self.value,
+                                    engine=NATIVE_BACKENDS[self.actual_backend])
             for parent, grad in zip(self.parents, grads):
+                if grad is None:
+                    continue
                 if parent.grad is None:
                     parent.clear_grad()
                 parent.grad += grad
@@ -310,6 +379,7 @@ class Conv2D_Op(Node):
         batch_size, in_channels, input_h, input_w = x_node.value.shape
         out_channels = kernel_node.value.shape[0]
         out_channels_per_group = out_channels // self.groups
+        needs_input_grad = _needs_grad(x_node)
 
         for group_index in range(self.groups):
             in_start, in_end = _group_bounds(in_channels, self.groups, group_index)
@@ -319,6 +389,8 @@ class Conv2D_Op(Node):
             kernel_node.grad[out_start:out_end] += (
                 grad_y.T @ self.cols[group_index]
             ).reshape(kernel_node.value[out_start:out_end].shape)
+            if not needs_input_grad:
+                continue
 
             grad_cols = grad_y @ self.kernel_cols[group_index]
             grad_x, context = col2im(
@@ -334,21 +406,29 @@ class Conv2D_Op(Node):
             x_node.grad[:, in_start:in_end] += grad_x
 
         if self.bias is not None:
-            bias_node.grad += xp.sum(self.grad, axis=(0, 2, 3))
+            # FP64 累加后舍入一次，与原生后端的 bias 梯度一致
+            bias_node.grad += xp.sum(self.grad, axis=(0, 2, 3), dtype=xp.float64).astype(bias_node.grad.dtype)
 
 
 class Conv2D_ReLU_Op(Conv2D_Op):
-    """融合算子：Conv2D(+bias) 后接 ReLU。"""
+    """融合算子：Conv2D(+bias) 后接 ReLU。原生后端在卷积尾处理 kernel 内完成 ReLU，
+    反向门控也在 dY 转置 kernel 内完成。"""
+
+    def _fused_activation(self):
+        return "relu"
 
     def forward(self, x_val, kernel_val, bias_val=None):
         super().forward(x_val, kernel_val, bias_val=bias_val)
+        if self._activation_fused:
+            return
         # 使用 pre-activation 的符号生成 mask，避免数值差异
         self._relu_mask = self.value > 0
         self.value = xp.maximum(0, self.value)
 
     def backward(self):
         # 先过 ReLU 的梯度门控，再按 Conv2D_Op 反传
-        self.grad = self.grad * self._relu_mask
+        if not self._activation_fused:
+            self.grad = self.grad * self._relu_mask
         super().backward()
 
 
@@ -359,13 +439,23 @@ class Conv2D_LeakyReLU_Op(Conv2D_Op):
         super().__init__(*args, **kwargs)
         self.alpha = float(alpha)
 
+    def _fused_activation(self):
+        # 只有 alpha > 0 时 y > 0 才等价于 pre-activation > 0，反向才能只用输出做门控
+        return "leaky_relu" if self.alpha > 0 else None
+
+    def _activation_alpha(self):
+        return self.alpha
+
     def forward(self, x_val, kernel_val, bias_val=None):
         super().forward(x_val, kernel_val, bias_val=bias_val)
+        if self._activation_fused:
+            return
         self._leaky_mask = self.value > 0
         self.value = xp.where(self._leaky_mask, self.value, self.alpha * self.value)
 
     def backward(self):
-        self.grad = xp.where(self._leaky_mask, self.grad, self.alpha * self.grad)
+        if not self._activation_fused:
+            self.grad = xp.where(self._leaky_mask, self.grad, self.alpha * self.grad)
         super().backward()
 
 
@@ -577,7 +667,8 @@ class ConvTranspose2D_Op(Node):
             )
 
         if self.bias is not None:
-            bias_node.grad += xp.sum(self.grad, axis=(0, 2, 3))
+            # FP64 累加后舍入一次，与原生后端的 bias 梯度一致
+            bias_node.grad += xp.sum(self.grad, axis=(0, 2, 3), dtype=xp.float64).astype(bias_node.grad.dtype)
 
 
 class ConvTranspose2D_ReLU_Op(ConvTranspose2D_Op):
@@ -606,7 +697,8 @@ class ConvTranspose2D_LeakyReLU_Op(ConvTranspose2D_Op):
         self.value = xp.where(self._leaky_mask, self.value, self.alpha * self.value)
 
     def backward(self):
-        self.grad = self.grad * xp.where(self._leaky_mask, 1.0, self.alpha)
+        # where 保持梯度 dtype；旧写法乘以 where(mask, 1.0, alpha) 会生成 float64 掩码
+        self.grad = xp.where(self._leaky_mask, self.grad, self.alpha * self.grad)
         super().backward()
 
 
@@ -620,7 +712,7 @@ class MaxPool2d_Op(Node):
 
     def forward(self, x_val):
         self.actual_backend = _resolve_backend(self.backend, x_val)
-        if self.actual_backend == "cuda_native_cublas":
+        if self.actual_backend in NATIVE_BACKENDS:
             from .cuda_native.native import maxpool2d_forward
             self.value, self._native_context = maxpool2d_forward(
                 x_val, kernel_size=self.kernel_size, stride=self.stride)
@@ -647,7 +739,7 @@ class MaxPool2d_Op(Node):
         if not hasattr(self, "actual_backend"):
             raise RuntimeError("forward must run before backward")
         _resolve_backend(self.actual_backend, self.grad, self.parents[0].value)
-        if self.actual_backend == "cuda_native_cublas":
+        if self.actual_backend in NATIVE_BACKENDS:
             from .cuda_native.native import maxpool2d_backward
             parent = self.parents[0]
             if parent.grad is None:

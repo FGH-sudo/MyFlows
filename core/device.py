@@ -37,6 +37,24 @@ def _bundled_cuda_runtime_root() -> str | None:
     return None
 
 
+def _sync_cupy_cuda_path(cuda_path: str | None) -> None:
+    """Make an already imported CuPy use ``cuda_path`` for headers too.
+
+    CuPy caches CUDA_PATH when it is imported. A process that imports CuPy before MyFlows (as
+    several tests do) would otherwise compile every kernel missing from CuPy's disk cache against
+    the system toolkit's CUDA 13 headers, which NVRTC 12.x rejects.
+    """
+    import sys
+
+    environment = sys.modules.get("cupy._environment")
+    if cuda_path and environment is not None and getattr(environment, "_cuda_path", None) != cuda_path:
+        environment._cuda_path = cuda_path
+
+
+# Repoint a CuPy that was imported before MyFlows; without CuPy loaded this does nothing.
+_sync_cupy_cuda_path(_bundled_cuda_runtime_root())
+
+
 def configure_cuda_dll_path() -> None:
     """将 CUDA/cuDNN 等 DLL 目录加入进程（供 CuPy、ONNX Runtime GPU 加载）。"""
     _configure_cuda_lib_path()
@@ -58,14 +76,15 @@ def _configure_cuda_lib_path() -> None:
         # Prefer the wheel-matched CUDA 12 headers over a machine-wide CUDA
         # toolkit that may be a different major version.
         os.environ["CUDA_PATH"] = cuda_path
+        _sync_cupy_cuda_path(cuda_path)
     if cuda_path:
         candidates.append(os.path.join(cuda_path, "bin"))
-    try:
-        import torch
-
-        candidates.append(os.path.join(os.path.dirname(torch.__file__), "lib"))
-    except ImportError:
-        pass
+    # Locate PyTorch's DLL directory (cuDNN for ONNX Runtime GPU) without importing torch:
+    # importing it loads its own NVRTC 12.8, which CuPy would then pair with the CUDA 12.6
+    # wheel headers, and CUB kernels (e.g. bool reductions) fail to compile.
+    torch_spec = importlib.util.find_spec("torch")
+    if torch_spec is not None and torch_spec.origin:
+        candidates.append(os.path.join(os.path.dirname(torch_spec.origin), "lib"))
 
     if sys.platform == "win32":
         for directory in candidates:

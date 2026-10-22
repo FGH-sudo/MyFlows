@@ -254,7 +254,9 @@ def load_checkpoint(layers, optimizer=None, filepath="checkpoint"):
                     f"参数形状不匹配 {saved['key']}: checkpoint={value.shape}, model={expected_shape}"
                 )
             live_var = _param_by_live_record(layers, live)
-            live_var.value = value.copy()
+            # 按模型参数当前的 dtype 恢复：旧的 float64 断点载入 float32 模型时不会把模型变回 float64
+            live_dtype = getattr(live_var.value, "dtype", None)
+            live_var.value = value.astype(live_dtype) if live_dtype is not None else value.copy()
             saved_key_to_var[saved["key"]] = live_var
 
         if len(saved_buffers) == len(live_buffers):
@@ -303,5 +305,5 @@ def _restore_optimizer(optimizer, optimizer_meta, data, saved_key_to_var):
         for entry in entries:
             var = saved_key_to_var.get(entry["param_key"])
             if var is not None:
-                state[var] = xp.asarray(data[entry["array_key"]]).copy()
+                state[var] = xp.asarray(data[entry["array_key"]], dtype=var.value.dtype).copy()
         setattr(optimizer, state_name, state)

@@ -24,12 +24,13 @@ class NativeCublasConvolutionTests(unittest.TestCase):
             ("P1", (4, 16, 32, 32), (32, 16, 3, 3), (1, 1), (1, 1)),
             ("P2", (1, 3, 120, 160), (8, 3, 7, 7), (2, 2), (3, 3)),
         )
-        for case in cases:
+        for case, backend in ((case, backend) for case in cases
+                              for backend in ("cuda_native_register", "cuda_native_cublas")):
             _, x_shape, w_shape, stride, padding = case
             x, w, b, dy = [cp.asarray(value) for value in conv_fixture(case, 0)]
             x_node, w_node, b_node = Variable(x), Variable(w), Variable(b)
             op = Conv2D_Op(x_node, w_node, stride=stride, padding=padding,
-                           bias=b_node, backend="cuda_native_cublas")
+                           bias=b_node, backend=backend)
             op.forward(x, w, b)
             native_y = op.value.copy()
             op.grad = dy

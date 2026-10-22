@@ -2,6 +2,7 @@ from ..core.device import xp
 from ..core.node import Variable
 from ..core.graph import Graph
 from ..core.tensor import Tensor
+from ..ops.fused import adam_update
 
 class Optimizer:
     """
@@ -34,7 +35,8 @@ class Optimizer:
         if node not in self.acc_gradient:
             return None
 
-        if self.acc_no == 0:
+        if self.acc_no in (0, 1):
+            # 只累加了一次时平均梯度就是累加值本身，省去一次整张量除法与分配
             return self.acc_gradient[node]
 
         return self.acc_gradient[node] / self.acc_no
@@ -186,37 +188,37 @@ class RMSProp(Optimizer):
 
 
 class Adam(Optimizer):
+    """Adam (Kingma & Ba, 2015)。
+
+    一阶矩 v 与二阶矩 s 从 0 开始，m_t = b1 m + (1 - b1) g，s_t = b2 s + (1 - b2) g^2，
+    再按 1 - b^t 修正偏差。旧实现首步直接令 v = g、s = g^2 后仍做偏差修正，首步步长只有
+    标准值的约 0.32 倍，且 g_1^2 在 s 中被放大 1000 倍、上千步才衰减。
+    每个参数一次融合更新（GPU 为单个 kernel），CPU 回退与 GPU 的逐步舍入顺序一致。
+    """
+
     def __init__(self, graph, learning_rate=0.01, beta_1=0.9, beta_2=0.999, eps=1e-8):
         super().__init__(graph, learning_rate)
         self.beta_1 = beta_1
         self.beta_2 = beta_2
         self.eps = eps
-        self.v = {}  # 储存历史梯度的加权累计(Momentum)
-        self.s = {}  # 储存历史梯度平方的加权累计(RMSProp)
+        self.v = {}  # 一阶矩：历史梯度的指数加权平均（Momentum）
+        self.s = {}  # 二阶矩：历史梯度平方的指数加权平均（RMSProp）
         self.t = 0   # 记录时间步长，用以修正偏差
 
     def _update(self):
         # 每次更新，时间步长+1
         self.t += 1
-        
+        # 平均梯度 = 累加梯度 / 累加次数，作为缩放因子传入融合 kernel，不单独生成新数组
+        scale = 1.0 if self.acc_no in (0, 1) else 1.0 / self.acc_no
+
         for node in self.graph.nodes:
             if isinstance(node, Variable) and node.trainable:
-                # 获取变量平均梯度
-                grad = self.get_gradient(node)
+                grad = self.acc_gradient.get(node)
                 if grad is None:
                     continue
                 if node not in self.s:
-                    self.v[node] = grad
-                    self.s[node] = xp.power(grad, 2)
-                else:
-                    self.v[node] = self.beta_1 * self.v[node] + (1 - self.beta_1) * grad
-                    self.s[node] = self.beta_2 * self.s[node] + (1 - self.beta_2) * xp.power(grad, 2)
-
-                # 修正偏差(Bias Correction)
-                v_correct = self.v[node] / (1 - self.beta_1 ** self.t)
-                s_correct = self.s[node] / (1 - self.beta_2 ** self.t)
-                
-                # 更新变量值
-                node.value -= self.learning_rate * v_correct / (xp.sqrt(s_correct) + self.eps)
-
-                
+                    self.v[node] = xp.zeros_like(node.value)
+                    self.s[node] = xp.zeros_like(node.value)
+                adam_update(node.value, grad, self.v[node], self.s[node], lr=self.learning_rate,
+                            beta1=self.beta_1, beta2=self.beta_2, eps=self.eps, step=self.t,
+                            grad_scale=scale)

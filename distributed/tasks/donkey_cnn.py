@@ -28,12 +28,12 @@ class DonkeyCnnTask:
         dtype = np.float32
         height = int(config.get("image_h", 120))
         width = int(config.get("image_w", 160))
-        backend = "cuda_native_cublas" if get_device() == "cuda" else "numpy"
+        backend = "cuda_native_register" if get_device() == "cuda" else "numpy"
         conv_backend = config.get("conv_backend")
         if conv_backend not in (None, ""):
             backend = str(conv_backend)
-        x = Variable(xp.zeros((1, 3, height, width), dtype), name="input")
-        y = Variable(xp.zeros((1, 2), dtype), name="target")
+        x = Variable(xp.zeros((1, 3, height, width), dtype), name="input", requires_grad=False)
+        y = Variable(xp.zeros((1, 2), dtype), name="target", requires_grad=False)
         conv1 = Conv2D(3, 8, kernel_size=5, stride=2, padding=2, fuse_activation=False,
                        initializer=init, dtype=dtype, backend=backend, name="conv1")
         pool1 = MaxPool2d(2, 2, backend=backend)

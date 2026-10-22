@@ -395,5 +395,71 @@ class AdvancedConvolutionOpsTest(unittest.TestCase):
         self.assertTrue(np.allclose(kernel_node.grad, expected_kernel_grad, atol=1e-10))
 
 
+class AdvancedConvolutionCudaTest(unittest.TestCase):
+    """The CuPy path (gather-based col2im) on grouped, dilated, strided and transposed convolutions."""
+
+    CASES = (
+        # x shape, kernel shape, stride, padding, dilation, groups
+        ((2, 4, 5, 5), (6, 2, 3, 3), (1, 2), (1, 1), (1, 1), 2),
+        ((1, 2, 6, 6), (3, 2, 2, 2), (1, 1), (1, 1), (2, 2), 1),
+        ((2, 3, 9, 7), (4, 3, 3, 2), (2, 3), (2, 0), (1, 2), 1),
+    )
+
+    def setUp(self):
+        from MyFlows.core.device import cuda_available, set_device
+
+        if not cuda_available():
+            self.skipTest("CUDA is required")
+        set_device("cuda")
+        self.rng = np.random.default_rng(29)
+
+    def tearDown(self):
+        from MyFlows.core.device import set_device
+
+        set_device("cpu")
+
+    def _run(self, op_class, x, kernel, grad, **kwargs):
+        from MyFlows.core.device import xp
+
+        x_node, kernel_node = Variable(xp.asarray(x)), Variable(xp.asarray(kernel), trainable=True)
+        op = op_class(x_node, kernel_node, **kwargs)
+        op.forward(x_node.value, kernel_node.value)
+        x_node.clear_grad()
+        kernel_node.clear_grad()
+        op.grad = xp.asarray(grad)
+        op.backward()
+        return op.value.get(), x_node.grad.get(), kernel_node.grad.get()
+
+    def test_conv2d_matches_naive_reference_and_is_reproducible(self):
+        for x_shape, k_shape, stride, padding, dilation, groups in self.CASES:
+            with self.subTest(x=x_shape, stride=stride, dilation=dilation, groups=groups):
+                x, kernel = self.rng.normal(size=x_shape), self.rng.normal(size=k_shape)
+                expected = naive_conv_forward(x, kernel, stride, padding, dilation, groups)
+                grad = self.rng.normal(size=expected.shape)
+                kwargs = dict(stride=stride, padding=padding, dilation=dilation, groups=groups)
+                y, dx, dw = self._run(Conv2D_Op, x, kernel, grad, **kwargs)
+                ref_dx, ref_dw = naive_conv_backward(x, kernel, grad, stride, padding, dilation, groups)
+                np.testing.assert_allclose(y, expected, atol=1e-10)
+                np.testing.assert_allclose(dx, ref_dx, atol=1e-10)
+                np.testing.assert_allclose(dw, ref_dw, atol=1e-10)
+                # float32 makes any change of summation order visible in the low bits
+                runs = [self._run(Conv2D_Op, x.astype(np.float32), kernel.astype(np.float32),
+                                  grad.astype(np.float32), **kwargs)[1] for _ in range(2)]
+                np.testing.assert_array_equal(runs[0], runs[1])
+
+    def test_convtranspose2d_matches_naive_reference(self):
+        x, kernel = self.rng.normal(size=(1, 2, 3, 4)), self.rng.normal(size=(2, 3, 3, 2))
+        kwargs = dict(stride=(2, 1), padding=(1, 0), output_padding=(1, 0), groups=1, dilation=1)
+        expected = naive_conv_transpose_forward(x, kernel, dilation=(1, 1), **{k: v for k, v in kwargs.items()
+                                                                               if k not in ("dilation",)})
+        grad = self.rng.normal(size=expected.shape)
+        y, dx, dw = self._run(ConvTranspose2D_Op, x, kernel, grad, **kwargs)
+        ref_dx, ref_dw = naive_conv_transpose_backward(x, kernel, grad, dilation=(1, 1),
+                                                       **{k: v for k, v in kwargs.items() if k != "dilation"})
+        np.testing.assert_allclose(y, expected, atol=1e-10)
+        np.testing.assert_allclose(dx, ref_dx, atol=1e-10)
+        np.testing.assert_allclose(dw, ref_dw, atol=1e-10)
+
+
 if __name__ == "__main__":
     unittest.main()

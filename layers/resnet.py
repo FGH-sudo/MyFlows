@@ -14,6 +14,7 @@
 """
 
 from ..core.device import xp
+from ..core.dtype import resolve_dtype
 
 from ..core.node import Variable
 from ..ops.basic import Add
@@ -34,21 +35,22 @@ class BatchNorm2d(Layer):
       eps:          数值稳定项
     """
 
-    def __init__(self, num_features, momentum=0.1, eps=1e-5, name=None):
+    def __init__(self, num_features, momentum=0.1, eps=1e-5, name=None, dtype=None):
         super().__init__(name=name)
         self.num_features = int(num_features)
         self.momentum = float(momentum)
         self.eps = float(eps)
         self.training = True
+        dtype = resolve_dtype(dtype)
 
-        gamma_init = xp.ones((self.num_features,), dtype=xp.float64)
-        beta_init = xp.zeros((self.num_features,), dtype=xp.float64)
+        gamma_init = xp.ones((self.num_features,), dtype=dtype)
+        beta_init = xp.zeros((self.num_features,), dtype=dtype)
         self.gamma = Variable(gamma_init, trainable=True, name=f"{self.name}_gamma" if self.name else "gamma")
         self.beta = Variable(beta_init, trainable=True, name=f"{self.name}_beta" if self.name else "beta")
         self.params = [self.gamma, self.beta]
 
-        self.running_mean = xp.zeros((self.num_features,), dtype=xp.float64)
-        self.running_var = xp.ones((self.num_features,), dtype=xp.float64)
+        self.running_mean = xp.zeros((self.num_features,), dtype=dtype)
+        self.running_var = xp.ones((self.num_features,), dtype=dtype)
         self._last_op = None
 
     def forward(self, input_node):
@@ -83,14 +85,14 @@ class GlobalAvgPool2d(Layer):
         return GlobalAvgPool2d_Op(input_node)
 
 
-def _conv3x3(in_c, out_c, stride=1, initializer=None):
+def _conv3x3(in_c, out_c, stride=1, initializer=None, backend="auto"):
     return Conv2D(in_c, out_c, kernel_size=3, stride=stride, padding=1,
-                  activation=None, fuse_activation=False, initializer=initializer)
+                  activation=None, fuse_activation=False, initializer=initializer, backend=backend)
 
 
-def _conv1x1(in_c, out_c, stride=1, initializer=None):
+def _conv1x1(in_c, out_c, stride=1, initializer=None, backend="auto"):
     return Conv2D(in_c, out_c, kernel_size=1, stride=stride, padding=0,
-                  activation=None, fuse_activation=False, initializer=initializer)
+                  activation=None, fuse_activation=False, initializer=initializer, backend=backend)
 
 
 class BasicBlock(Layer):
@@ -101,16 +103,17 @@ class BasicBlock(Layer):
 
     expansion = 1
 
-    def __init__(self, in_channels, out_channels, stride=1, name=None, initializer=None):
+    def __init__(self, in_channels, out_channels, stride=1, name=None, initializer=None, conv_backend="auto"):
         super().__init__(name=name)
-        self.conv1 = _conv3x3(in_channels, out_channels, stride=stride, initializer=initializer)
+        self.conv1 = _conv3x3(in_channels, out_channels, stride=stride, initializer=initializer, backend=conv_backend)
         self.bn1 = BatchNorm2d(out_channels)
-        self.conv2 = _conv3x3(out_channels, out_channels, stride=1, initializer=initializer)
+        self.conv2 = _conv3x3(out_channels, out_channels, stride=1, initializer=initializer, backend=conv_backend)
         self.bn2 = BatchNorm2d(out_channels)
 
         self.downsample = None
         if stride != 1 or in_channels != out_channels:
-            self.downsample_conv = _conv1x1(in_channels, out_channels, stride=stride, initializer=initializer)
+            self.downsample_conv = _conv1x1(in_channels, out_channels, stride=stride, initializer=initializer,
+                                            backend=conv_backend)
             self.downsample_bn = BatchNorm2d(out_channels)
             self.downsample = (self.downsample_conv, self.downsample_bn)
 
@@ -155,10 +158,12 @@ class ResNet18(Layer):
     """
 
     def __init__(self, in_channels=3, output_dim=2, stem="imagenet",
-                 base_width=64, name=None, dropout=0.0, initializer=None):
+                 base_width=64, name=None, dropout=0.0, initializer=None, conv_backend="auto"):
         super().__init__(name=name)
         if stem not in ("imagenet", "cifar"):
             raise ValueError("stem must be 'imagenet' or 'cifar'")
+        from ..ops.convolution import _backend_name
+        self.conv_backend = _backend_name(conv_backend)
         self.stem_type = stem
         self.output_dim = int(output_dim)
 
@@ -166,10 +171,12 @@ class ResNet18(Layer):
 
         if stem == "imagenet":
             self.stem_conv = Conv2D(in_channels, widths[0], kernel_size=7, stride=2,
-                                    padding=3, activation=None, fuse_activation=False, initializer=initializer)
+                                    padding=3, activation=None, fuse_activation=False, initializer=initializer,
+                                    backend=self.conv_backend)
         else:
             self.stem_conv = Conv2D(in_channels, widths[0], kernel_size=3, stride=1,
-                                    padding=1, activation=None, fuse_activation=False, initializer=initializer)
+                                    padding=1, activation=None, fuse_activation=False, initializer=initializer,
+                                    backend=self.conv_backend)
         self.stem_bn = BatchNorm2d(widths[0])
 
         # 4 个 stage, 每个 2 个 BasicBlock
@@ -184,8 +191,8 @@ class ResNet18(Layer):
         # fc 权重形状 (C, output_dim)
         fan_in = widths[3]
         init = make_initializer(initializer)
-        w_init = xp.asarray(init((fan_in, self.output_dim)))
-        b_init = xp.zeros((self.output_dim,))
+        w_init = xp.asarray(init((fan_in, self.output_dim)), dtype=resolve_dtype())
+        b_init = xp.zeros((self.output_dim,), dtype=w_init.dtype)
         self.fc_W = Variable(w_init, trainable=True, name="fc_W")
         self.fc_b = Variable(b_init, trainable=True, name="fc_b")
 
@@ -204,9 +211,9 @@ class ResNet18(Layer):
         self.widths = widths
 
     def _make_stage(self, in_c, out_c, num_blocks, stride, initializer=None):
-        blocks = [BasicBlock(in_c, out_c, stride=stride, initializer=initializer)]
+        blocks = [BasicBlock(in_c, out_c, stride=stride, initializer=initializer, conv_backend=self.conv_backend)]
         for _ in range(num_blocks - 1):
-            blocks.append(BasicBlock(out_c, out_c, stride=1, initializer=initializer))
+            blocks.append(BasicBlock(out_c, out_c, stride=1, initializer=initializer, conv_backend=self.conv_backend))
         return blocks
 
     def forward(self, input_node):
@@ -218,7 +225,7 @@ class ResNet18(Layer):
         self._last_feature_nodes["stem"] = x
         if self.stem_type == "imagenet":
             from ..ops.convolution import MaxPool2d_Op
-            x = MaxPool2d_Op(x, kernel_size=3, stride=2)
+            x = MaxPool2d_Op(x, kernel_size=3, stride=2, backend=self.conv_backend)
 
         for block in self.layer1:
             x = block(x)

@@ -25,12 +25,12 @@ class BackendValidationTest(unittest.TestCase):
         set_device("cpu")
         x = Variable(np.ones((1, 1, 4, 4), np.float32))
         w = Variable(np.ones((1, 1, 3, 3), np.float32))
-        for backend in ("cuda_native_cublas", "cupy"):
+        for backend in ("cuda_native_register", "cuda_native_cublas", "cupy"):
             with self.assertRaises(ValueError):
                 Graph(Conv2D_Op(x, w, backend=backend)).forward()
-        for kwargs in ({"groups": 2}, {"dilation": 2}):
+        for kwargs, backend in (({"groups": 2}, "cuda_native_register"), ({"dilation": 2}, "cuda_native_cublas")):
             with self.assertRaises((ValueError, TypeError)):
-                Conv2D_Op(x, w, backend="cuda_native_cublas", **kwargs)
+                Conv2D_Op(x, w, backend=backend, **kwargs)
         with self.assertRaises(ValueError):
             Conv2D_Op(x, w, backend="typo")
 
@@ -49,7 +49,7 @@ class CudaGraphIntegrationTest(unittest.TestCase):
         arrays = [np.random.default_rng(i).normal(size=s).astype(np.float32)
                   for i, s in enumerate(((2, 2, 5, 7), (3, 2, 3, 3), (3,)))]
         snapshots = []
-        for backend in ("cupy", "cuda_native_cublas"):
+        for backend in ("cupy", "cuda_native_register", "cuda_native_cublas"):
             x, w, b = [Variable(xp.asarray(a)) for a in arrays]
             left = Conv2D_Op(x, w, padding=1, bias=b, backend=backend)
             right = Conv2D_Op(x, w, padding=1, bias=b, backend=backend)
@@ -65,8 +65,8 @@ class CudaGraphIntegrationTest(unittest.TestCase):
     def test_context_refresh_after_batch_and_spatial_change(self):
         x = Variable(xp.ones((1, 1, 5, 7), xp.float32))
         w = Variable(xp.ones((2, 1, 3, 3), xp.float32))
-        conv = Conv2D_Op(x, w, padding=1, backend="cuda_native_cublas")
-        pool = MaxPool2d_Op(conv, 3, 1, backend="cuda_native_cublas")
+        conv = Conv2D_Op(x, w, padding=1, backend="cuda_native_register")
+        pool = MaxPool2d_Op(conv, 3, 1, backend="cuda_native_register")
         graph = Graph(SumAll(pool))
         for shape in ((1, 1, 5, 7), (3, 1, 8, 6), (2, 1, 4, 5)):
             x.value = xp.ones(shape, xp.float32)
@@ -88,33 +88,36 @@ class CudaGraphIntegrationTest(unittest.TestCase):
             op.backward()
 
     def test_fusion_keeps_explicit_backend(self):
-        for optimize, fuse_layer, activation in ((False, True, ReLU), (True, False, ReLU), (True, False, LeakyReLU)):
+        for (optimize, fuse_layer, activation), backend in (
+                ((False, True, ReLU), "cuda_native_register"), ((True, False, ReLU), "cuda_native_cublas"),
+                ((True, False, LeakyReLU), "cuda_native_register")):
             x = Variable(xp.ones((1, 1, 4, 4), xp.float32))
-            conv = Conv2D(1, 2, backend="cuda_native_cublas", dtype=np.float32, activation=activation,
+            conv = Conv2D(1, 2, backend=backend, dtype=np.float32, activation=activation,
                           fuse_activation=fuse_layer)
             graph = Graph(SumAll(conv(x)), optimize=optimize)
             graph.forward()
             graph.backward()
             conv_nodes = [n for n in graph.nodes if isinstance(n, Conv2D_Op)]
             self.assertEqual(len(conv_nodes), 1)
-            self.assertEqual(conv_nodes[0].actual_backend, "cuda_native_cublas")
+            self.assertEqual(conv_nodes[0].actual_backend, backend)
 
     def test_fp32_training_same_initial_values_gradients_updates_and_loss(self):
-        models = [build(backend) for backend in ("cupy", "cuda_native_cublas")]
-        for a, b in zip(models[0]["params"], models[1]["params"]):
+        models = [build(backend) for backend in ("cupy", "cuda_native_register", "cuda_native_cublas")]
+        pairs = lambda: ((a, b) for other in models[1:] for a, b in zip(models[0]["params"], other["params"]))
+        for a, b in pairs():
             np.testing.assert_array_equal(asnumpy(a.value), asnumpy(b.value))
         for step in range(100):
             for model in models:
                 model["optimizer"].one_step()
                 assert_fp32(model)
             if step < 3:
-                for a, b in zip(models[0]["params"], models[1]["params"]):
+                for a, b in pairs():
                     np.testing.assert_allclose(asnumpy(a.grad), asnumpy(b.grad), atol=1e-4, rtol=1e-3)
             for model in models:
                 model["optimizer"].update()
                 assert_fp32(model)
             if step < 3:
-                for a, b in zip(models[0]["params"], models[1]["params"]):
+                for a, b in pairs():
                     np.testing.assert_allclose(asnumpy(a.value), asnumpy(b.value), atol=1e-4, rtol=1e-3)
         losses = []
         for model in models:
@@ -123,4 +126,5 @@ class CudaGraphIntegrationTest(unittest.TestCase):
             accuracy = np.mean(asnumpy(model["logits"].value).argmax(1) == asnumpy(model["y"].value).ravel())
             self.assertGreaterEqual(accuracy, 0.95)
             losses.append(float(model["loss"].value))
-        np.testing.assert_allclose(*losses, atol=1e-4, rtol=1e-3)
+        for loss in losses[1:]:
+            np.testing.assert_allclose(losses[0], loss, atol=1e-4, rtol=1e-3)

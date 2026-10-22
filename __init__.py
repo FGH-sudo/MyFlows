@@ -13,6 +13,7 @@ from .core.tensor import Tensor
 from .core.graph import Graph
 from .core.graph_opt import apply_graph_optimizations
 from .core.device import cuda_available, configure_cuda_dll_path, get_device, set_device, to_device, use_cuda
+from .core.dtype import get_default_dtype, set_default_dtype
 
 # --- 连接层 (layers) ---
 # 导入连接网络层
@@ -102,6 +103,7 @@ __all__ = [
     # Core
     'Node', 'Variable', 'Tensor', 'Graph',
     'set_device', 'get_device', 'use_cuda', 'cuda_available', 'to_device', 'configure_cuda_dll_path',
+    'get_default_dtype', 'set_default_dtype',
     # Layers
     'Layer', 'Dense', 'Conv2D', 'GroupedConv2D', 'DepthwiseConv2D', 'DepthwiseSeparableConv2D', 'DilatedConv2D', 'ConvTranspose2D', 'Dropout', 'MaxPool2d', 'Flatten', 'save_checkpoint', 'load_checkpoint', 'export_onnx',
     'BatchNorm2d', 'GlobalAvgPool2d', 'BasicBlock', 'ResNet18',

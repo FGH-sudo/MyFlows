@@ -1,6 +1,7 @@
 from ..core.device import xp
+from ..core.dtype import resolve_dtype
 from ..core.node import Variable
-from ..ops.basic import Linear
+from ..ops.basic import Linear, _linear_backend
 from ..ops.convolution import Conv2D_Op, ConvTranspose2D_Op, MaxPool2d_Op, Flatten_Op
 from ..ops.dropout import Dropout_Op
 from ..utils.initializers import make_initializer
@@ -41,12 +42,20 @@ class Layer:
 
 
 class Dense(Layer):
-    """全连接层：实现 Z = XW + b"""
-    def __init__(self, input_dim, output_dim, activation=None, name=None, initializer=None, dtype=None):
+    """全连接层：实现 Z = XW + b
+
+    backend 见 :class:`MyFlows.ops.basic.Linear`：auto（按设备用 NumPy/CuPy）、原生 GEMM 引擎
+    cuda_native_register（第 19 讲寄存器分块 kernel）/ cuda_native_cublas，或实验用的补偿累加
+    cuda_native_kahan / cuda_native_dot2。
+    """
+    def __init__(self, input_dim, output_dim, activation=None, name=None, initializer=None, dtype=None,
+                 backend="auto"):
         super().__init__(name=name)
-        
+        self.backend = _linear_backend(backend)
+
         init = make_initializer(initializer)
-        w_init = xp.asarray(init((input_dim, output_dim)), dtype=dtype)
+        # 参数默认使用框架默认 dtype（float32），初始化器仍按 float64 采样再转换，随机流不变
+        w_init = xp.asarray(init((input_dim, output_dim)), dtype=resolve_dtype(dtype))
         b_init = xp.zeros((1, output_dim), dtype=w_init.dtype)
         
         self.W = Variable(w_init, trainable=True, name=f"{self.name}_W" if self.name else "W")
@@ -58,7 +67,7 @@ class Dense(Layer):
     def forward(self, input_node):
         """构建计算图分支"""
         # 融合：Z = XW + b（单算子，减少节点）
-        z = Linear(input_node, self.W, self.b)
+        z = Linear(input_node, self.W, self.b, backend=self.backend)
         
         if self.activation:
             return self.activation(z)
@@ -101,7 +110,7 @@ class Conv2D(Layer):
 
         fan_in = (in_channels // groups) * kernel_h * kernel_w
         init = make_initializer(initializer)
-        k_init = xp.asarray(init((out_channels, in_channels // groups, kernel_h, kernel_w)), dtype=dtype)
+        k_init = xp.asarray(init((out_channels, in_channels // groups, kernel_h, kernel_w)), dtype=resolve_dtype(dtype))
         b_init = xp.zeros((out_channels,), dtype=k_init.dtype)
 
         self.kernel = Variable(k_init, trainable=True, name=f"{self.name}_kernel" if self.name else "kernel")
@@ -282,6 +291,7 @@ class ConvTranspose2D(Layer):
         activation=None,
         fuse_activation=True,
         name=None,
+        dtype=None,
     ):
         super().__init__(name=name)
 
@@ -302,8 +312,9 @@ class ConvTranspose2D(Layer):
             raise ValueError("output_padding must be smaller than max(stride, dilation)")
 
         fan_in = (out_channels // groups) * kernel_h * kernel_w
-        k_init = xp.random.randn(in_channels, out_channels // groups, kernel_h, kernel_w) * xp.sqrt(2. / fan_in)
-        b_init = xp.zeros((out_channels,))
+        dtype = resolve_dtype(dtype)
+        k_init = (xp.random.randn(in_channels, out_channels // groups, kernel_h, kernel_w) * xp.sqrt(2. / fan_in)).astype(dtype)
+        b_init = xp.zeros((out_channels,), dtype=dtype)
 
         self.kernel = Variable(k_init, trainable=True, name=f"{self.name}_kernel" if self.name else "kernel")
         self.b = Variable(b_init, trainable=True, name=f"{self.name}_bias" if self.name else "bias")

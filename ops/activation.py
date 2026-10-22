@@ -1,5 +1,6 @@
 from ..core.device import xp
 from ..core.node import Node
+from .fused import leaky_relu_backward_accumulate, relu_backward_accumulate
 
 class Logistic(Node):
     def forward(self, x):
@@ -55,9 +56,9 @@ class ReLU(Node):
         if x_node.grad is None:
             x_node.grad = xp.zeros_like(x_node.value)
         
-        # ReLU 的导数说明：x > 0 时为 1，否则为 0
-        grad_mask = (x_node.value > 0).astype(float)
-        x_node.grad += self.grad * grad_mask
+        # ReLU 的导数说明：x > 0 时为 1，否则为 0。单个融合 kernel 完成门控和累加，
+        # 不再生成 float64 掩码（GeForce 的 FP64 吞吐只有 FP32 的 1/32~1/64）
+        relu_backward_accumulate(x_node.value, self.grad, x_node.grad)
 
 
 class LeakyReLU(Node):
@@ -74,6 +75,5 @@ class LeakyReLU(Node):
         if x_node.grad is None:
             x_node.grad = xp.zeros_like(x_node.value)
         
-        # LeakyReLU 的导数说明：x > 0 时为 1，其余则取值为 alpha
-        grad_mask = xp.where(x_node.value > 0, 1.0, self.alpha)
-        x_node.grad += self.grad * grad_mask
+        # LeakyReLU 的导数说明：x > 0 时为 1，其余则取值为 alpha（保持梯度 dtype）
+        leaky_relu_backward_accumulate(x_node.value, self.grad, x_node.grad, self.alpha)

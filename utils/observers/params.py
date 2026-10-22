@@ -50,12 +50,10 @@ def gradient_norms(model, *, max_items: int = 32) -> dict[str, float]:
 
 
 def global_gradient_norm(model) -> float:
-    total = 0.0
-    for _, param in named_parameters(model):
-        grad = _to_numpy(getattr(param, "grad", None)).astype(np.float64, copy=False).reshape(-1)
-        if grad.size:
-            total += float(np.dot(grad, grad))
-    return float(np.sqrt(total))
+    # 在梯度所在的设备上按 FP64 累加，只把最终的一个标量拷回主机（旧实现逐参数拷回整份梯度）
+    from MyFlows.ops.fused import global_norm
+
+    return global_norm([getattr(param, "grad", None) for _, param in named_parameters(model)])
 
 
 def update_ratios(model, learning_rate: float, *, eps: float = 1e-12, max_items: int = 32) -> dict[str, float]:

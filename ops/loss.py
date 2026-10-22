@@ -1,6 +1,8 @@
+import numpy as np
+
 from ..core.device import xp
 from ..core.node import Node
-from .activation import Softmax
+from .fused import softmax_cross_entropy, softmax_cross_entropy_grad
 
 class PerceptionLoss(Node):
     """
@@ -40,17 +42,14 @@ class LogLoss(Node):
     def forward(self, y_pred, y_true):
         # 前向传播公式说明 x = y_true * y_pred
         self.x = self.y_true.value * self.y_pred.value
-        
-       
-        res = xp.zeros_like(self.x)
-        mask = self.x > 0
-        res[mask] = xp.log1p(xp.exp(-self.x[mask]))
-        res[~mask] = -self.x[~mask] + xp.log1p(xp.exp(self.x[~mask]))
-        
-        self.value = xp.mean(res)
+
+        # log(1 + e^{-x}) = logaddexp(0, -x)：两侧都数值稳定，且没有布尔索引（CuPy 上会同步）；
+        # 均值在 FP64 中累加后转回输入 dtype
+        self.value = xp.mean(xp.logaddexp(0, -self.x), dtype=np.float64).astype(self.x.dtype)
 
     def backward(self):
-        N = len(self.y_true.value)
+        # 前向对全部元素求均值，因此按元素总数归一化（多列标签时与 len() 不同）
+        N = self.x.size
         
         # 梯度公式说明: grad = -y_true / (1 + e^x)
        
@@ -64,6 +63,12 @@ class LogLoss(Node):
 
 
 class CrossEntropy(Node):
+    """Softmax 交叉熵。logits 为 (N, C)；标签可为类别下标 (N,)/(N, 1) 或 (N, C) 的 one-hot/软标签。
+
+    按 log-sum-exp 直接求 log softmax（FP64 累加），不再计算 log(softmax + 1e-10)；
+    GPU 上 softmax、log-sum-exp 与逐行损失在一个融合 kernel 内完成。
+    """
+
     def __init__(self, logits, y_true, name="CrossEntropy"):
         # 这里的 logits 是前层(如Add)的输出，y_true 是标签变量
         super().__init__(logits, y_true, name=name)
@@ -71,30 +76,13 @@ class CrossEntropy(Node):
         self.y_true = y_true
 
     def forward(self, logits_val, y_true_val):
-        # 借用 Softmax 的静态方法计算概率
-        self.probs = Softmax.softmax(logits_val)
-        
-        # 处理标签维度 (兼容整数索引或 One-hot)
-        if y_true_val.ndim == 1 or y_true_val.shape[1] == 1:
-            num_classes = logits_val.shape[1]
-            self.y_true_final = xp.eye(num_classes, dtype=logits_val.dtype)[y_true_val.reshape(-1).astype(int)]
-        else:
-            self.y_true_final = y_true_val.astype(logits_val.dtype, copy=False)
-
-        # 计算 Loss 值
-        self.value = -xp.mean(xp.sum(self.y_true_final * xp.log(self.probs + 1e-10), axis=-1))
+        self.value, self.probs, self._labels, self._targets = softmax_cross_entropy(logits_val, y_true_val)
 
     def backward(self):
-        #计算 Loss 对 Logits 的梯度：(P - Y) / N
-        N = self.logits.value.shape[0]
-        
-        # 这里的 self.grad 由Graph.backward 传来，为 1.0
-        # 计算合成梯度
-        final_grad = (self.probs - self.y_true_final) / N
-        
-        # 将梯度回传给父节点 (logits)
+        # 计算 Loss 对 Logits 的梯度：(P - Y) / N；self.grad 由 Graph.backward 传来，为 1.0
+        final_grad = softmax_cross_entropy_grad(self.probs, self._labels, self._targets)
         if self.logits.grad is None:
-            self.logits.clear_grad() #
+            self.logits.clear_grad()
         self.logits.grad += self.grad * final_grad
 
 
@@ -106,7 +94,10 @@ class MSELoss(Node):
     def forward(self, y_pred_val, y_true_val):
         self.y_pred_val = y_pred_val
         self.y_true_val = y_true_val
-        self.value = float(xp.mean((y_pred_val - y_true_val) ** 2))
+        # 损失留在设备上（0 维数组，FP64 累加后转回预测的 dtype）：float() 会在前向中途
+        # 同步 GPU，让 CPU 等前向跑完才能发射反向 kernel；读取时再转成 Python 标量
+        diff = y_pred_val - y_true_val
+        self.value = xp.mean(diff * diff, dtype=np.float64).astype(diff.dtype)
 
     def backward(self):
         y_pred, y_true = self.parents

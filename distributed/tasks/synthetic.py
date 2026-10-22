@@ -30,8 +30,8 @@ class SyntheticTask:
         seed = int(config.get("seed", 0))
         init = make_initializer(seed=seed)
         dtype = np.float32
-        x = Variable(xp.zeros((1, 4), dtype), name="input")
-        y = Variable(xp.zeros((1, 2), dtype), name="target")
+        x = Variable(xp.zeros((1, 4), dtype), name="input", requires_grad=False)
+        y = Variable(xp.zeros((1, 2), dtype), name="target", requires_grad=False)
         fc1 = Dense(4, 8, activation=ReLU, initializer=init, dtype=dtype, name="fc1")
         fc2 = Dense(8, 2, initializer=init, dtype=dtype, name="fc2")
         logits = fc2(fc1(x))

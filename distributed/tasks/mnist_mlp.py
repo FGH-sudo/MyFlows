@@ -69,8 +69,8 @@ class MnistMlpTask:
         hidden = int(config.get("hidden", 64))
         init = make_initializer(seed=seed)
         dtype = np.float32
-        x = Variable(xp.zeros((1, 784), dtype), name="input")
-        y = Variable(xp.zeros((1, 1), np.int64), name="target")
+        x = Variable(xp.zeros((1, 784), dtype), name="input", requires_grad=False)
+        y = Variable(xp.zeros((1, 1), np.int64), name="target", requires_grad=False)
         fc1 = Dense(784, hidden, activation=ReLU, initializer=init, dtype=dtype, name="fc1")
         fc2 = Dense(hidden, 10, initializer=init, dtype=dtype, name="fc2")
         logits = fc2(fc1(x))
