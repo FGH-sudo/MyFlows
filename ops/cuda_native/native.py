@@ -1,8 +1,10 @@
 """Python boundary for the native C/C++ CUDA scheduler.
 
-CuPy owns the arrays and allocations. The native DLL compiles its kernels with NVRTC for the
-current device (caching the binary under build/native-cuda/kernel-cache), owns every kernel
-launch on the current CuPy stream, and runs the GEMMs on one of ``GEMM_ENGINES``.
+CuPy owns the arrays and allocations. The native library (native_cublas.dll on Windows,
+native_cublas.so on Linux) compiles its kernels with NVRTC for the current device (caching the
+binary under build/native-cuda/kernel-cache), owns every kernel launch on the current CuPy stream,
+and runs the GEMMs on one of ``GEMM_ENGINES``. The first call builds the library with CMake when it
+is missing or older than its sources (see build.py); MYFLOWS_NATIVE_AUTOBUILD=0 turns that off.
 """
 
 from __future__ import annotations
@@ -16,10 +18,12 @@ from functools import lru_cache
 from pathlib import Path
 
 from ...core.device import _lazy_cupy
+from . import build as _build
 
 
-ROOT = Path(__file__).resolve().parents[3]
-DLL_PATH = ROOT / "build" / "native-cuda" / "native_cublas.dll"
+ROOT = _build.ROOT
+_WINDOWS = os.name == "nt"
+LIBRARY_PATH = _build.OUTPUT
 KERNEL_CACHE_DIR = ROOT / "build" / "native-cuda" / "kernel-cache"
 _nvidia_spec = importlib.util.find_spec("nvidia")
 _torch_spec = importlib.util.find_spec("torch")
@@ -27,7 +31,18 @@ PYTHON_SITE = Path(next(iter(_nvidia_spec.submodule_search_locations))).parent i
 TORCH_SITE = Path(next(iter(_torch_spec.submodule_search_locations))).parent if _torch_spec else Path()
 _MISSING = Path("__missing_native_dependency__")
 _TORCH_LIB = TORCH_SITE / "torch" / "lib"
-_TOOLKIT_BIN = Path(os.environ.get("CUDA_PATH", "")) / "bin" if os.environ.get("CUDA_PATH") else _MISSING
+# CUDA library names per platform. The nvidia-* wheels and the CUDA Toolkit (CUDA_PATH; on Linux also
+# CUDA_HOME or /usr/local/cuda) keep them in bin/ on Windows, in lib/ (wheels) and lib64/ (Toolkit) on Linux.
+if _WINDOWS:
+    _WHEEL_DIR, _TOOLKIT_DIR = "bin", "bin"
+    _CUBLAS_WHEEL, _CUBLAS, _NVRTC, _NVRTC_BUILTINS = (
+        "cublas64_*.dll", "cublas64_12.dll", "nvrtc64_120_0.dll", "nvrtc-builtins64_*.dll")
+else:
+    _WHEEL_DIR, _TOOLKIT_DIR = "lib", "lib64"
+    _CUBLAS_WHEEL, _CUBLAS, _NVRTC, _NVRTC_BUILTINS = (
+        "libcublas.so.*", "libcublas.so.12", "libnvrtc.so.12", "libnvrtc-builtins.so.*")
+_TOOLKIT_ROOT = os.environ.get("CUDA_PATH") or (None if _WINDOWS else os.environ.get("CUDA_HOME", "/usr/local/cuda"))
+_TOOLKIT_LIB = Path(_TOOLKIT_ROOT) / _TOOLKIT_DIR if _TOOLKIT_ROOT else _MISSING
 INT32_LIMIT = 2**31 - 1
 
 _STATUS = {1: "initialization failed", 2: "invalid argument", 3: "CUDA driver error",
@@ -49,17 +64,17 @@ def _first_existing(*candidates):
 
 # The nvidia-*-cu12 wheels pinned in pyproject.toml come first so the native path does not depend
 # on whichever PyTorch build is installed; the PyTorch wheel and the CUDA Toolkit are fallbacks.
-CUBLAS_DLL = _first_existing(
-    *sorted((PYTHON_SITE / "nvidia" / "cublas" / "bin").glob("cublas64_*.dll")),
-    _TOOLKIT_BIN / "cublas64_12.dll",
-    _TORCH_LIB / "cublas64_12.dll",
+CUBLAS_LIBRARY = _first_existing(
+    *sorted((PYTHON_SITE / "nvidia" / "cublas" / _WHEEL_DIR).glob(_CUBLAS_WHEEL)),
+    _TOOLKIT_LIB / _CUBLAS,
+    _TORCH_LIB / _CUBLAS,
 )
-NVRTC_DLL = _first_existing(
-    PYTHON_SITE / "nvidia" / "cuda_nvrtc" / "bin" / "nvrtc64_120_0.dll",
-    _TORCH_LIB / "nvrtc64_120_0.dll",
-    _TOOLKIT_BIN / "nvrtc64_120_0.dll",
+NVRTC_LIBRARY = _first_existing(
+    PYTHON_SITE / "nvidia" / "cuda_nvrtc" / _WHEEL_DIR / _NVRTC,
+    _TORCH_LIB / _NVRTC,
+    _TOOLKIT_LIB / _NVRTC,
 )
-_DLL_DIR_HANDLES = []
+_LOADER_HANDLES = []
 
 
 class NativeCudaError(RuntimeError):
@@ -85,8 +100,9 @@ def _i32(value):
 
 
 def _ansi(path):
-    # LoadLibraryExA and fopen in the DLL interpret narrow strings in the ANSI code page.
-    return str(path).encode("mbcs" if os.name == "nt" else "utf-8")
+    # On Windows LoadLibraryExA and fopen in the library interpret narrow strings in the ANSI code
+    # page; Linux paths are UTF-8 bytes.
+    return str(path).encode("mbcs" if _WINDOWS else "utf-8")
 
 
 def _configure(lib):
@@ -123,26 +139,44 @@ def _error(status, lib):
     return NativeCudaError(f"native CUDA {_STATUS.get(status, 'call failed')} ({status}): {detail}")
 
 
+def ensure_library():
+    """Return LIBRARY_PATH, building it first when it is missing or older than its sources."""
+    if os.environ.get("MYFLOWS_NATIVE_AUTOBUILD", "1") == "0":
+        if not LIBRARY_PATH.exists():
+            raise NativeCudaError(f"native CUDA library is missing: {LIBRARY_PATH} (MYFLOWS_NATIVE_AUTOBUILD=0); "
+                                  "run tools/build_native_cuda.py")
+        return LIBRARY_PATH
+    try:
+        _build.ensure_built()
+    except (_build.BuildError, OSError) as exc:
+        raise NativeCudaError(f"could not build the native CUDA library {LIBRARY_PATH}: {exc}. The build needs "
+                              "CMake and a C++ compiler, see docs/development_environment.md") from exc
+    return LIBRARY_PATH
+
+
+def library_status():
+    """Build state of the library (see build.status) plus whether its CUDA dependencies were found."""
+    return {**_build.status(), "dependencies": CUBLAS_LIBRARY.exists() and NVRTC_LIBRARY.exists(),
+            "cublas_library": str(CUBLAS_LIBRARY), "nvrtc_library": str(NVRTC_LIBRARY)}
+
+
 @lru_cache(maxsize=1)
 def _library():
-    if not DLL_PATH.exists():
-        raise NativeCudaError(
-            f"native CUDA DLL is missing: {DLL_PATH}. "
-            "Run tools/build_native_cuda.py first."
-        )
-    if not CUBLAS_DLL.exists() or not NVRTC_DLL.exists():
+    ensure_library()
+    if not CUBLAS_LIBRARY.exists() or not NVRTC_LIBRARY.exists():
         raise NativeCudaError(
             "the native CUDA runtime dependencies are missing; expected "
-            f"{CUBLAS_DLL} and {NVRTC_DLL}"
+            f"{CUBLAS_LIBRARY} and {NVRTC_LIBRARY}"
         )
-    for directory in (DLL_PATH.parent, CUBLAS_DLL.parent, NVRTC_DLL.parent):
+    for directory in (LIBRARY_PATH.parent, CUBLAS_LIBRARY.parent, NVRTC_LIBRARY.parent):
         if directory.exists() and hasattr(os, "add_dll_directory"):
-            _DLL_DIR_HANDLES.append(os.add_dll_directory(str(directory)))
-    # NVRTC loads nvrtc-builtins64_<ver>.dll by bare name while compiling, which bypasses the
-    # directories above; once a module of that name is loaded the loader reuses it.
-    for builtins in sorted(NVRTC_DLL.parent.glob("nvrtc-builtins64_*.dll")):
-        _DLL_DIR_HANDLES.append(ctypes.WinDLL(str(builtins)) if os.name == "nt" else ctypes.CDLL(str(builtins)))
-    lib = _configure(ctypes.CDLL(str(DLL_PATH)))
+            _LOADER_HANDLES.append(os.add_dll_directory(str(directory)))
+    # NVRTC loads its builtins (nvrtc-builtins64_<ver>.dll, libnvrtc-builtins.so.<ver>) by bare name
+    # while compiling, which bypasses the directories above; once a library of that name is loaded
+    # the loader reuses it.
+    for builtins in sorted(NVRTC_LIBRARY.parent.glob(_NVRTC_BUILTINS)):
+        _LOADER_HANDLES.append(ctypes.WinDLL(str(builtins)) if _WINDOWS else ctypes.CDLL(str(builtins)))
+    lib = _configure(ctypes.CDLL(str(LIBRARY_PATH)))
     cp = _lazy_cupy()
     # mf_init binds the module and the cuBLAS handle to the current context, so make sure the
     # runtime's primary context of the current device exists on this thread.
@@ -152,19 +186,21 @@ def _library():
     if os.environ.get("MYFLOWS_NATIVE_KERNEL_CACHE", "1") != "0":
         KERNEL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
         cache = _ansi(KERNEL_CACHE_DIR)
-    status = lib.mf_init(_ansi(CUBLAS_DLL), _ansi(NVRTC_DLL), cache)
+    status = lib.mf_init(_ansi(CUBLAS_LIBRARY), _ansi(NVRTC_LIBRARY), cache)
     if status != 0:
         raise _error(status, lib)
     return lib
 
 
 def is_available():
-    return DLL_PATH.exists() and CUBLAS_DLL.exists() and NVRTC_DLL.exists()
+    """Whether the library is built and its CUDA dependencies exist; _library() builds a missing one."""
+    return LIBRARY_PATH.exists() and CUBLAS_LIBRARY.exists() and NVRTC_LIBRARY.exists()
 
 
 def info():
     """Build facts of the loaded kernels: target architecture, binary kind, NVRTC, cache state."""
-    return {**json.loads(_library().mf_info().decode()), "nvrtc_dll": str(NVRTC_DLL), "cublas_dll": str(CUBLAS_DLL)}
+    return {**json.loads(_library().mf_info().decode()), "nvrtc_library": str(NVRTC_LIBRARY),
+            "cublas_library": str(CUBLAS_LIBRARY)}
 
 
 def set_debug_sync(enabled=True):

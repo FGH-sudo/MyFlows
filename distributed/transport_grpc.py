@@ -26,6 +26,7 @@ _PS_METHODS = {
     "initial_state_applied": "InitialStateApplied",
     "update_applied": "UpdateApplied",
     "stop": "Stop",
+    "reduce": "Reduce",
     # Ring's coordinator carries only readiness and state digests, never gradients.
     "join_init": "InitialStateApplied",
     "confirm_update": "UpdateApplied",
@@ -92,6 +93,8 @@ def dict_to_ps_request(message):
         optimizer_step=int(message.get("optimizer_step") or 0),
         digest=str(message.get("digest") or ""),
         parameter_hash=str(message.get("parameter_hash") or ""),
+        stop_requested=bool(message.get("stop_requested")),
+        reduce_key=str(message.get("reduce_key") or ""),
     )
     req.tensors.extend(encoded_to_blobs(message.get("tensor_arrays")
                                        if message.get("tensor_arrays") is not None
@@ -118,6 +121,8 @@ def ps_request_to_dict(req):
         "optimizer_step": req.optimizer_step,
         "digest": req.digest,
         "parameter_hash": req.parameter_hash,
+        "stop_requested": req.stop_requested,
+        "reduce_key": req.reduce_key,
         "tensors": blobs_to_encoded(req.tensors, as_arrays=True),
     }
 
@@ -143,6 +148,7 @@ def dict_to_ps_response(reply):
         parameter_hash=str(reply.get("parameter_hash") or ""),
         fingerprint=str(reply.get("fingerprint") or ""),
         global_step=int(reply.get("global_step") or 0),
+        stop=bool(reply.get("stop")),
     )
     resp.tensors.extend(encoded_to_blobs(reply.get("tensor_arrays")
                                          if reply.get("tensor_arrays") is not None
@@ -184,6 +190,7 @@ def ps_response_to_dict(resp):
         "parameter_hash": resp.parameter_hash,
         "fingerprint": resp.fingerprint,
         "global_step": resp.global_step,
+        "stop": resp.stop,
         "tensors": blobs_to_encoded(resp.tensors, as_arrays=True),
     }
     if resp.parameters:
@@ -237,13 +244,16 @@ class _PsServicer(ps_pb2_grpc.ParameterServiceServicer):
     def Stop(self, request, context):
         return self._handle(request, "stop")
 
+    def Reduce(self, request, context):
+        return self._handle(request, "reduce")
+
 
 class GrpcPsClient:
-    def __init__(self, host, port, timeout=30.0):
+    def __init__(self, host, port, timeout=30.0, max_bytes=DEFAULT_MAX_FRAME):
         self.timeout = timeout
         options = [
-            ("grpc.max_send_message_length", DEFAULT_MAX_FRAME),
-            ("grpc.max_receive_message_length", DEFAULT_MAX_FRAME),
+            ("grpc.max_send_message_length", int(max_bytes)),
+            ("grpc.max_receive_message_length", int(max_bytes)),
         ]
         deadline = time.perf_counter() + timeout
         last = None
@@ -283,10 +293,10 @@ class GrpcPsClient:
         self.channel.close()
 
 
-def serve_ps_grpc(engine, port, stop, host=BIND_HOST, timeout=30.0):
+def serve_ps_grpc(engine, port, stop, host=BIND_HOST, timeout=30.0, max_bytes=DEFAULT_MAX_FRAME):
     options = [
-        ("grpc.max_send_message_length", DEFAULT_MAX_FRAME),
-        ("grpc.max_receive_message_length", DEFAULT_MAX_FRAME),
+        ("grpc.max_send_message_length", int(max_bytes)),
+        ("grpc.max_receive_message_length", int(max_bytes)),
     ]
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=16), options=options)
     ps_pb2_grpc.add_ParameterServiceServicer_to_server(_PsServicer(engine), server)

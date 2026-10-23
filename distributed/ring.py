@@ -26,7 +26,7 @@ from .gradient_layout import (
 )
 from .launcher import allocate_port, _outputs_from_events
 from .monitor import emit
-from .protocol import encode_tensors
+from .protocol import Reductions, encode_tensors, tensor_mapping
 from .schedule import BatchCursor, iter_steps, metric_row, resolve_budget
 from .session import TrainSession
 from .transport_grpc import GrpcPsClient, GrpcRingClient, RingInbox, serve_ps_grpc, serve_ring_grpc
@@ -40,6 +40,8 @@ class MetadataBarrier:
         self.cv = threading.Condition(self.lock)
         self.init = {}
         self.rounds = {}
+        self.stop_votes = {}
+        self.reductions = Reductions(self.n_workers)
         self.stopped = False
         self.aborted = None
 
@@ -49,6 +51,8 @@ class MetadataBarrier:
             return self._join_init(message, wait_s)
         if kind == "confirm_update":
             return self._confirm(message, wait_s)
+        if kind == "reduce":
+            return self._reduce(message, wait_s)
         if kind == "stop":
             self.stopped = True
             return {"status": STATUS_OK, "request_id": message.get("request_id")}
@@ -68,7 +72,11 @@ class MetadataBarrier:
             deadline = time.monotonic() + max(0.0, float(wait_s))
             while len(self.init) < self.n_workers and time.monotonic() < deadline:
                 self.cv.wait(max(0.0, deadline - time.monotonic()))
-            ready = len(self.init) == self.n_workers and len(set(self.init.values())) == 1
+            if len(self.init) == self.n_workers and len(set(self.init.values())) != 1:
+                # Waiting cannot fix different starting states; fail now instead of at the timeout.
+                return {"status": "DUPLICATE_CONFLICT", "error": "ranks start from different initial states",
+                        "request_id": message.get("request_id")}
+            ready = len(self.init) == self.n_workers
             status = STATUS_OK if ready else STATUS_WAITING
             return {"status": status, "ready": ready, "request_id": message.get("request_id")}
 
@@ -84,6 +92,8 @@ class MetadataBarrier:
                 return {"status": "DUPLICATE_CONFLICT", "error": "update summary conflict",
                         "request_id": message.get("request_id")}
             rnd[rank] = summary
+            votes = self.stop_votes.setdefault(step, {})
+            votes.setdefault(rank, bool(message.get("stop_requested")))
             self.cv.notify_all()
             deadline = time.monotonic() + max(0.0, float(wait_s))
             while len(rnd) < self.n_workers and time.monotonic() < deadline:
@@ -97,8 +107,33 @@ class MetadataBarrier:
             for old in list(self.rounds):
                 if old < step - 2:
                     self.rounds.pop(old, None)
+                    self.stop_votes.pop(old, None)
             self.cv.notify_all()
-            return {"status": STATUS_OK, "round_ready": True, "request_id": message.get("request_id")}
+            # Every rank leaves after the same step when any of them asked to stop.
+            return {"status": STATUS_OK, "round_ready": True, "stop": any(votes.values()),
+                    "request_id": message.get("request_id")}
+
+    def _reduce(self, message, wait_s=0.0):
+        rank = int(message["worker_id"])
+        key = str(message.get("reduce_key") or "")
+        values = tensor_mapping(message.get("tensors"))
+        deadline = time.monotonic() + max(0.0, float(wait_s))
+        with self.cv:
+            while True:
+                try:
+                    total = self.reductions.contribute(rank, key, values)
+                except ValueError as exc:
+                    return {"status": "INVALID_MESSAGE", "error": str(exc), "request_id": message.get("request_id")}
+                if total is not None:
+                    self.cv.notify_all()
+                    return {"status": STATUS_OK, "request_id": message.get("request_id"),
+                            "tensor_arrays" if message.get("_grpc_wire_arrays") else "tensors":
+                            total if message.get("_grpc_wire_arrays") else encode_tensors(total)}
+                self.cv.notify_all()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return {"status": STATUS_WAITING, "request_id": message.get("request_id")}
+                self.cv.wait(remaining)
 
 
 def run_ring(config):

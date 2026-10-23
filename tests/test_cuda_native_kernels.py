@@ -1,4 +1,7 @@
-"""Native DLL kernels against independent FP64 references (stricter than the CuPy comparison)."""
+"""Native library kernels against independent FP64 references (stricter than the CuPy comparison).
+
+A missing native library is built on first use, so only a missing GPU skips these tests.
+"""
 
 import unittest
 
@@ -34,7 +37,7 @@ def _assert_near(test, actual, expected, rel, name):
     test.assertLessEqual(error, rel * scale, f"{name}: max error {error:.3e} > {rel:.1e} x {scale:.3e}")
 
 
-@unittest.skipUnless(cuda_available() and native.is_available(), "CUDA and the native DLL are required")
+@unittest.skipUnless(cuda_available(), "CUDA is required")
 class NativeConvolutionKernelTests(unittest.TestCase):
     def setUp(self):
         set_device("cuda")
@@ -134,7 +137,7 @@ class NativeConvolutionKernelTests(unittest.TestCase):
             native.set_debug_sync(False)
 
 
-@unittest.skipUnless(cuda_available() and native.is_available(), "CUDA and the native DLL are required")
+@unittest.skipUnless(cuda_available(), "CUDA is required")
 class NativeMatmulTests(unittest.TestCase):
     """Lecture 19 matmul kernels: basic, tiled, shared-memory and register-tiled, three accumulation modes."""
 
@@ -218,7 +221,7 @@ class NativeMatmulTests(unittest.TestCase):
             native.matmul(a.astype(xp.float64), xp.zeros((3, 2), xp.float32))
 
 
-@unittest.skipUnless(cuda_available() and native.is_available(), "CUDA and the native DLL are required")
+@unittest.skipUnless(cuda_available(), "CUDA is required")
 class NativeGemmEngineTests(unittest.TestCase):
     """native.gemm: register-tiled engine (five tile shapes, NN/NT/TN, split-K) and cuBLAS."""
 
@@ -300,7 +303,7 @@ class NativeGemmEngineTests(unittest.TestCase):
             native.gemm(a.astype(xp.float64), xp.zeros((3, 2), xp.float32))
 
 
-@unittest.skipUnless(cuda_available() and native.is_available(), "CUDA and the native DLL are required")
+@unittest.skipUnless(cuda_available(), "CUDA is required")
 class NativeLinearTests(unittest.TestCase):
     """Linear/Dense on the native backends: forward, dX, dW and db against FP64."""
 

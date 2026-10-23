@@ -3,14 +3,14 @@ import unittest
 import cupy as cp
 import numpy as np
 
-from MyFlows.core.device import set_device
+from MyFlows.core.device import cuda_available, set_device
 from MyFlows.core.node import Variable
 from MyFlows.ops.convolution import Conv2D_Op
-from MyFlows.ops.cuda_native.native import is_available
 from MyFlows.tests.cuda_fixtures import conv_fixture
 
 
-@unittest.skipUnless(is_available(), "native CUDA scheduler DLL is not built")
+# A missing native library is built on first use, so only a missing GPU skips these tests.
+@unittest.skipUnless(cuda_available(), "CUDA is required")
 class NativeCublasConvolutionTests(unittest.TestCase):
     def setUp(self):
         set_device("cuda")

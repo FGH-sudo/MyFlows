@@ -1,4 +1,5 @@
 import json
+import os
 import re
 from pathlib import Path
 
@@ -54,6 +55,26 @@ def resolve_checkpoint_paths(filepath):
     if path.suffix == ".npz":
         return path.with_suffix(".json"), path
     return path.with_suffix(".json"), path.with_suffix(".npz")
+
+
+def named_state(layers):
+    """Parameters and BN running statistics of ``layers`` under their checkpoint keys.
+
+    Returns ``({key: parameter node}, {key: (layer, attribute)})`` in checkpoint order, so every
+    process that builds the same model gets the same names (distributed training uses them).
+    """
+    params, buffers = {}, {}
+    seen = set()
+    for layer in collect_layers(layers):
+        for param in getattr(layer, "params", []):
+            if id(param) in seen:
+                continue
+            seen.add(id(param))
+            params[f"param_{len(params):04d}_{_safe_name(getattr(param, 'name', None))}"] = param
+        for attr in ("running_mean", "running_var"):
+            if hasattr(getattr(layer, attr, None), "shape"):
+                buffers[f"buffer_{len(buffers):04d}_{_safe_name(getattr(layer, 'name', None))}_{attr}"] = (layer, attr)
+    return params, buffers
 
 
 def _collect_model_arrays(layers):
@@ -175,8 +196,13 @@ def _resolve_score(acc=None, loss=None, score=None, score_name=None):
     return None, None, None
 
 
-def save_checkpoint(layers, optimizer=None, epoch=0, acc=None, filepath="checkpoint", *, loss=None, score=None, score_name=None):
-    """以 JSON + NPZ 格式保存模型权重、BN buffer 与优化器状态。"""
+def save_checkpoint(layers, optimizer=None, epoch=0, acc=None, filepath="checkpoint", *, loss=None, score=None,
+                    score_name=None, training=None):
+    """以 JSON + NPZ 格式保存模型权重、BN buffer 与优化器状态。
+
+    ``training`` 是可选的 JSON 字典（如训练进度），原样写入元数据，由 ``read_checkpoint_metadata`` 读回。
+    两个文件先写临时文件再替换：保存中途被结束时，原有断点仍然完整。
+    """
     json_path, npz_path = resolve_checkpoint_paths(filepath)
     json_path.parent.mkdir(parents=True, exist_ok=True)
     npz_path.parent.mkdir(parents=True, exist_ok=True)
@@ -211,11 +237,28 @@ def save_checkpoint(layers, optimizer=None, epoch=0, acc=None, filepath="checkpo
         metadata["score_value"] = metric_value
         if legacy_metric_key is not None:
             metadata[legacy_metric_key] = metric_value
+    if training is not None:
+        metadata["training"] = training
 
-    with json_path.open("w", encoding="utf-8") as f:
+    # 数组先落盘、元数据后落盘：替换到一半时，旧元数据仍指向同名、同形状的数组
+    npz_tmp = npz_path.with_name(npz_path.name + ".tmp")
+    with npz_tmp.open("wb") as f:
+        np.savez_compressed(f, **arrays)
+    os.replace(npz_tmp, npz_path)
+    json_tmp = json_path.with_name(json_path.name + ".tmp")
+    with json_tmp.open("w", encoding="utf-8") as f:
         json.dump(metadata, f, ensure_ascii=False, indent=2)
-    np.savez_compressed(npz_path, **arrays)
+    os.replace(json_tmp, json_path)
     return str(json_path), str(npz_path)
+
+
+def read_checkpoint_metadata(filepath):
+    """Return the JSON metadata of a checkpoint without loading its arrays, or None when it is missing."""
+    json_path, npz_path = resolve_checkpoint_paths(filepath)
+    if not json_path.exists() or not npz_path.exists():
+        return None
+    with json_path.open("r", encoding="utf-8") as f:
+        return json.load(f)
 
 
 def _read_checkpoint_score(metadata):

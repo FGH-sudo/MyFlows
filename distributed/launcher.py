@@ -81,8 +81,22 @@ def run_ps(**kwargs):
     return run_training(**kwargs)
 
 
+def prepare_native_library(config):
+    """Build a missing or stale native CUDA library once, before any rank starts.
+
+    Every rank would otherwise reach the build on its first convolution and queue on the build lock
+    while the run's handshake and barrier timeouts are already running.
+    """
+    if not str(config.get("task", "")).startswith("donkey_") or not str(config.get("device", "cpu")).startswith("cuda"):
+        return
+    if str(config.get("conv_backend") or "cuda_native_register").startswith("cuda_native"):
+        from ..ops.cuda_native.native import ensure_library
+        ensure_library()
+
+
 def run_training(**kwargs):
     config = normalize_config(**kwargs)
+    prepare_native_library(config)
     if config["mode"] == "single":
         result = run_local_training(config)
         result.update(config=config, events=result.get("events") or [])

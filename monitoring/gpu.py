@@ -7,6 +7,7 @@ reason in ``missing``; they are never replaced by 0.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import threading
 import time
@@ -27,7 +28,10 @@ _SMI_QUERY = (
 )
 _SMI_COLUMNS = ("index", "name", "uuid") + GPU_FIELDS
 _MIB = 1024 * 1024
-_WDDM_REASON = "NVML 未提供每进程显存（Windows WDDM 模式常见）"
+# Why NVML reports a process without its memory: the WDDM driver model on Windows, the same
+# paravirtualized driver inside WSL2, or a container without access to the host's process table.
+_PROCESS_MEMORY_REASON = ("NVML 未提供每进程显存（Windows WDDM 驱动模式下常见）" if os.name == "nt"
+                          else "NVML 未提供每进程显存（WSL2 或容器内常见）")
 
 
 def _no_window() -> int:
@@ -93,7 +97,7 @@ class _NvmlBackend:
                     for p in procs
                 ]
                 if any(p["used_memory_mib"] is None for p in gpu["processes"]):
-                    missing["process_memory"] = _WDDM_REASON
+                    missing["process_memory"] = _PROCESS_MEMORY_REASON
             gpu["missing"] = missing
             gpus.append(gpu)
         return gpus

@@ -25,6 +25,7 @@ from .constants import (
     DEFAULT_PS_RETAIN_ROUNDS,
 )
 from .protocol import (
+    Reductions,
     aggregate_weighted,
     clone_arrays,
     decode_tensors,
@@ -33,6 +34,7 @@ from .protocol import (
     payload_hash,
     schema_from_arrays,
     schema_hash,
+    tensor_mapping,
 )
 
 
@@ -47,6 +49,7 @@ class _Round:
         self.contributions = {}
         self.avg = None
         self.applied = {}
+        self.stop_votes = {}
         self.committed = False
         self.ready = None
 
@@ -96,6 +99,7 @@ class PSEngine:
         self.request_index = {}
         self.aborted = None
         self.stopped = False
+        self.reductions = Reductions(self.n_workers)
 
     def handle(self, message, *, wait_s=0.0):
         if not isinstance(message, dict):
@@ -113,6 +117,7 @@ class PSEngine:
                 "push": self._push,
                 "pull": lambda msg: self._poll(self._pull_once, msg, wait_s),
                 "update_applied": lambda msg: self._poll(self._update_once, msg, wait_s),
+                "reduce": lambda msg: self._poll(self._reduce_once, msg, wait_s),
             }
             handler = dispatch.get(kind)
             if handler is None:
@@ -344,6 +349,7 @@ class PSEngine:
             previous = rnd.applied.get(message["worker_id"])
             if previous is None:
                 rnd.applied[message["worker_id"]] = summary
+                rnd.stop_votes[message["worker_id"]] = bool(message.get("stop_requested"))
             if len(rnd.applied) < self.n_workers:
                 reply = self._reply(message, STATUS_WAITING, "waiting for remaining update confirmations")
                 self._index_request(message, reply)
@@ -360,11 +366,27 @@ class PSEngine:
                 "parameter_version": self.committed_version,
                 "update_id": rnd.avg["update_id"],
                 "global_step": step,
+                # Every rank leaves after the same step when any of them asked to stop.
+                "stop": any(rnd.stop_votes.values()),
             }
             reply = self._reply(message, STATUS_OK, **rnd.ready)
             self._store_ok(message, reply)
             self._gc_locked()
             return reply
+
+    def _reduce_once(self, message):
+        with self.lock:
+            try:
+                total = self.reductions.contribute(
+                    message["worker_id"], str(message.get("reduce_key") or ""),
+                    tensor_mapping(message.get("tensor_arrays") if message.get("tensor_arrays") is not None
+                                   else message.get("tensors")))
+            except ValueError as exc:
+                raise ProtocolError(STATUS_INVALID, str(exc)) from None
+            if total is None:
+                return self._reply(message, STATUS_WAITING, "waiting for remaining reduce contributions")
+            field = "tensor_arrays" if message.get("_grpc_wire_arrays") else "tensors"
+            return self._reply(message, STATUS_OK, **{field: total if field == "tensor_arrays" else encode_tensors(total)})
 
     def _checked_update_summary(self, message, rnd):
         if message.get("update_id") != rnd.avg["update_id"]:

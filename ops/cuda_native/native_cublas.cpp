@@ -1,26 +1,105 @@
 // MyFlows native CUDA scheduler.
 //
-// CuPy owns every device allocation. This DLL compiles the project's kernels with NVRTC once per
-// process for the current device's architecture (caching the binary on disk) and launches them with
-// the CUDA driver API on the caller's stream. GEMMs run on cuBLAS or on the register-tiled kernels
-// below, chosen per call. It links against nothing but the Windows loader: the driver, NVRTC and
-// cuBLAS are resolved at run time.
+// CuPy owns every device allocation. This library (native_cublas.dll on Windows, native_cublas.so on
+// Linux) compiles the project's kernels with NVRTC once per process for the current device's
+// architecture (caching the binary on disk) and launches them with the CUDA driver API on the
+// caller's stream. GEMMs run on cuBLAS or on the register-tiled kernels below, chosen per call. It
+// links against nothing but the system loader: the driver, NVRTC and cuBLAS are resolved at run time.
 //
 // Every failure records "line: call: status name (description)" in a thread-local message that
 // Python reads through mf_last_error(). MYFLOWS_NATIVE_SYNC=1 (or mf_set_debug_sync) synchronizes
 // the stream after each launch so asynchronous faults are reported by the kernel that caused them.
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <dlfcn.h>
+#include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
 #include <vector>
 
+// The C entry points that native.py binds with ctypes; nothing else is exported.
+#ifdef _WIN32
+#define MF_API extern "C" __declspec(dllexport)
+#else
+#define MF_API extern "C" __attribute__((visibility("default")))
+#endif
+
 namespace {
+
+// ---------------------------------------------------------------------------------------------
+// Platform layer: the run-time loader, environment variables and atomic file replacement.
+// ---------------------------------------------------------------------------------------------
+#ifdef _WIN32
+using Library = HMODULE;
+const char* const DRIVER_LIBRARY = "nvcuda.dll";
+constexpr char PATH_SEPARATOR = '\\';
+
+// The driver is a system DLL. NVRTC and cuBLAS are opened by full path, and the DLLs they load in
+// turn (nvrtc-builtins, cublasLt) are searched beside them.
+Library open_library(const char* path, bool system) {
+    return system ? LoadLibraryA(path)
+                  : LoadLibraryExA(path, nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+}
+
+FARPROC find_symbol(Library library, const char* name) { return GetProcAddress(library, name); }
+
+std::string loader_error() { return "Win32 error " + std::to_string(GetLastError()); }
+
+unsigned long process_id() { return GetCurrentProcessId(); }
+
+bool replace_file(const std::string& from, const std::string& to) {
+    return MoveFileExA(from.c_str(), to.c_str(), MOVEFILE_REPLACE_EXISTING) != 0;
+}
+
+void remove_file(const std::string& path) { DeleteFileA(path.c_str()); }
+
+// Value of an environment variable; empty when it is unset.
+std::string environment(const char* name) {
+    char value[64] = {0};
+    const DWORD size = GetEnvironmentVariableA(name, value, sizeof(value));
+    return size > 0 && size < sizeof(value) ? std::string(value, size) : std::string();
+}
+#else
+using Library = void*;
+const char* const DRIVER_LIBRARY = "libcuda.so.1";
+constexpr char PATH_SEPARATOR = '/';
+
+// The driver comes from the system library path. NVRTC and cuBLAS are opened by full path; the
+// libraries they load in turn (nvrtc-builtins, cublasLt) resolve through the $ORIGIN run path of the
+// nvidia-* wheels, and native.py preloads nvrtc-builtins as well.
+Library open_library(const char* path, bool /*system*/) { return dlopen(path, RTLD_NOW | RTLD_LOCAL); }
+
+void* find_symbol(Library library, const char* name) { return dlsym(library, name); }
+
+std::string loader_error() {
+    const char* text = dlerror();
+    return text ? text : "unknown dlopen error";
+}
+
+unsigned long process_id() { return static_cast<unsigned long>(getpid()); }
+
+// rename() replaces an existing file atomically on POSIX file systems.
+bool replace_file(const std::string& from, const std::string& to) {
+    return std::rename(from.c_str(), to.c_str()) == 0;
+}
+
+void remove_file(const std::string& path) { std::remove(path.c_str()); }
+
+// Value of an environment variable; empty when it is unset.
+std::string environment(const char* name) {
+    const char* value = std::getenv(name);
+    return value ? value : "";
+}
+#endif
 
 using CUresult = int;
 using CUdevice = int;
@@ -122,9 +201,9 @@ struct Kernel {
 };
 
 Api api;
-HMODULE driver_module = nullptr;
-HMODULE nvrtc_module = nullptr;
-HMODULE cublas_module = nullptr;
+Library driver_module = nullptr;
+Library nvrtc_module = nullptr;
+Library cublas_module = nullptr;
 CUmodule cuda_module = nullptr;
 CUcontext init_context = nullptr;
 cublasHandle_t cublas_handle = nullptr;
@@ -708,8 +787,8 @@ bool fits_index(std::int64_t value) { return value >= 0 && value <= INDEX_LIMIT;
 // Initialization: symbols, cuBLAS handle, architecture-specific NVRTC build with a disk cache.
 // ---------------------------------------------------------------------------------------------
 template <typename T>
-bool load_symbol(HMODULE module, const char* name, T& target, bool required = true) {
-    target = reinterpret_cast<T>(GetProcAddress(module, name));
+bool load_symbol(Library module, const char* name, T& target, bool required = true) {
+    target = reinterpret_cast<T>(find_symbol(module, name));
     if (!target && required) {
         last_error = std::string("missing symbol: ") + name;
         return false;
@@ -744,13 +823,12 @@ bool read_file(const std::string& path, std::vector<char>& data) {
 // Written under a per-process temporary name and renamed, so concurrent workers never read a
 // partially written binary.
 void write_file_atomic(const std::string& path, const std::vector<char>& data) {
-    const std::string temporary = path + ".tmp" + std::to_string(GetCurrentProcessId());
+    const std::string temporary = path + ".tmp" + std::to_string(process_id());
     FILE* file = std::fopen(temporary.c_str(), "wb");
     if (!file) return;
     const bool ok = std::fwrite(data.data(), 1, data.size(), file) == data.size();
     std::fclose(file);
-    if (!ok || !MoveFileExA(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING))
-        DeleteFileA(temporary.c_str());
+    if (!ok || !replace_file(temporary, path)) remove_file(temporary);
 }
 
 // The newest NVRTC target that the device can run: SASS for the exact architecture when NVRTC
@@ -796,7 +874,7 @@ int compile_kernels(const char* cache_dir) {
     char key_hex[17];
     std::snprintf(key_hex, sizeof(key_hex), "%016llx", static_cast<unsigned long long>(fnv1a(key)));
     const std::string cache_path = cache_dir && *cache_dir
-        ? std::string(cache_dir) + "\\kernels-" + key_hex + (cubin ? ".cubin" : ".ptx") : std::string();
+        ? std::string(cache_dir) + PATH_SEPARATOR + "kernels-" + key_hex + (cubin ? ".cubin" : ".ptx") : std::string();
 
     const auto started = std::chrono::steady_clock::now();
     std::vector<char> binary;
@@ -807,7 +885,7 @@ int compile_kernels(const char* cache_dir) {
         if (api.cuModuleLoadData(&cuda_module, binary.data()) == CUDA_SUCCESS) {
             cache_state = "hit";
         } else {
-            DeleteFileA(cache_path.c_str());
+            remove_file(cache_path);
             binary.clear();
             cuda_module = nullptr;
         }
@@ -853,14 +931,14 @@ int compile_kernels(const char* cache_dir) {
 int ensure_initialized(const char* cublas_path, const char* nvrtc_path, const char* cache_dir) {
     std::lock_guard<std::mutex> lock(init_mutex);
     if (initialized) return MF_OK;
-    driver_module = LoadLibraryA("nvcuda.dll");
-    nvrtc_module = LoadLibraryExA(nvrtc_path, nullptr,
-                                  LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
-    cublas_module = LoadLibraryExA(cublas_path, nullptr,
-                                   LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
-    if (!driver_module || !nvrtc_module || !cublas_module)
-        return fail(MF_ERR_INIT, __LINE__, std::string("could not load ") +
-                    (!driver_module ? "nvcuda.dll" : !nvrtc_module ? nvrtc_path : cublas_path));
+    // Each library is checked right after loading, while the loader's error still describes it.
+    const auto load = [](Library& library, const char* path, bool system) {
+        library = open_library(path, system);
+        return library ? MF_OK : fail(MF_ERR_INIT, __LINE__, std::string("could not load ") + path + ": " + loader_error());
+    };
+    MF_TRY(load(driver_module, DRIVER_LIBRARY, true));
+    MF_TRY(load(nvrtc_module, nvrtc_path, false));
+    MF_TRY(load(cublas_module, cublas_path, false));
     const bool symbols =
         load_symbol(driver_module, "cuModuleLoadData", api.cuModuleLoadData) &&
         load_symbol(driver_module, "cuModuleGetFunction", api.cuModuleGetFunction) &&
@@ -893,9 +971,8 @@ int ensure_initialized(const char* cublas_path, const char* nvrtc_path, const ch
     MF_CU(api.cuCtxGetCurrent(&init_context));
     if (!init_context)
         return fail(MF_ERR_INIT, __LINE__, "no current CUDA context; create a CuPy array before initializing");
-    char sync_flag[8] = {0};
-    if (GetEnvironmentVariableA("MYFLOWS_NATIVE_SYNC", sync_flag, sizeof(sync_flag)) > 0)
-        debug_sync = sync_flag[0] != '0';
+    const std::string sync_flag = environment("MYFLOWS_NATIVE_SYNC");
+    if (!sync_flag.empty()) debug_sync = sync_flag[0] != '0';
     // A failed earlier attempt may already own the handle or the module; reuse them on retry.
     if (!cublas_handle) MF_CUBLAS(api.cublasCreate(&cublas_handle));
     MF_CUBLAS(api.cublasSetMathMode(cublas_handle, CUBLAS_DEFAULT_MATH));
@@ -1046,25 +1123,25 @@ int check_activation(int activation, float alpha, int line) {
 
 }  // namespace
 
-extern "C" __declspec(dllexport) const char* mf_last_error() {
+MF_API const char* mf_last_error() {
     return last_error.c_str();
 }
 
-extern "C" __declspec(dllexport) const char* mf_info() {
+MF_API const char* mf_info() {
     return info_text.c_str();
 }
 
-extern "C" __declspec(dllexport) void mf_set_debug_sync(int enabled) {
+MF_API void mf_set_debug_sync(int enabled) {
     debug_sync = enabled != 0;
 }
 
-extern "C" __declspec(dllexport) int mf_init(const char* cublas_path, const char* nvrtc_path, const char* cache_dir) {
+MF_API int mf_init(const char* cublas_path, const char* nvrtc_path, const char* cache_dir) {
     return ensure_initialized(cublas_path, nvrtc_path, cache_dir);
 }
 
 // Forward: im2col, rows = cols W^T (GEMM engine), then the NCHW epilogue (bias + activation).
 // engine: 0 cuBLAS, 1 register-tiled, with an optional split-K workspace (see mf_gemm).
-extern "C" __declspec(dllexport) int mf_conv_forward(
+MF_API int mf_conv_forward(
     std::uint64_t x, std::uint64_t weight, std::uint64_t bias, std::uint64_t cols,
     std::uint64_t rows, std::uint64_t y, int N, int CI, int H, int W, int CO, int KH, int KW,
     int OH, int OW, int SH, int SW, int PH, int PW, int activation, float alpha, int engine,
@@ -1091,7 +1168,7 @@ extern "C" __declspec(dllexport) int mf_conv_forward(
 
 // Backward: dyT = gate(dy) transposed to (M, CO) with FP64 bias partials, dW = dyT^T cols,
 // grad_cols = dyT W, dx = col2im(grad_cols). dx/grad_cols and partial/db are optional (0).
-extern "C" __declspec(dllexport) int mf_conv_backward(
+MF_API int mf_conv_backward(
     std::uint64_t weight, std::uint64_t dy, std::uint64_t y, std::uint64_t cols,
     std::uint64_t dyT, std::uint64_t dw, std::uint64_t grad_cols, std::uint64_t dx,
     std::uint64_t partial, std::uint64_t db, int N, int CI, int H, int W, int CO, int KH, int KW,
@@ -1131,7 +1208,7 @@ extern "C" __declspec(dllexport) int mf_conv_backward(
     return launch(K_COL2IM, blocks_for(static_cast<std::int64_t>(N) * CI * H * W, 256), 1, 1, 256, 1, stream, args, __LINE__);
 }
 
-extern "C" __declspec(dllexport) int mf_pool_forward(
+MF_API int mf_pool_forward(
     std::uint64_t x, std::uint64_t y, std::uint64_t argmax,
     int N, int C, int H, int W, int OH, int OW, int KH, int KW, int SH, int SW,
     std::uint64_t stream_ptr) {
@@ -1146,7 +1223,7 @@ extern "C" __declspec(dllexport) int mf_pool_forward(
                   reinterpret_cast<CUstream>(stream_ptr), args, __LINE__);
 }
 
-extern "C" __declspec(dllexport) int mf_pool_backward(
+MF_API int mf_pool_backward(
     std::uint64_t dy, std::uint64_t argmax, std::uint64_t dx,
     int N, int C, int H, int W, int OH, int OW, int KH, int KW, int SH, int SW,
     std::uint64_t stream_ptr) {
@@ -1164,7 +1241,7 @@ extern "C" __declspec(dllexport) int mf_pool_backward(
 // C(M,N) = A(M,K) B(K,N) [+ bias(N)], row-major. variant: 0 basic, 1 tiled, 2 shared memory,
 // 3 cuBLAS, 4 register-tiled; tile 16/32 for variants 1-2; accumulate 0/1/2 as documented in the
 // kernel source.
-extern "C" __declspec(dllexport) int mf_matmul(
+MF_API int mf_matmul(
     int variant, int tile, int accumulate, std::uint64_t a, std::uint64_t b, std::uint64_t bias,
     std::uint64_t c, int M, int N, int K, std::uint64_t stream_ptr) {
     MF_TRY(check_ready());
@@ -1214,7 +1291,7 @@ extern "C" __declspec(dllexport) int mf_matmul(
 
 // Tile shape (index into s, h, t, w, x) and split-K slices of the register engine for C(M,N) with
 // inner size K.
-extern "C" __declspec(dllexport) int mf_gemm_plan(int M, int N, int K, int* shape, int* slices) {
+MF_API int mf_gemm_plan(int M, int N, int K, int* shape, int* slices) {
     MF_TRY(check_ready());
     MF_REQUIRE(M > 0 && N > 0 && K > 0, "GEMM dimensions must be positive");
     MF_REQUIRE(shape && slices, "mf_gemm_plan received a null output");
@@ -1226,7 +1303,7 @@ extern "C" __declspec(dllexport) int mf_gemm_plan(int M, int N, int K, int* shap
 
 // Floats of split-K workspace that the register engine of mf_gemm uses for C(M,N) with inner size
 // K (0 when it does not split), or -1 with mf_last_error set.
-extern "C" __declspec(dllexport) std::int64_t mf_gemm_workspace(int M, int N, int K) {
+MF_API std::int64_t mf_gemm_workspace(int M, int N, int K) {
     if (check_ready() != MF_OK) return -1;
     if (M <= 0 || N <= 0 || K <= 0) {
         fail(MF_ERR_ARG, __LINE__, "GEMM dimensions must be positive");
@@ -1239,7 +1316,7 @@ extern "C" __declspec(dllexport) std::int64_t mf_gemm_workspace(int M, int N, in
 // when trans_a (A stored K x M), op(B) = B^T when trans_b (B stored N x K); not both. engine: 0
 // cuBLAS, 1 register-tiled. workspace may be 0; with mf_gemm_workspace(M, N, K) floats the register
 // engine splits K for outputs too small to fill the GPU. bias needs ldc == N.
-extern "C" __declspec(dllexport) int mf_gemm(
+MF_API int mf_gemm(
     int engine, int trans_a, int trans_b, std::uint64_t a, std::uint64_t b, std::uint64_t bias,
     std::uint64_t c, int M, int N, int K, int lda, int ldb, int ldc, std::uint64_t workspace,
     std::int64_t workspace_floats, std::uint64_t stream_ptr) {

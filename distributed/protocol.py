@@ -25,6 +25,8 @@ __all__ = [
     "aggregate_weighted",
     "make_update_id",
     "digest_state",
+    "tensor_mapping",
+    "Reductions",
 ]
 
 
@@ -181,3 +183,50 @@ def digest_state(parameters, optimizer_state=None, step=None):
         "step": step,
     }, sort_keys=True)
     return hashlib.sha256((digest + extra).encode()).hexdigest()
+
+
+def tensor_mapping(items):
+    """Name -> FP32 array of a message's tensors: a gRPC mapping or the Socket JSON item list."""
+    if isinstance(items, dict):
+        return {name: np.array(value, dtype=np.float32) for name, value in items.items()}
+    return {item["name"]: np.asarray(item["data"], dtype=np.float32).reshape(item["shape"])
+            for item in items or []}
+
+
+class Reductions:
+    """Sum small per-rank tensors under a key once every rank has contributed.
+
+    Training loops use it for values every rank must agree on outside the gradient path, such as
+    sharded validation sums. Ranks are summed in rank order in FP64, so every rank receives the
+    same bits; an entry is dropped once each rank has fetched the total.
+    """
+
+    def __init__(self, n_workers):
+        self.n_workers = int(n_workers)
+        self.entries = {}
+
+    def contribute(self, rank, key, values):
+        """Record ``values`` of ``rank``; return the totals once complete, else None."""
+        if not key:
+            raise ValueError("reduce_key required")
+        entry = self.entries.setdefault(key, {"parts": {}, "fetched": set(), "total": None})
+        previous = entry["parts"].get(rank)
+        if previous is None:
+            entry["parts"][rank] = values
+        elif set(previous) != set(values) or any(not np.array_equal(previous[n], values[n]) for n in values):
+            raise ValueError(f"conflicting reduce contribution for {key}")
+        if len(entry["parts"]) < self.n_workers:
+            return None
+        if entry["total"] is None:
+            parts = [entry["parts"][r] for r in sorted(entry["parts"])]
+            names = set(parts[0])
+            if any(set(part) != names for part in parts):
+                raise ValueError(f"reduce {key}: ranks sent different names")
+            entry["total"] = {name: np.sum([np.asarray(part[name], dtype=np.float64) for part in parts],
+                                           axis=0).astype(np.float32)
+                              for name in sorted(names)}
+        entry["fetched"].add(rank)
+        total = entry["total"]
+        if len(entry["fetched"]) == self.n_workers:
+            del self.entries[key]
+        return total
