@@ -1,13 +1,49 @@
+import time
 import unittest
+from unittest import mock
 
 import numpy as np
-
+from MyFlows.distributed import launcher
 from MyFlows.distributed.launcher import run_ps
 from MyFlows.distributed.model import SmallMLP, single_process
 from MyFlows.distributed.protocol import aggregate_weighted, payload_hash, schema_hash
+from MyFlows.distributed.ps import server_main
+
+
+def _slow_shutdown_server(config, events, results, stop):
+    server_main(config, events, results, stop)
+    # A transport can finish its accept/handler threads after the workers have exited.
+    time.sleep(0.4)
+    # Larger than the pipe buffer: shutdown must keep consuming the final event.
+    events.put({"phase": "server_cleanup_complete", "payload": b"x" * (256 * 1024)})
+
+
+def _stalled_shutdown_server(config, events, results, stop):
+    server_main(config, events, results, stop)
+    time.sleep(60)
 
 
 class ParameterServerTest(unittest.TestCase):
+    def test_delayed_server_shutdown_preserves_success_and_final_events(self):
+        with mock.patch.object(launcher, "server_main", _slow_shutdown_server):
+            result = run_ps(workers=2, steps=1, timeout=15, shard_sizes=[20, 12])
+        self.assertEqual(result["status"], "passed", result.get("error"))
+        self.assertTrue(all(code == 0 for code in result["exitcodes"].values()), result["exitcodes"])
+        self.assertFalse(result["alive_pids"])
+        self.assertLess(result["cleanup_s"], 5)
+        self.assertEqual(len(result["history"]), 2)
+        self.assertTrue(any(event["phase"] == "server_cleanup_complete" for event in result["events"]))
+
+    def test_stalled_server_shutdown_is_bounded_and_reports_failure(self):
+        with mock.patch.object(launcher, "server_main", _stalled_shutdown_server):
+            result = run_ps(workers=1, steps=1, timeout=15)
+        self.assertEqual(result["status"], "failed", result.get("error"))
+        self.assertIn("myflows-ps", result["error"])
+        self.assertNotEqual(result["exitcodes"]["myflows-ps"], 0)
+        self.assertEqual(result["exitcodes"]["myflows-worker-0"], 0)
+        self.assertFalse(result["alive_pids"])
+        self.assertLess(result["cleanup_s"], 5)
+
     def test_one_worker_one_step_matches_single_process(self):
         reference = single_process(steps=1)
         result = run_ps(workers=1, steps=1, timeout=15, shard_sizes=[32])

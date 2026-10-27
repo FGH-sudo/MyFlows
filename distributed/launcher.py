@@ -152,10 +152,28 @@ def _run_ps(config):
                 break
     finally:
         cleanup_start = time.perf_counter()
+        cleanup_deadline = cleanup_start + DEFAULT_CLEANUP_S
         stop.set()
-        for process in processes:
-            if process.pid is not None:
-                process.join(timeout=max(0, min(0.2, cleanup_start + 1 - time.perf_counter())))
+        # Let transports finish their accept loop and handler threads before escalating.
+        # Drain events while waiting: a child cannot exit until its queue feeder flushes.
+        # Reserve the last two seconds of the shared cleanup budget for terminate/kill.
+        grace_deadline = cleanup_deadline - 2.0
+        while True:
+            running = []
+            for process in processes:
+                if process.pid is not None:
+                    process.join(timeout=0)
+                    if process.is_alive():
+                        running.append(process)
+            if not running:
+                break
+            remaining = grace_deadline - time.perf_counter()
+            if remaining <= 0:
+                break
+            try:
+                collected.append(events.get(timeout=min(0.02, remaining)))
+            except queue.Empty:
+                pass
         forced = False
         for process in processes:
             if process.pid is not None and process.is_alive():
@@ -163,10 +181,10 @@ def _run_ps(config):
                 process.terminate()
         for process in processes:
             if process.pid is not None:
-                process.join(timeout=max(0, cleanup_start + 4 - time.perf_counter()))
+                process.join(timeout=max(0, cleanup_deadline - 1.0 - time.perf_counter()))
                 if process.is_alive():
                     process.kill()
-                    process.join(timeout=max(0, cleanup_start + 5 - time.perf_counter()))
+                    process.join(timeout=max(0, cleanup_deadline - time.perf_counter()))
         while not forced:
             try:
                 collected.append(events.get_nowait())
@@ -181,6 +199,10 @@ def _run_ps(config):
     result = result or {"status": "failed", "error": "run aborted"}
     if alive or cleanup_s > DEFAULT_CLEANUP_S:
         result.update(status="failed", error="process cleanup did not meet deadline")
+    elif result.get("status") == "passed":
+        failed = [f"{name} exited {code}" for name, code in exitcodes.items() if code != 0]
+        if failed:
+            result.update(status="failed", error="; ".join(failed))
     result.update(config=config, events=collected, exitcodes=exitcodes, alive_pids=alive,
                   cleanup_s=cleanup_s, elapsed_s=time.perf_counter() - started)
     result.update(_outputs_from_events(collected, config["train_workers"]))
