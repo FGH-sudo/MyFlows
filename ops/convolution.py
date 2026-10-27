@@ -28,6 +28,48 @@ def _resolve_backend(backend, *arrays):
     return actual
 
 
+def _depthwise_windows(shape, kernel_size, stride, padding, dilation):
+    """Output size and, per kernel tap (i, j), the strided slices of the padded input it multiplies."""
+    _, _, h, w = shape
+    (kh, kw), (sh, sw), (ph, pw), (dh, dw) = kernel_size, stride, padding, dilation
+    out_h = (h + 2 * ph - dh * (kh - 1) - 1) // sh + 1
+    out_w = (w + 2 * pw - dw * (kw - 1) - 1) // sw + 1
+    taps = [(i, j, slice(i * dh, i * dh + sh * (out_h - 1) + 1, sh), slice(j * dw, j * dw + sw * (out_w - 1) + 1, sw))
+            for i in range(kh) for j in range(kw)]
+    return (out_h, out_w), taps
+
+
+def depthwise_conv2d_forward(x, kernel, stride, padding, dilation):
+    """Depthwise convolution (groups == C_in == C_out): one strided multiply-add per kernel tap.
+
+    The grouped im2col path runs one GEMM per channel (up to 960 in MobileNetV2); this one touches only
+    activation-sized arrays. Returns ``(y, x_padded)``.
+    """
+    ph, pw = padding
+    x_pad = xp.pad(x, ((0, 0), (0, 0), (ph, ph), (pw, pw))) if ph or pw else x
+    (out_h, out_w), taps = _depthwise_windows(x.shape, kernel.shape[2:], stride, padding, dilation)
+    y = xp.zeros((x.shape[0], x.shape[1], out_h, out_w), dtype=x.dtype)
+    for i, j, rows, cols in taps:
+        y += x_pad[:, :, rows, cols] * kernel[:, 0, i, j].reshape(1, -1, 1, 1)
+    return y, x_pad
+
+
+def depthwise_conv2d_backward(x_pad, kernel, grad_y, input_shape, stride, padding, dilation, *, need_input_grad):
+    """Kernel gradient (FP64 accumulation, like the other reductions) and, optionally, the input gradient."""
+    _, taps = _depthwise_windows(input_shape, kernel.shape[2:], stride, padding, dilation)
+    grad_k = xp.zeros(kernel.shape, dtype=kernel.dtype)
+    grad_pad = xp.zeros(x_pad.shape, dtype=grad_y.dtype) if need_input_grad else None
+    for i, j, rows, cols in taps:
+        grad_k[:, 0, i, j] = (x_pad[:, :, rows, cols] * grad_y).sum(axis=(0, 2, 3), dtype=xp.float64)
+        if need_input_grad:
+            grad_pad[:, :, rows, cols] += grad_y * kernel[:, 0, i, j].reshape(1, -1, 1, 1)
+    if grad_pad is None:
+        return grad_k, None
+    ph, pw = padding
+    h, w = input_shape[2:]
+    return grad_k, grad_pad[:, :, ph:ph + h, pw:pw + w]
+
+
 def _needs_grad(node):
     # 输入图像、标签等 requires_grad=False 的叶子变量不需要梯度，可以跳过 dX 的 GEMM 与 col2im
     return getattr(node, "requires_grad", True)
@@ -309,6 +351,14 @@ class Conv2D_Op(Node):
             if bias_val.shape != (C_out,):
                 raise ValueError("bias shape must be (C_out,)")
 
+        self._depthwise = self.groups > 1 and self.groups == C_in == C_out
+        if self._depthwise:
+            self.value, self._depthwise_input = depthwise_conv2d_forward(
+                x_val, kernel_val, self.stride, self.padding, self.dilation)
+            if self.bias is not None:
+                self.value = self.value + bias_val.reshape(1, C_out, 1, 1)
+            return
+
         if len(self._im2col_contexts) != self.groups:
             self._im2col_contexts = [None] * self.groups
 
@@ -380,6 +430,17 @@ class Conv2D_Op(Node):
         out_channels = kernel_node.value.shape[0]
         out_channels_per_group = out_channels // self.groups
         needs_input_grad = _needs_grad(x_node)
+
+        if getattr(self, "_depthwise", False):
+            grad_k, grad_x = depthwise_conv2d_backward(
+                self._depthwise_input, kernel_node.value, self.grad, x_node.value.shape, self.stride, self.padding,
+                self.dilation, need_input_grad=needs_input_grad)
+            kernel_node.grad += grad_k
+            if grad_x is not None:
+                x_node.grad += grad_x
+            if self.bias is not None:
+                bias_node.grad += xp.sum(self.grad, axis=(0, 2, 3), dtype=xp.float64).astype(bias_node.grad.dtype)
+            return
 
         for group_index in range(self.groups):
             in_start, in_end = _group_bounds(in_channels, self.groups, group_index)
@@ -703,15 +764,22 @@ class ConvTranspose2D_LeakyReLU_Op(ConvTranspose2D_Op):
 
 
 class MaxPool2d_Op(Node):
-    def __init__(self, x, kernel_size=2, stride=2, backend="auto"):
+    """最大池化。``padding`` 按 -inf 补边（与 torch.nn.MaxPool2d 相同），补边后各后端的路径不变。"""
+
+    def __init__(self, x, kernel_size=2, stride=2, backend="auto", padding=0):
         super().__init__(x)
         self.backend = _backend_name(backend)
         self.kernel_size = _normalize_pair(kernel_size, "kernel_size")
         self.stride = _normalize_pair(stride, "stride")
+        self.padding = _normalize_pair(padding, "padding", allow_zero=True)
         self._im2col_context = None
 
     def forward(self, x_val):
         self.actual_backend = _resolve_backend(self.backend, x_val)
+        ph, pw = self.padding
+        if ph or pw:
+            x_val = xp.pad(x_val, ((0, 0), (0, 0), (ph, ph), (pw, pw)), constant_values=-xp.inf)
+        self._pooled_shape = x_val.shape
         if self.actual_backend in NATIVE_BACKENDS:
             from .cuda_native.native import maxpool2d_forward
             self.value, self._native_context = maxpool2d_forward(
@@ -744,7 +812,7 @@ class MaxPool2d_Op(Node):
             parent = self.parents[0]
             if parent.grad is None:
                 parent.clear_grad()
-            parent.grad += maxpool2d_backward(self.grad, self._native_context)
+            parent.grad += self._unpad(maxpool2d_backward(self.grad, self._native_context))
             return
         x_node = self.parents[0]
         if x_node.grad is None:
@@ -756,14 +824,20 @@ class MaxPool2d_Op(Node):
         grad_rows = grad_patches.transpose(0, 2, 1, 3).reshape(-1, C * self.kernel_size[0] * self.kernel_size[1])
         grad_x, self._im2col_context = col2im(
             grad_rows,
-            x_node.value.shape,
+            self._pooled_shape,
             self.kernel_size,
             stride=self.stride,
             padding=0,
             dilation=1,
             context=self._im2col_context,
         )
-        x_node.grad += grad_x
+        x_node.grad += self._unpad(grad_x)
+
+    def _unpad(self, grad):
+        ph, pw = self.padding
+        if not (ph or pw):
+            return grad
+        return grad[:, :, ph:grad.shape[2] - ph, pw:grad.shape[3] - pw]
 
 
 class Flatten_Op(Node):

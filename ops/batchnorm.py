@@ -28,8 +28,10 @@ class BatchNorm2d_Op(Node):
         momentum=0.1,
         eps=1e-5,
         training=True,
+        unbiased_running_var=False,
     ):
         super().__init__(x, gamma, beta)
+        self.unbiased_running_var = bool(unbiased_running_var)
         self.running_mean = running_mean
         self.running_var = running_var
         self.momentum = float(momentum)
@@ -44,7 +46,8 @@ class BatchNorm2d_Op(Node):
         self._training_used = self.training
         self.value, self._mean, self._inv_std = batchnorm2d_forward(
             x_val, gamma_val, beta_val, self.running_mean, self.running_var,
-            momentum=self.momentum, eps=self.eps, training=self.training)
+            momentum=self.momentum, eps=self.eps, training=self.training,
+            unbiased_running_var=self.unbiased_running_var)
 
     def backward(self):
         x_node, gamma_node, beta_node = self.parents

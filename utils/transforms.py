@@ -252,10 +252,12 @@ def augment_chw_batch(
     *,
     mixup: bool = False,
     cutmix: bool = False,
+    mix_seed: int | None = None,
 ) -> np.ndarray:
     """
     对 NCHW batch 做增强，返回同形状 NCHW。
     y_batch 可能被 MixUp/CutMix 修改（调用方应使用返回值）。
+    mix_seed: MixUp/CutMix 配对与混合比例的种子；None 时每次随机。
     """
     b, c, h, w = x_batch.shape
     imgs_hwc = [chw_to_hwc(x_batch[i]) for i in range(b)]
@@ -269,6 +271,7 @@ def augment_chw_batch(
             labels,
             use_mixup=mixup,
             use_cutmix=cutmix,
+            seed=mix_seed,
         )
     for i in range(b):
         y_batch[i] = labels[i]

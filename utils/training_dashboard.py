@@ -116,7 +116,9 @@ class TrainingDashboard:
         num_classes: int | None = None,
         force: bool = False,
         epoch: int | None = None,
+        extra: Mapping[str, object] | None = None,
     ) -> None:
+        """extra: 额外写进 JSONL step 行的字段（例如分阶段耗时、显存），不写 TensorBoard。"""
         samples_per_sec = float(batch_size) / max(step_time_ms / 1000.0, 1e-12)
         self._write_jsonl({
             "kind": "step", "epoch": epoch, "step": int(step), "loss": float(loss),
@@ -124,6 +126,7 @@ class TrainingDashboard:
             "accuracy": None if accuracy is None else float(accuracy),
             "data_load_ms": float(data_load_ms), "train_step_ms": float(train_step_ms),
             "step_time_ms": float(step_time_ms), "batch_size": int(batch_size), "samples_per_sec": samples_per_sec,
+            **dict(extra or {}),
         })
         if not self.active:
             return
@@ -166,13 +169,17 @@ class TrainingDashboard:
         accuracy: float | None = None,
         validation_loss: float | None = None,
         validation_accuracy: float | None = None,
+        extra: Mapping[str, object] | None = None,
     ) -> None:
+        """extra: 额外写进 JSONL epoch 行的指标（例如 val_angle_mae），同时以 epoch/<名字> 写入 TensorBoard。"""
+        extra = dict(extra or {})
         self._write_jsonl({
             "kind": "epoch", "epoch": int(epoch), "loss": float(loss),
             "accuracy": None if accuracy is None else float(accuracy),
             "val_loss": None if validation_loss is None else float(validation_loss),
             "val_accuracy": None if validation_accuracy is None else float(validation_accuracy),
             "learning_rate": float(learning_rate), "epoch_time_s": float(epoch_time_s),
+            **extra,
         })
         if not self.active:
             return
@@ -185,6 +192,9 @@ class TrainingDashboard:
             self.tb.log_scalar("val/accuracy_epoch", validation_accuracy, epoch)
         self.tb.log_scalar("train/lr", learning_rate, epoch)
         self.tb.log_scalar("train/epoch_time_s", epoch_time_s, epoch)
+        for name, value in extra.items():
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                self.tb.log_scalar(f"epoch/{name}", value, epoch)
 
     def log_checkpoint(self, tag: str, text: str, step: int) -> None:
         if self.active:

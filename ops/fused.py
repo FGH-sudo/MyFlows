@@ -120,7 +120,8 @@ extern "C" __global__ void mf_bn_grad_partials(const float* x, const float* dy, 
 // (Sterbenz). A single rounded float mean would cost up to |mean| / std ulp in x_hat.
 extern "C" __global__ void mf_bn_stats_finalize(const double* partial, const float* x, float* mean, float* inv_std,
                                                 float* running_mean, float* running_var,
-                                                int C, int HW, int slices, double count, double momentum, double eps) {
+                                                int C, int HW, int slices, double count, double momentum, double eps,
+                                                double var_scale) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= C) return;
     double sum = 0.0, sq = 0.0;
@@ -137,7 +138,7 @@ extern "C" __global__ void mf_bn_stats_finalize(const double* partial, const flo
     inv_std[c] = (float)(1.0 / sqrt(var + eps));
     if (running_mean) {
         running_mean[c] = (float)((1.0 - momentum) * (double)running_mean[c] + momentum * mu);
-        running_var[c] = (float)((1.0 - momentum) * (double)running_var[c] + momentum * var);
+        running_var[c] = (float)((1.0 - momentum) * (double)running_var[c] + momentum * var * var_scale);
     }
 }
 
@@ -199,14 +200,19 @@ def _channel(array):
     return array.reshape(1, -1, 1, 1)
 
 
-def batchnorm2d_forward(x, gamma, beta, running_mean, running_var, *, momentum, eps, training):
+def batchnorm2d_forward(x, gamma, beta, running_mean, running_var, *, momentum, eps, training,
+                        unbiased_running_var=False):
     """Return ``(y, mean, inv_std)``; updates the running statistics in place when training.
 
     ``mean`` has shape (2, C): the FP64 mean split into ``mean[0] + mean[1]`` (see
     ``mf_bn_stats_finalize``). Pass it unchanged to :func:`batchnorm2d_backward`.
+    Normalisation always uses the biased batch variance; ``unbiased_running_var`` makes the running
+    variance track the unbiased one, n / (n - 1) times larger, as torch.nn.BatchNorm2d does.
     """
     n, c, h, w = x.shape
     hw = h * w
+    count = n * hw
+    var_scale = count / (count - 1) if unbiased_running_var and count > 1 else 1.0
     if _on_gpu(x, gamma, beta, running_mean, running_var) and _same_float32(x, gamma, beta, running_mean, running_var):
         cp = _lazy_cupy()
         x = cp.ascontiguousarray(x)
@@ -221,7 +227,8 @@ def batchnorm2d_forward(x, gamma, beta, running_mean, running_var, *, momentum, 
             module.get_function("mf_bn_stats_partials")((c, slices), (256,), (x, partial, np.int32(n), np.int32(c), np.int32(hw), np.int32(chunk)))
             module.get_function("mf_bn_stats_finalize")((-(-c // 128),), (128,), (
                 partial, x, mean, inv_std, running_mean, running_var, np.int32(c), np.int32(hw),
-                np.int32(slices), np.float64(n * hw), np.float64(momentum), np.float64(eps)))
+                np.int32(slices), np.float64(n * hw), np.float64(momentum), np.float64(eps),
+                np.float64(var_scale)))
         else:
             mean = cp.stack([running_mean, cp.zeros_like(running_mean)])
             inv_std = (1.0 / cp.sqrt(running_var.astype(cp.float64) + eps)).astype(cp.float32)
@@ -236,7 +243,7 @@ def batchnorm2d_forward(x, gamma, beta, running_mean, running_var, *, momentum, 
         centered = x.astype(np.float64) - _channel(mean64)
         var64 = (centered * centered).mean(axis=axes)
         running_mean[...] = (1.0 - momentum) * running_mean.astype(np.float64) + momentum * mean64
-        running_var[...] = (1.0 - momentum) * running_var.astype(np.float64) + momentum * var64
+        running_var[...] = (1.0 - momentum) * running_var.astype(np.float64) + momentum * var64 * var_scale
     else:
         mean64, var64 = running_mean.astype(np.float64), running_var.astype(np.float64)
     hi = mean64.astype(x.dtype)

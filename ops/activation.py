@@ -61,6 +61,20 @@ class ReLU(Node):
         relu_backward_accumulate(x_node.value, self.grad, x_node.grad)
 
 
+class ReLU6(Node):
+    """min(max(0, x), 6)：MobileNetV2 的激活。导数在 (0, 6) 内为 1，其余为 0（与 torch.nn.ReLU6 一致）。"""
+
+    def forward(self, x):
+        self.value = xp.clip(x, 0, 6)
+
+    def backward(self):
+        x_node = self.parents[0]
+        if x_node.grad is None:
+            x_node.grad = xp.zeros_like(x_node.value)
+        x = x_node.value
+        x_node.grad += self.grad * ((x > 0) & (x < 6))
+
+
 class LeakyReLU(Node):
     def __init__(self, x, alpha=0.01, name=None):
         self.alpha = alpha  # 负半轴的斜率，通常设为 0.01

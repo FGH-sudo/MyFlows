@@ -197,10 +197,11 @@ def _resolve_score(acc=None, loss=None, score=None, score_name=None):
 
 
 def save_checkpoint(layers, optimizer=None, epoch=0, acc=None, filepath="checkpoint", *, loss=None, score=None,
-                    score_name=None, training=None):
+                    score_name=None, training=None, compress=True):
     """以 JSON + NPZ 格式保存模型权重、BN buffer 与优化器状态。
 
     ``training`` 是可选的 JSON 字典（如训练进度），原样写入元数据，由 ``read_checkpoint_metadata`` 读回。
+    ``compress=False`` 写不压缩的 NPZ（频繁保存的 TrainingState 用：浮点权重几乎压不小，压缩只是费时）。
     两个文件先写临时文件再替换：保存中途被结束时，原有断点仍然完整。
     """
     json_path, npz_path = resolve_checkpoint_paths(filepath)
@@ -243,7 +244,7 @@ def save_checkpoint(layers, optimizer=None, epoch=0, acc=None, filepath="checkpo
     # 数组先落盘、元数据后落盘：替换到一半时，旧元数据仍指向同名、同形状的数组
     npz_tmp = npz_path.with_name(npz_path.name + ".tmp")
     with npz_tmp.open("wb") as f:
-        np.savez_compressed(f, **arrays)
+        (np.savez_compressed if compress else np.savez)(f, **arrays)
     os.replace(npz_tmp, npz_path)
     json_tmp = json_path.with_name(json_path.name + ".tmp")
     with json_tmp.open("w", encoding="utf-8") as f:
@@ -350,3 +351,127 @@ def _restore_optimizer(optimizer, optimizer_meta, data, saved_key_to_var):
             if var is not None:
                 state[var] = xp.asarray(data[entry["array_key"]], dtype=var.value.dtype).copy()
         setattr(optimizer, state_name, state)
+
+
+# ---- TrainingState: transactional, checksummed snapshots for exact resume and rollback -----------------
+
+TRAINING_STATE_VERSION = 1
+_STATE_DIR = re.compile(r"^step-(\d{9})$")
+_STATE_FILES = ("checkpoint.json", "checkpoint.npz")
+
+
+class TrainingStateError(RuntimeError):
+    """A TrainingState is missing, incomplete or does not match its manifest."""
+
+
+def _sha256(path):
+    import hashlib
+
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _replace_json(path, value):
+    path = Path(path)
+    tmp = path.with_name(path.name + ".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(value, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+def save_training_state(directory, layers, optimizer, step, state, *, keep=3):
+    """Write one TrainingState under ``directory/step-<step>/`` as a transaction.
+
+    The weights, BN buffers and optimizer state go through :func:`save_checkpoint` (``state`` becomes its
+    ``training`` metadata: RNG states, data cursor, early-stopping state, config fingerprint, ...). Everything
+    is written into a staging directory first; ``manifest.json`` with the SHA-256 of every file is written
+    last, the directory is renamed into place, and only then ``latest.json`` points at it. A crash at any
+    point leaves either the previous states untouched or a staging directory that readers ignore.
+    The newest ``keep`` states are kept (older ones are deleted) plus the step-0 state, the initial weights
+    every rollback can fall back to; returns the state directory.
+    """
+    import shutil
+    import time
+    import uuid
+
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    name = f"step-{int(step):09d}"
+    staging = directory / f".staging-{name}-{uuid.uuid4().hex[:8]}"
+    staging.mkdir()
+    try:
+        epoch = int(state.get("epoch", 0)) if isinstance(state, dict) else 0
+        save_checkpoint(layers, optimizer, epoch, filepath=str(staging / "checkpoint"), compress=False,
+                        training={**state, "state_version": TRAINING_STATE_VERSION, "step": int(step)})
+        files = {f: {"sha256": _sha256(staging / f), "bytes": (staging / f).stat().st_size} for f in _STATE_FILES}
+        _replace_json(staging / "manifest.json", {"format": "MyFlows TrainingState", "version": TRAINING_STATE_VERSION,
+                                                  "step": int(step), "created_unix_s": time.time(), "files": files})
+        final = directory / name
+        if final.exists():
+            shutil.rmtree(final)
+        os.replace(staging, final)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    _replace_json(directory / "latest.json", {"state": name, "step": int(step)})
+    states = [s for s in list_training_states(directory, verify=False) if s["step"] != 0]
+    for old in states[:-keep] if keep and len(states) > keep else []:
+        shutil.rmtree(old["path"], ignore_errors=True)
+    return final
+
+
+def verify_training_state(path):
+    """Check a TrainingState against its manifest; returns the manifest or raises TrainingStateError."""
+    path = Path(path)
+    manifest_path = path / "manifest.json"
+    if not manifest_path.exists():
+        raise TrainingStateError(f"{path}: 没有 manifest（未完成的写入）")
+    with manifest_path.open("r", encoding="utf-8") as f:
+        manifest = json.load(f)
+    for name, expected in (manifest.get("files") or {}).items():
+        file = path / name
+        if not file.exists():
+            raise TrainingStateError(f"{path}: 缺少 {name}")
+        if _sha256(file) != expected.get("sha256"):
+            raise TrainingStateError(f"{path}: {name} 的校验和与 manifest 不符")
+    return manifest
+
+
+def list_training_states(directory, *, verify=True):
+    """Complete TrainingStates under ``directory``, oldest first: ``[{path, step, state}]``.
+
+    ``state`` is the training metadata (read from ``checkpoint.json``); with ``verify`` the checksums are
+    checked and broken states are skipped.
+    """
+    directory = Path(directory)
+    out = []
+    if not directory.is_dir():
+        return out
+    for entry in sorted(directory.iterdir()):
+        m = _STATE_DIR.match(entry.name)
+        if not m or not entry.is_dir() or not (entry / "manifest.json").exists():
+            continue
+        try:
+            if verify:
+                verify_training_state(entry)
+            meta = read_checkpoint_metadata(entry / "checkpoint")
+        except (TrainingStateError, OSError, ValueError):
+            continue
+        if meta is not None:
+            out.append({"path": entry, "step": int(m.group(1)), "state": meta.get("training") or {}})
+    return sorted(out, key=lambda s: s["step"])
+
+
+def load_training_state(path, layers, optimizer):
+    """Verify, then restore weights, buffers and optimizer state; returns the training metadata."""
+    path = Path(path)
+    verify_training_state(path)
+    load_checkpoint(layers, optimizer, filepath=str(path / "checkpoint"))
+    meta = read_checkpoint_metadata(path / "checkpoint") or {}
+    state = meta.get("training") or {}
+    if state.get("state_version") != TRAINING_STATE_VERSION:
+        raise TrainingStateError(f"{path}: 不支持的 TrainingState 版本 {state.get('state_version')}")
+    return state

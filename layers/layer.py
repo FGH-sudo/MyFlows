@@ -90,6 +90,7 @@ class Conv2D(Layer):
         initializer=None,
         dtype=None,
         backend="auto",
+        bias=True,
     ):
         super().__init__(name=name)
 
@@ -114,8 +115,9 @@ class Conv2D(Layer):
         b_init = xp.zeros((out_channels,), dtype=k_init.dtype)
 
         self.kernel = Variable(k_init, trainable=True, name=f"{self.name}_kernel" if self.name else "kernel")
-        self.b = Variable(b_init, trainable=True, name=f"{self.name}_bias" if self.name else "bias")
-        self.params = [self.kernel, self.b]
+        # bias=False：后接 BN 的卷积（torchvision ResNet/MobileNetV2）没有偏置
+        self.b = Variable(b_init, trainable=True, name=f"{self.name}_bias" if self.name else "bias") if bias else None
+        self.params = [self.kernel] if self.b is None else [self.kernel, self.b]
 
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -364,14 +366,15 @@ class ConvTranspose2D(Layer):
         return self.activation(conv_out) if self.activation else conv_out
 
 class MaxPool2d(Layer):
-    def __init__(self, kernel_size=2, stride=2, name=None, backend="auto"):
+    def __init__(self, kernel_size=2, stride=2, name=None, backend="auto", padding=0):
         super().__init__(name=name)
         from ..ops.convolution import _backend_name
         self.backend = _backend_name(backend)
         self.k, self.s = kernel_size, stride
+        self.padding = _pair(padding, "padding", allow_zero=True)
         self.params = []
     def forward(self, input_node):
-        return MaxPool2d_Op(input_node, self.k, self.s, backend=self.backend)
+        return MaxPool2d_Op(input_node, self.k, self.s, backend=self.backend, padding=self.padding)
 
 
 class Flatten(Layer):

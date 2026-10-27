@@ -1,3 +1,5 @@
+from contextlib import nullcontext
+
 from ..core.device import xp
 from ..core.node import Variable
 from ..core.graph import Graph
@@ -19,12 +21,13 @@ class Optimizer:
         self.acc_gradient = {}  # 累加梯度的字典
         self.acc_no = 0  # 累加次数
     
-    def one_step(self):
+    def one_step(self, timer=None):
         """
-        执行一步训练，包括前向传播和反向传播，并增加累加次数
+        执行一步训练，包括前向传播和反向传播，并增加累加次数。
+        timer: 可选，timer("forward") / timer("backward") 返回上下文管理器，分别包住前向与反向（含梯度累加）
         """
         # 前向传播和反向传播
-        self.forward_backward()
+        self.forward_backward(timer)
         # 增加累加次数
         self.acc_no += 1
     
@@ -83,18 +86,22 @@ class Optimizer:
         self.acc_gradient.clear()
         self.acc_no = 0
         
-    def forward_backward(self):
+    def forward_backward(self, timer=None):
         """
         执行前向传播和反向传播
         计算目标节点对各个可训练节点的梯度，并累加到acc_gradient中
         """
         # 前向传播
-        self.graph.forward()
-        
-        # 反向传播
-        self.graph.backward()
-        
-        # 累加梯度 
+        with (timer("forward") if timer else nullcontext()):
+            self.graph.forward()
+
+        with (timer("backward") if timer else nullcontext()):
+            # 反向传播
+            self.graph.backward()
+            self._accumulate_gradients()
+
+    def _accumulate_gradients(self):
+        # 累加梯度
         for node in self.graph.nodes:
             if node.trainable is True:
                 if node.grad is not None:
