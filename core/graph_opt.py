@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import numpy as np
 
+from .device import xp
 from .node import Node, Variable
 
 
@@ -84,7 +85,7 @@ def fold_constant_adds(target_node: Node) -> tuple[Node, int]:
             if not getattr(a, "constant", False) or not getattr(b, "constant", False):
                 continue
 
-            val = _add_values(np.asarray(a.value), np.asarray(b.value))
+            val = _add_values(xp.asarray(a.value), xp.asarray(b.value))
             new_v = Variable(
                 val,
                 trainable=False,
@@ -175,7 +176,9 @@ def fold_bn_into_conv(target_node: Node) -> tuple[Node, int]:
         if not node.parents:
             continue
         conv = node.parents[0]
-        if not isinstance(conv, Conv2D_Op):
+        # An activation cannot be moved across BN, and other consumers must keep
+        # seeing the original convolution output.
+        if type(conv) is not Conv2D_Op or any(child is not node for child in conv.children):
             continue
         if len(conv.parents) < 2:
             continue

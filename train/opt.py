@@ -187,7 +187,7 @@ class RMSProp(Optimizer):
                 if grad is None:
                     continue
                 if node not in self.s:
-                    self.s[node] = xp.power(grad, 2)
+                    self.s[node] = (1 - self.beta) * xp.power(grad, 2)
                 else:
                     self.s[node] = self.beta * self.s[node] + (1 - self.beta) * xp.power(grad, 2)
                 # 更新变量值

@@ -9,10 +9,11 @@ import numpy as np
 
 from MyFlows.core.device import cuda_available, set_device, xp
 from MyFlows.core.node import Variable
-from MyFlows.ops.convolution import NATIVE_BACKENDS, Conv2D_LeakyReLU_Op, Conv2D_Op, Conv2D_ReLU_Op
+from MyFlows.ops.convolution import NATIVE_BACKENDS, Conv2D_LeakyReLU_Op, Conv2D_Op, Conv2D_ReLU_Op, MaxPool2d_Op
 from MyFlows.ops.cuda_native import native
 from MyFlows.tests.cuda_fixtures import CONV_CASES, conv_fixture
-from MyFlows.tests.test_convolution import naive_conv_backward, naive_conv_forward
+from MyFlows.tests.test_convolution import (naive_conv_backward, naive_conv_forward, naive_maxpool_backward,
+                                          naive_maxpool_forward)
 
 EPS32 = float(np.finfo(np.float32).eps)
 
@@ -135,6 +136,47 @@ class NativeConvolutionKernelTests(unittest.TestCase):
             self._run(CONV_CASES[1])
         finally:
             native.set_debug_sync(False)
+
+
+@unittest.skipUnless(cuda_available(), "CUDA is required")
+class NativePoolingTests(unittest.TestCase):
+    def setUp(self):
+        set_device("cuda")
+
+    def tearDown(self):
+        set_device("cpu")
+
+    def test_forward_backward_match_fp64_with_ties_padding_and_overlapping_windows(self):
+        rng = np.random.default_rng(7)
+        for shape, kernel, stride, padding in (
+            ((2, 3, 7, 9), (3, 2), (1, 2), (0, 0)),
+            ((1, 2, 4, 5), (3, 3), (2, 2), (1, 1)),
+            ((1, 1, 6, 7), (2, 2), (3, 3), (0, 0)),
+        ):
+            with self.subTest(shape=shape, kernel=kernel, stride=stride, padding=padding):
+                x = rng.integers(-3, 4, size=shape).astype(np.float32)
+                ph, pw = padding
+                padded = np.pad(x.astype(np.float64), ((0, 0), (0, 0), (ph, ph), (pw, pw)),
+                                constant_values=-np.inf)
+                expected = naive_maxpool_forward(padded, kernel, stride)
+                dy = rng.standard_normal(expected.shape).astype(np.float32)
+                expected_dx = naive_maxpool_backward(padded, dy.astype(np.float64), kernel, stride)
+                expected_dx = expected_dx[:, :, ph:ph + shape[2], pw:pw + shape[3]]
+                node = Variable(xp.asarray(x))
+                pool = MaxPool2d_Op(node, kernel, stride, padding=padding, backend="cuda_native_register")
+                pool.forward(node.value)
+                pool.grad = xp.asarray(dy)
+                pool.backward()
+                np.testing.assert_array_equal(xp.asnumpy(pool.value), expected)
+                np.testing.assert_allclose(xp.asnumpy(node.grad), expected_dx, rtol=1e-6, atol=1e-6)
+
+    def test_nan_in_any_window_position_is_propagated(self):
+        for position in range(4):
+            with self.subTest(position=position):
+                x = np.arange(1, 5, dtype=np.float32).reshape(1, 1, 2, 2)
+                x.reshape(-1)[position] = np.nan
+                y, _ = native.maxpool2d_forward(xp.asarray(x))
+                self.assertTrue(np.isnan(xp.asnumpy(y)).all())
 
 
 @unittest.skipUnless(cuda_available(), "CUDA is required")

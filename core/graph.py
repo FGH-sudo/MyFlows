@@ -67,7 +67,7 @@ class Graph:
         for n in self.nodes:
             n.clear_grad()
             
-        self.target_node.grad = xp.asarray(1.0, dtype=self.target_node.value.dtype)
+        self.target_node.grad = xp.ones_like(self.target_node.value)
         
         # 使用预先计算好的反向排序列表
         for node in reversed(self.sorted_nodes):

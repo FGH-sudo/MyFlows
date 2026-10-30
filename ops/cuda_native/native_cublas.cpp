@@ -369,7 +369,7 @@ extern "C" __global__ void maxpool2d_forward_native(
     for (int kh = 0; kh < KH; ++kh)
         for (int kw = 0; kw < KW; ++kw) {
             int at = first + kh * W + kw;
-            if (x[at] > value) { value = x[at]; best = at; }
+            if (x[at] > value || isnan(x[at])) { value = x[at]; best = at; }
         }
     y[idx] = value;
     argmax[idx] = best;

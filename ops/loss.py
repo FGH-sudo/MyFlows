@@ -14,6 +14,7 @@ class PerceptionLoss(Node):
         self.y_true = y_true
 
     def forward(self, y_pred_val, y_true_val):
+        self.y_pred, self.y_true = self.parents
         # 存储值以便反向传播
         self.y_pred_val = y_pred_val
         self.y_true_val = y_true_val
@@ -40,8 +41,9 @@ class LogLoss(Node):
         self.y_true = y_true
 
     def forward(self, y_pred, y_true):
+        self.y_pred, self.y_true = self.parents
         # 前向传播公式说明 x = y_true * y_pred
-        self.x = self.y_true.value * self.y_pred.value
+        self.x = y_true * y_pred
 
         # log(1 + e^{-x}) = logaddexp(0, -x)：两侧都数值稳定，且没有布尔索引（CuPy 上会同步）；
         # 均值在 FP64 中累加后转回输入 dtype
@@ -76,6 +78,7 @@ class CrossEntropy(Node):
         self.y_true = y_true
 
     def forward(self, logits_val, y_true_val):
+        self.logits, self.y_true = self.parents
         self.value, self.probs, self._labels, self._targets = softmax_cross_entropy(logits_val, y_true_val)
 
     def backward(self):

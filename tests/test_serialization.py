@@ -14,6 +14,8 @@ import numpy as np
 
 from MyFlows import Dense, Variable, Graph, save_checkpoint, load_checkpoint, export_onnx
 from MyFlows.layers.resnet import BatchNorm2d
+from MyFlows.utils.checkpoint import (TrainingStateError, load_training_state, read_checkpoint_metadata,
+                                      save_training_state, verify_training_state)
 
 
 def test_json_npz_checkpoint_roundtrip():
@@ -59,6 +61,41 @@ class CheckpointScoreMetadataTest(unittest.TestCase):
             epoch, best_loss = load_checkpoint([layer], filepath=base)
             self.assertEqual(epoch, 3)
             self.assertEqual(best_loss, 0.125)
+
+
+class TrainingStateBestCheckpointTest(unittest.TestCase):
+    def test_resume_restores_the_best_at_the_snapshot_not_a_later_best(self):
+        layer = Dense(3, 2, name="dense")
+        best_weights = layer.W.value.copy()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            best = root / "historical_best"
+            save_checkpoint([layer], epoch=0, loss=0.25, filepath=best)
+            layer.W.value += 1
+            state_weights = layer.W.value.copy()
+            state = save_training_state(root / "states", [layer], None, 1, {"best_loss": 0.25}, best_filepath=best)
+            layer.W.value += 1
+            save_checkpoint([layer], epoch=1, loss=0.1, filepath=best)
+
+            restored_best = root / "resumed" / "selected"
+            load_training_state(state, [layer], None, best_filepath=restored_best)
+            np.testing.assert_array_equal(layer.W.value, state_weights)
+            metadata = read_checkpoint_metadata(restored_best)
+            self.assertEqual((metadata["score_value"], metadata["array_file"]), (0.25, "selected.npz"))
+            load_checkpoint([layer], filepath=restored_best)
+            np.testing.assert_array_equal(layer.W.value, best_weights)
+
+            data = bytearray((state / "best.npz").read_bytes())
+            data[len(data) // 2] ^= 1
+            (state / "best.npz").write_bytes(data)
+            with self.assertRaises(TrainingStateError):
+                verify_training_state(state)
+
+    def test_a_state_missing_its_historical_best_is_not_silently_resumed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = save_training_state(tmp, [], None, 1, {"best_loss": 0.25})
+            with self.assertRaisesRegex(TrainingStateError, "历史最佳模型"):
+                load_training_state(state, [], None, best_filepath=Path(tmp) / "best")
 
 
 def test_batchnorm_buffers_checkpoint_roundtrip():

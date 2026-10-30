@@ -274,6 +274,8 @@ def load_checkpoint(layers, optimizer=None, filepath="checkpoint"):
     """Load JSON+NPZ checkpoint and return ``(epoch, score_value)``."""
     json_path, npz_path = resolve_checkpoint_paths(filepath)
     if not json_path.exists() or not npz_path.exists():
+        if optimizer is None or json_path.exists() or npz_path.exists():
+            raise FileNotFoundError(f"Checkpoint 不存在或不完整: {json_path} + {npz_path}")
         print("未发现 Checkpoint，从零开始训练。")
         return -1, 0.0
 
@@ -287,6 +289,8 @@ def load_checkpoint(layers, optimizer=None, filepath="checkpoint"):
     saved_buffers = metadata["model"].get("buffers", [])
     if len(saved_params) != len(live_params):
         raise ValueError(f"参数数量不匹配: checkpoint={len(saved_params)}, model={len(live_params)}")
+    if len(saved_buffers) != len(live_buffers):
+        raise ValueError(f"buffer 数量不匹配: checkpoint={len(saved_buffers)}, model={len(live_buffers)}")
 
     saved_key_to_var = {}
     with np.load(npz_path, allow_pickle=False) as data:
@@ -382,7 +386,21 @@ def _replace_json(path, value):
     os.replace(tmp, path)
 
 
-def save_training_state(directory, layers, optimizer, step, state, *, keep=3):
+def _copy_checkpoint(source, target):
+    import shutil
+
+    source_json, source_npz = resolve_checkpoint_paths(source)
+    json_path, npz_path = resolve_checkpoint_paths(target)
+    metadata = json.loads(source_json.read_text(encoding="utf-8"))
+    npz_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = npz_path.with_name(npz_path.name + ".tmp")
+    shutil.copyfile(source_npz, tmp)
+    os.replace(tmp, npz_path)
+    metadata["array_file"] = npz_path.name
+    _replace_json(json_path, metadata)
+
+
+def save_training_state(directory, layers, optimizer, step, state, *, keep=3, best_filepath=None):
     """Write one TrainingState under ``directory/step-<step>/`` as a transaction.
 
     The weights, BN buffers and optimizer state go through :func:`save_checkpoint` (``state`` becomes its
@@ -391,7 +409,8 @@ def save_training_state(directory, layers, optimizer, step, state, *, keep=3):
     last, the directory is renamed into place, and only then ``latest.json`` points at it. A crash at any
     point leaves either the previous states untouched or a staging directory that readers ignore.
     The newest ``keep`` states are kept (older ones are deleted) plus the step-0 state, the initial weights
-    every rollback can fall back to; returns the state directory.
+    every rollback can fall back to; returns the state directory. ``best_filepath`` snapshots the historical
+    best checkpoint as well, so a later improvement cannot change the best model of an older state.
     """
     import shutil
     import time
@@ -406,7 +425,11 @@ def save_training_state(directory, layers, optimizer, step, state, *, keep=3):
         epoch = int(state.get("epoch", 0)) if isinstance(state, dict) else 0
         save_checkpoint(layers, optimizer, epoch, filepath=str(staging / "checkpoint"), compress=False,
                         training={**state, "state_version": TRAINING_STATE_VERSION, "step": int(step)})
-        files = {f: {"sha256": _sha256(staging / f), "bytes": (staging / f).stat().st_size} for f in _STATE_FILES}
+        names = list(_STATE_FILES)
+        if best_filepath is not None:
+            _copy_checkpoint(best_filepath, staging / "best")
+            names.extend(("best.json", "best.npz"))
+        files = {f: {"sha256": _sha256(staging / f), "bytes": (staging / f).stat().st_size} for f in names}
         _replace_json(staging / "manifest.json", {"format": "MyFlows TrainingState", "version": TRAINING_STATE_VERSION,
                                                   "step": int(step), "created_unix_s": time.time(), "files": files})
         final = directory / name
@@ -429,11 +452,24 @@ def verify_training_state(path):
     manifest_path = path / "manifest.json"
     if not manifest_path.exists():
         raise TrainingStateError(f"{path}: 没有 manifest（未完成的写入）")
-    with manifest_path.open("r", encoding="utf-8") as f:
-        manifest = json.load(f)
-    for name, expected in (manifest.get("files") or {}).items():
+    try:
+        with manifest_path.open("r", encoding="utf-8") as f:
+            manifest = json.load(f)
+    except (OSError, ValueError) as exc:
+        raise TrainingStateError(f"{path}: 无法读取 manifest: {exc}") from exc
+    if not isinstance(manifest, dict) or manifest.get("format") != "MyFlows TrainingState" \
+            or manifest.get("version") != TRAINING_STATE_VERSION:
+        raise TrainingStateError(f"{path}: 不支持的 manifest 格式或版本")
+    files = manifest.get("files")
+    allowed = {*_STATE_FILES, "best.json", "best.npz"}
+    if not isinstance(files, dict) or not set(_STATE_FILES).issubset(files) or set(files) - allowed \
+            or (("best.json" in files) != ("best.npz" in files)):
+        raise TrainingStateError(f"{path}: manifest 文件清单不完整或无效")
+    for name, expected in files.items():
         file = path / name
-        if not file.exists():
+        if not isinstance(expected, dict) or not isinstance(expected.get("sha256"), str):
+            raise TrainingStateError(f"{path}: {name} 的校验记录无效")
+        if not file.is_file():
             raise TrainingStateError(f"{path}: 缺少 {name}")
         if _sha256(file) != expected.get("sha256"):
             raise TrainingStateError(f"{path}: {name} 的校验和与 manifest 不符")
@@ -465,13 +501,18 @@ def list_training_states(directory, *, verify=True):
     return sorted(out, key=lambda s: s["step"])
 
 
-def load_training_state(path, layers, optimizer):
+def load_training_state(path, layers, optimizer, *, best_filepath=None):
     """Verify, then restore weights, buffers and optimizer state; returns the training metadata."""
     path = Path(path)
-    verify_training_state(path)
-    load_checkpoint(layers, optimizer, filepath=str(path / "checkpoint"))
+    manifest = verify_training_state(path)
     meta = read_checkpoint_metadata(path / "checkpoint") or {}
     state = meta.get("training") or {}
     if state.get("state_version") != TRAINING_STATE_VERSION:
         raise TrainingStateError(f"{path}: 不支持的 TrainingState 版本 {state.get('state_version')}")
+    if best_filepath is not None and state.get("best_loss") is not None:
+        if not {"best.json", "best.npz"}.issubset(manifest["files"]):
+            raise TrainingStateError(f"{path}: TrainingState 未保存历史最佳模型，无法恢复最佳权重")
+    load_checkpoint(layers, optimizer, filepath=str(path / "checkpoint"))
+    if best_filepath is not None and state.get("best_loss") is not None:
+        _copy_checkpoint(path / "best", best_filepath)
     return state
