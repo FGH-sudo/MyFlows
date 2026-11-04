@@ -9,9 +9,9 @@ from MyFlows.utils.tensorboard_logger import TensorBoardLogger, has_tensorboard_
 class TensorBoardLoggerTest(unittest.TestCase):
     def test_write_scalar_creates_events(self):
         try:
-            from torch.utils.tensorboard import SummaryWriter  # noqa: F401
+            from tensorboard.summary.writer.event_file_writer import EventFileWriter  # noqa: F401
         except ImportError:
-            self.skipTest("tensorboard/torch not installed")
+            self.skipTest("tensorboard not installed")
 
         with tempfile.TemporaryDirectory() as tmp:
             log_dir = Path(tmp) / "run"

@@ -7,12 +7,15 @@ reason in ``missing``; they are never replaced by 0.
 from __future__ import annotations
 
 import json
+import math
 import os
 import subprocess
 import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
+
+from .schema import record
 
 GPU_FIELDS = (
     "utilization_pct",
@@ -28,6 +31,7 @@ _SMI_QUERY = (
 )
 _SMI_COLUMNS = ("index", "name", "uuid") + GPU_FIELDS
 _MIB = 1024 * 1024
+_HOST_CPU_PRIMED = threading.local()
 # Why NVML reports a process without its memory: the WDDM driver model on Windows, the same
 # paravirtualized driver inside WSL2, or a container without access to the host's process table.
 _PROCESS_MEMORY_REASON = ("NVML 未提供每进程显存（Windows WDDM 驱动模式下常见）" if os.name == "nt"
@@ -220,35 +224,63 @@ def sample_host(root_pid: int | None = None) -> dict:
 
     row = {"cpu_utilization_pct": psutil.cpu_percent(), "ram_used_bytes": psutil.virtual_memory().used,
            "ram_total_bytes": psutil.virtual_memory().total}
+    if not getattr(_HOST_CPU_PRIMED, "ready", False):
+        row["cpu_utilization_pct"] = None
+        row["missing"] = {"cpu_utilization_pct": "first sample primes the CPU utilization interval"}
+        _HOST_CPU_PRIMED.ready = True
     if root_pid is not None:
         rss = {}
+        unreadable = []
         try:
             root = psutil.Process(root_pid)
             for proc in [root, *root.children(recursive=True)]:
                 try:
                     rss[str(proc.pid)] = proc.memory_info().rss
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    pass
-        except psutil.NoSuchProcess:
-            pass
-        row["process_rss_bytes"] = rss
+                    unreadable.append(str(proc.pid))
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            unreadable.append(str(root_pid))
+        row["process_rss_bytes"] = rss or None
+        if unreadable:
+            row.setdefault("missing", {})["process_rss_bytes"] = "unreadable or exited PIDs: " + ", ".join(unreadable)
     return row
 
 
 def flat_resource_row(sample: dict, host: dict | None = None, gpu_index: int = 0) -> dict:
     """One ``resources.jsonl`` row, field-compatible with ``benchmark.distributed_experiment``."""
-    row = {"monotonic_s": sample["monotonic_s"], "unix_s": sample["unix_s"], "sampler_backend": sample["backend"]}
+    row = record({"monotonic_s": sample["monotonic_s"], "unix_s": sample["unix_s"],
+                  "sampler_backend": sample["backend"], "sampling_status": sample.get("status", "ok")})
     row.update(host or {})
+    missing = dict(row.get("missing") or {})
     gpu = next((g for g in sample["gpus"] if g.get("index") == gpu_index), None)
     if gpu is None:
         row["sampling_error"] = sample.get("error") or f"GPU {gpu_index} 不可用"
-        for key in ("gpu_utilization_pct", "gpu_memory_mib", "gpu_temperature_c", "gpu_power_w"):
+        for key in ("gpu_utilization_pct", "gpu_memory_mib", "gpu_temperature_c", "gpu_power_w", "gpu_power_limit_w"):
             row[key] = None
+            missing[key] = row["sampling_error"]
     else:
         row.update(gpu_utilization_pct=gpu["utilization_pct"], gpu_memory_mib=gpu["memory_used_mib"],
-                   gpu_temperature_c=gpu["temperature_c"], gpu_power_w=gpu["power_w"])
+                   gpu_temperature_c=gpu["temperature_c"], gpu_power_w=gpu["power_w"],
+                   gpu_power_limit_w=gpu["power_limit_w"])
         if gpu["missing"]:
             row["gpu_missing"] = gpu["missing"]
+        for flat, source in (("gpu_utilization_pct", "utilization_pct"), ("gpu_memory_mib", "memory_used_mib"),
+                             ("gpu_temperature_c", "temperature_c"), ("gpu_power_w", "power_w"),
+                             ("gpu_power_limit_w", "power_limit_w")):
+            if row[flat] is None:
+                missing[flat] = gpu["missing"].get(source, "not available")
+    row["gpu_device_memory_mib"] = row["gpu_memory_mib"]
+    if row["gpu_device_memory_mib"] is None:
+        missing["gpu_device_memory_mib"] = missing["gpu_memory_mib"]
+    for key in ("cpu_utilization_pct", "ram_used_bytes", "ram_total_bytes", "process_rss_bytes"):
+        if row.get(key) is None:
+            row[key] = None
+            missing.setdefault(key, "host metric not collected")
+    rss = row["process_rss_bytes"]
+    row["process_rss_total_bytes"] = sum(rss.values()) if rss else None
+    if row["process_rss_total_bytes"] is None:
+        missing["process_rss_total_bytes"] = missing.get("process_rss_bytes", "no readable process RSS")
+    row["missing"] = missing
     row["gpus"] = sample["gpus"]
     return row
 
@@ -260,14 +292,20 @@ class ResourceRecorder:
                  root_pid: int | None = None, history: int = 1200, on_sample: Callable[[dict], None] | None = None):
         self.sampler = sampler
         self.interval_s = float(interval_s)
+        if not math.isfinite(self.interval_s) or self.interval_s <= 0:
+            raise ValueError("interval_s must be finite and positive")
         self.jsonl_path = Path(jsonl_path) if jsonl_path else None
         self.root_pid = root_pid
         self.history_size = int(history)
+        if self.history_size < 1:
+            raise ValueError("history must be positive")
         self.on_sample = on_sample
         self._history: list[dict] = []
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._loop, name="resource-recorder", daemon=True)
+        self.error = None
+        self._device_peak = None
 
     def start(self):
         self._thread.start()
@@ -295,15 +333,31 @@ class ResourceRecorder:
                 handle = self.jsonl_path.open("a", encoding="utf-8", buffering=1)
             while not self._stop.is_set():
                 started = time.perf_counter()
-                row = flat_resource_row(self.sampler.sample(), sample_host(self.root_pid))
+                try:
+                    host = sample_host(self.root_pid)
+                except Exception as exc:
+                    host = {"missing": {key: f"{type(exc).__name__}: {exc}" for key in (
+                        "cpu_utilization_pct", "ram_used_bytes", "ram_total_bytes", "process_rss_bytes")}}
+                row = flat_resource_row(self.sampler.sample(), host)
+                row.update(interval_s=self.interval_s, root_pid=self.root_pid)
+                used = row["gpu_device_memory_mib"]
+                if used is not None:
+                    self._device_peak = max(self._device_peak or 0., used)
+                row["gpu_device_memory_peak_mib"] = self._device_peak
+                if self._device_peak is None:
+                    row["missing"]["gpu_device_memory_peak_mib"] = "no successful device memory samples"
+                if row["missing"] and row["sampling_status"] == "ok":
+                    row["sampling_status"] = "partial"
                 with self._lock:
                     self._history.append(row)
                     del self._history[:-self.history_size]
                 if handle:
-                    handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+                    handle.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
                 if self.on_sample:
                     self.on_sample(row)
                 self._stop.wait(max(0.0, self.interval_s - (time.perf_counter() - started)))
+        except Exception as exc:
+            self.error = f"{type(exc).__name__}: {exc}"
         finally:
             if handle:
                 handle.close()

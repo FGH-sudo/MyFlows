@@ -8,6 +8,7 @@ import time
 import numpy as np
 
 from ..core.device import asnumpy, xp
+from ..monitoring.schema import record
 
 
 def account(client, kind, request_bytes, response_bytes, rpc_s, encode_s=0., decode_s=0., payload=0):
@@ -179,7 +180,7 @@ class Recorder:
             row[key] = value - (traffic_before or {}).get(key, 0)
         row['gradient_payload_bytes'] = sum(v.nbytes for v in computed['device_gradients'].values())
         row['backends'] = computed.get('backends')
-        self.steps_file.write(json.dumps(row) + '\n')
+        self.steps_file.write(json.dumps(record(row, clocks=True)) + '\n')
         self.rows.append(row)
         if self.config.get('numerical_snapshots'):
             save_state(self.session, self.directory / f'step-{step:04d}.npz', gradients=gradients,

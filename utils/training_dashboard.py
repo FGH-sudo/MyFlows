@@ -23,6 +23,7 @@ from MyFlows.utils.observers import (
     update_ratios,
 )
 from MyFlows.utils.tensorboard_logger import TensorBoardLogger
+from MyFlows.monitoring.schema import JsonlCursor, record
 
 
 class TrainingDashboard:
@@ -41,6 +42,7 @@ class TrainingDashboard:
         max_hist_params: int = 24,
         feature_channels: int = 16,
         jsonl_path: str | Path | None = None,
+        resources_path: str | Path | None = None,
     ):
         self.log_dir = Path(log_dir)
         self.jsonl_path = Path(jsonl_path) if jsonl_path else None
@@ -56,6 +58,8 @@ class TrainingDashboard:
         self.log_interval = int(log_interval)
         self.max_hist_params = int(max_hist_params)
         self.feature_channels = int(feature_channels)
+        self._resources = JsonlCursor(resources_path) if resources_path else None
+        self._resource_step = 0
 
     @property
     def active(self) -> bool:
@@ -64,8 +68,22 @@ class TrainingDashboard:
     def _write_jsonl(self, row: dict) -> None:
         if self._jsonl is None:
             return
-        row = {"monotonic_s": time.perf_counter(), "unix_s": time.time(), **row}
-        self._jsonl.write(json.dumps(row, ensure_ascii=False) + "\n")
+        row = record(row, clocks=True)
+        self._jsonl.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
+
+    def log_resources(self) -> None:
+        """Ingest each hardware sample once at its original wall time; never query NVML here."""
+        if not self.active or self._resources is None:
+            return
+        fields = ("gpu_utilization_pct", "gpu_device_memory_mib", "gpu_device_memory_peak_mib",
+                  "gpu_temperature_c", "gpu_power_w", "gpu_power_limit_w", "cpu_utilization_pct",
+                  "ram_used_bytes", "process_rss_total_bytes")
+        for row in self._resources.poll():
+            for key in fields:
+                value = row.get(key)
+                if isinstance(value, (int, float)) and not isinstance(value, bool) and np.isfinite(value):
+                    self.tb.log_scalar(f"resources/{key}", value, self._resource_step, wall_time=row.get("unix_s"))
+            self._resource_step += 1
 
     def log_run_config(self, args, extra: Mapping[str, object] | None = None, step: int = 0) -> None:
         if self.active:
@@ -120,12 +138,15 @@ class TrainingDashboard:
     ) -> None:
         """extra: 额外写进 JSONL step 行的字段（例如分阶段耗时、显存），不写 TensorBoard。"""
         samples_per_sec = float(batch_size) / max(step_time_ms / 1000.0, 1e-12)
+        step_total_ms = float(data_load_ms) + float(step_time_ms)
+        samples_per_sec_total = float(batch_size) / max(step_total_ms / 1000.0, 1e-12)
         self._write_jsonl({
             "kind": "step", "epoch": epoch, "step": int(step), "loss": float(loss),
             "running_loss": None if running_loss is None else float(running_loss),
             "accuracy": None if accuracy is None else float(accuracy),
             "data_load_ms": float(data_load_ms), "train_step_ms": float(train_step_ms),
             "step_time_ms": float(step_time_ms), "batch_size": int(batch_size), "samples_per_sec": samples_per_sec,
+            "step_total_ms": step_total_ms, "samples_per_sec_total": samples_per_sec_total,
             **dict(extra or {}),
         })
         if not self.active:
@@ -141,6 +162,13 @@ class TrainingDashboard:
         self.tb.log_scalar("train/train_step_ms", train_step_ms, step)
         self.tb.log_scalar("train/step_time_ms", step_time_ms, step)
         self.tb.log_scalar("train/samples_per_sec", samples_per_sec, step)
+        self.tb.log_scalar("train/step_total_ms", step_total_ms, step)
+        self.tb.log_scalar("train/samples_per_sec_total", samples_per_sec_total, step)
+        for name in ("forward_ms", "backward_ms", "optimizer_ms", "cupy_pool_used_mib", "cupy_pool_total_mib"):
+            value = (extra or {}).get(name)
+            if value is not None:
+                self.tb.log_scalar(f"{'resources' if name.startswith('cupy') else 'train'}/{name}", value, step)
+        self.log_resources()
         if task == "classification":
             if num_classes is None:
                 raise ValueError("num_classes is required for classification batch stats")
@@ -201,11 +229,13 @@ class TrainingDashboard:
             self.tb.log_text(f"checkpoint/{tag}", text, step)
 
     def flush(self) -> None:
+        self.log_resources()
         self.tb.flush()
         if self._jsonl is not None:
             self._jsonl.flush()
 
     def close(self) -> None:
+        self.log_resources()
         self.tb.close()
         if self._jsonl is not None:
             self._jsonl.close()
