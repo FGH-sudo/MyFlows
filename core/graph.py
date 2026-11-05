@@ -33,6 +33,7 @@ class Graph:
         # self.nodes 是所有节点的集合
         
         self.nodes = self.sorted_nodes
+        self.profiler = None
     
     def _build_topo_sort(self, target_node):
         
@@ -52,14 +53,18 @@ class Graph:
         return order
 
     def forward(self):
-        
         for node in self.sorted_nodes:
             if node.parents:
                 inputs = [p.value for p in node.parents]
-                node.forward(*inputs)
             elif isinstance(node, Variable):
-                # Variable 节点是起点
-                node.forward() 
+                inputs = ()
+            else:
+                continue
+            if self.profiler is None:
+                node.forward(*inputs)
+            else:
+                with self.profiler.node(node, "forward"):
+                    node.forward(*inputs)
 
     def backward(self):
         
@@ -71,4 +76,8 @@ class Graph:
         
         # 使用预先计算好的反向排序列表
         for node in reversed(self.sorted_nodes):
-            node.backward()
+            if self.profiler is None:
+                node.backward()
+            else:
+                with self.profiler.node(node, "backward"):
+                    node.backward()
