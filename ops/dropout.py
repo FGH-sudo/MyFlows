@@ -27,12 +27,14 @@ class Dropout_Op(Node):
 
     def forward(self, x):
         if not self.training or self.p == 0.0:
-            self._mask = xp.ones_like(x)
+            self._mask = xp.ones_like(x) if self.requires_grad else None
             self.value = x
             return
         keep = 1.0 - self.p
         self._mask = (self._random(x.shape) < keep).astype(x.dtype) / keep
         self.value = x * self._mask
+        if not self.requires_grad:
+            self._mask = None
 
     def backward(self):
         x_node = self.parents[0]

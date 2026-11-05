@@ -309,7 +309,7 @@ extern "C" __global__ void conv_grad_rows(
     const int n = blockIdx.z, c0 = blockIdx.y * MF_TILE;
     const float* src = dy + (long long)n * CO * OHW;
     const float* gate = y ? y + (long long)n * CO * OHW : nullptr;
-    float* dst = dyT + (long long)n * OHW * CO;
+    float* dst = dyT ? dyT + (long long)n * OHW * CO : nullptr;
     double acc[MF_TILE / MF_ROWS] = {0.0, 0.0, 0.0, 0.0};
     for (int p0 = blockIdx.x * MF_TILE; p0 < OHW; p0 += gridDim.x * MF_TILE) {
         int k = 0;
@@ -328,7 +328,7 @@ extern "C" __global__ void conv_grad_rows(
         __syncthreads();
         for (int j = threadIdx.y; j < MF_TILE; j += MF_ROWS) {
             const int p = p0 + j, c = c0 + threadIdx.x;
-            if (p < OHW && c < CO) dst[(long long)p * CO + c] = tile[threadIdx.x][j];
+            if (dst && p < OHW && c < CO) dst[(long long)p * CO + c] = tile[threadIdx.x][j];
         }
         __syncthreads();
     }
@@ -1179,7 +1179,11 @@ MF_API int mf_conv_backward(
     MF_TRY(check_conv(d, __LINE__));
     MF_TRY(check_activation(activation, alpha, __LINE__));
     MF_TRY(check_engine(engine, __LINE__));
-    MF_REQUIRE(weight && dy && cols && dyT && dw, "conv backward received a null buffer");
+    const bool direct_dx = dx && !dw && !db;
+    MF_REQUIRE(weight && dy, "conv backward requires weight and dy");
+    MF_REQUIRE(!dw || (cols && dyT), "dW requires cols and transposed dy");
+    MF_REQUIRE(!dx || direct_dx || dyT, "dX requires a gradient matrix");
+    MF_REQUIRE(!direct_dx || activation == ACT_NONE, "dX-only expects the gated NCHW gradient");
     MF_REQUIRE(activation == ACT_NONE || y, "a fused activation needs the forward output");
     MF_REQUIRE((grad_cols == 0) == (dx == 0), "grad_cols and dx must be given together");
     MF_REQUIRE((partial == 0) == (db == 0), "partial and db must be given together");
@@ -1189,7 +1193,7 @@ MF_API int mf_conv_backward(
     CUstream stream = reinterpret_cast<CUstream>(stream_ptr);
     const int M = N * OHW;
     const int K = CI * KH * KW;
-    {
+    if (dw || db) {
         void* args[] = {&dy, &y, &dyT, &partial, &OHW, &CO, &activation, &alpha};
         MF_TRY(launch(K_GRAD_ROWS, static_cast<unsigned>(grid_x), blocks_for(CO, 32), N, 32, 8, stream, args, __LINE__));
     }
@@ -1199,11 +1203,24 @@ MF_API int mf_conv_backward(
         MF_TRY(launch(K_REDUCE, blocks_for(CO, 128), 1, 1, 128, 1, stream, args, __LINE__));
     }
     // dW (CO x K) = dyT^T cols, grad_cols (M x K) = dyT W; both reuse the workspace in stream order.
-    MF_TRY(gemm_rows(engine, stream, true, false, CO, K, M, dyT, CO, cols, K, dw, K, workspace,
-                     workspace_floats, __LINE__));
+    if (dw) {
+        MF_TRY(gemm_rows(engine, stream, true, false, CO, K, M, dyT, CO, cols, K, dw, K, workspace,
+                         workspace_floats, __LINE__));
+    }
     if (!dx) return MF_OK;
-    MF_TRY(gemm_rows(engine, stream, false, false, M, K, CO, dyT, CO, weight, K, grad_cols, K, workspace,
-                     workspace_floats, __LINE__));
+    if (direct_dx) {
+        // Each NCHW image already contains a contiguous CO x OHW matrix. Read it transposed
+        // directly into that image's im2col gradient without materializing an NHWC dy buffer.
+        for (int n = 0; n < N; ++n) {
+            auto image = dy + static_cast<std::uint64_t>(n) * CO * OHW * sizeof(float);
+            auto grad_image = grad_cols + static_cast<std::uint64_t>(n) * OHW * K * sizeof(float);
+            MF_TRY(gemm_rows(engine, stream, true, false, OHW, K, CO, image, OHW, weight, K, grad_image, K,
+                             workspace, workspace_floats, __LINE__));
+        }
+    } else {
+        MF_TRY(gemm_rows(engine, stream, false, false, M, K, CO, dyT, CO, weight, K, grad_cols, K, workspace,
+                         workspace_floats, __LINE__));
+    }
     void* args[] = {&grad_cols, &dx, &N, &CI, &H, &W, &KH, &KW, &OH, &OW, &SH, &SW, &PH, &PW};
     return launch(K_COL2IM, blocks_for(static_cast<std::int64_t>(N) * CI * H * W, 256), 1, 1, 256, 1, stream, args, __LINE__);
 }

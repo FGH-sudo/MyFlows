@@ -19,9 +19,11 @@ class Add(Node):
         a, b = self.parents
         
         # 处理 a 的梯度
-        a.grad += self._handle_broadcast(self.grad, self.a_broadcast_shape, self.a_shape)
+        if a.requires_grad:
+            a.grad += self._handle_broadcast(self.grad, self.a_broadcast_shape, self.a_shape)
         # 处理 b 的梯度
-        b.grad += self._handle_broadcast(self.grad, self.b_broadcast_shape, self.b_shape)
+        if b.requires_grad:
+            b.grad += self._handle_broadcast(self.grad, self.b_broadcast_shape, self.b_shape)
 
     def _handle_broadcast(self, grad, broadcast_shape, original_shape):
         # 将上游梯度沿着被广播的维度求和，再恢复成原始张量形状
@@ -128,9 +130,12 @@ class Linear(Node):
         if grad.ndim == 2:
             if getattr(x, "requires_grad", True):
                 x.grad += self._matmul(grad, w.value, trans_b=True)
-            w.grad += self._matmul(x.value, grad, trans_a=True)
+            if w.requires_grad:
+                w.grad += self._matmul(x.value, grad, trans_a=True)
         else:
             if getattr(x, "requires_grad", True):
                 x.grad += xp.dot(grad, w.value.T)
-            w.grad += xp.tensordot(x.value, grad, axes=(tuple(range(x.value.ndim - 1)),) * 2)
-        b.grad += _reduce_to(grad, b.value.shape)
+            if w.requires_grad:
+                w.grad += xp.tensordot(x.value, grad, axes=(tuple(range(x.value.ndim - 1)),) * 2)
+        if b.requires_grad:
+            b.grad += _reduce_to(grad, b.value.shape)

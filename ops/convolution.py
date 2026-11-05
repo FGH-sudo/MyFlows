@@ -54,13 +54,17 @@ def depthwise_conv2d_forward(x, kernel, stride, padding, dilation):
     return y, x_pad
 
 
-def depthwise_conv2d_backward(x_pad, kernel, grad_y, input_shape, stride, padding, dilation, *, need_input_grad):
+def depthwise_conv2d_backward(x_pad, kernel, grad_y, input_shape, stride, padding, dilation, *, need_input_grad,
+                              need_weight_grad=True):
     """Kernel gradient (FP64 accumulation, like the other reductions) and, optionally, the input gradient."""
     _, taps = _depthwise_windows(input_shape, kernel.shape[2:], stride, padding, dilation)
-    grad_k = xp.zeros(kernel.shape, dtype=kernel.dtype)
-    grad_pad = xp.zeros(x_pad.shape, dtype=grad_y.dtype) if need_input_grad else None
+    grad_k = xp.zeros(kernel.shape, dtype=kernel.dtype) if need_weight_grad else None
+    n, c, h, w = input_shape
+    ph, pw = padding
+    grad_pad = xp.zeros((n, c, h + 2 * ph, w + 2 * pw), dtype=grad_y.dtype) if need_input_grad else None
     for i, j, rows, cols in taps:
-        grad_k[:, 0, i, j] = (x_pad[:, :, rows, cols] * grad_y).sum(axis=(0, 2, 3), dtype=xp.float64)
+        if need_weight_grad:
+            grad_k[:, 0, i, j] = (x_pad[:, :, rows, cols] * grad_y).sum(axis=(0, 2, 3), dtype=xp.float64)
         if need_input_grad:
             grad_pad[:, :, rows, cols] += grad_y * kernel[:, 0, i, j].reshape(1, -1, 1, 1)
     if grad_pad is None:
@@ -68,11 +72,6 @@ def depthwise_conv2d_backward(x_pad, kernel, grad_y, input_shape, stride, paddin
     ph, pw = padding
     h, w = input_shape[2:]
     return grad_k, grad_pad[:, :, ph:ph + h, pw:pw + w]
-
-
-def _needs_grad(node):
-    # 输入图像、标签等 requires_grad=False 的叶子变量不需要梯度，可以跳过 dX 的 GEMM 与 col2im
-    return getattr(node, "requires_grad", True)
 
 
 def _normalize_pair(value, name, allow_zero=False):
@@ -333,12 +332,13 @@ class Conv2D_Op(Node):
             from .cuda_native.native import conv2d_forward
             activation = self._fused_activation()
             # 输出直接是连续的 NCHW；bias 与激活在同一个尾处理 kernel 中完成
-            self.value, self._cuda_im2col_cols = conv2d_forward(
+            self.value, cols = conv2d_forward(
                 x_val, kernel_val, bias_val, stride=self.stride, padding=self.padding,
                 activation=activation, alpha=self._activation_alpha(),
                 engine=NATIVE_BACKENDS[self.actual_backend])
             self._activation_fused = activation is not None
-            self._cuda_inputs = (x_val, kernel_val)
+            self._cuda_im2col_cols = cols if self.parents[1].requires_grad else None
+            self._cuda_inputs = (x_val, kernel_val) if self.requires_grad else None
             return
         # x_val: (N, C_in, H, W), kernel_val: (C_out, C_in, kH, kW)
         N, C_in, H, W = x_val.shape
@@ -355,6 +355,8 @@ class Conv2D_Op(Node):
         if self._depthwise:
             self.value, self._depthwise_input = depthwise_conv2d_forward(
                 x_val, kernel_val, self.stride, self.padding, self.dilation)
+            if not self.parents[1].requires_grad:
+                self._depthwise_input = None
             if self.bias is not None:
                 self.value = self.value + bias_val.reshape(1, C_out, 1, 1)
             return
@@ -385,8 +387,10 @@ class Conv2D_Op(Node):
             group_out = cols @ group_kernel_cols.T
             out_H, out_W = context["output_size"]
 
-            self.cols.append(cols)
-            self.kernel_cols.append(group_kernel_cols)
+            if self.parents[1].requires_grad:
+                self.cols.append(cols)
+            if self.parents[0].requires_grad:
+                self.kernel_cols.append(group_kernel_cols)
             outputs.append(
                 group_out.reshape(N, out_H, out_W, out_channels_per_group).transpose(0, 3, 1, 2)
             )
@@ -399,12 +403,16 @@ class Conv2D_Op(Node):
         if not hasattr(self, "actual_backend"):
             raise RuntimeError("forward must run before backward")
         _resolve_backend(self.actual_backend, self.grad, *(p.value for p in self.parents))
+        x_node, kernel_node = self.parents[:2]
+        need_x, need_w = x_node.requires_grad, kernel_node.requires_grad
+        need_b = self.bias is not None and self.bias.requires_grad
+        if not (need_x or need_w or need_b):
+            return
         if self.actual_backend in NATIVE_BACKENDS:
             from .cuda_native.native import conv2d_backward
             grads = conv2d_backward(*self._cuda_inputs, self.grad, self._cuda_im2col_cols,
                                     stride=self.stride, padding=self.padding,
-                                    need_bias_grad=self.bias is not None,
-                                    need_input_grad=_needs_grad(self.parents[0]),
+                                    need_bias_grad=need_b, need_weight_grad=need_w, need_input_grad=need_x,
                                     activation=self._fused_activation() if self._activation_fused else None,
                                     alpha=self._activation_alpha(), output=self.value,
                                     engine=NATIVE_BACKENDS[self.actual_backend])
@@ -415,31 +423,26 @@ class Conv2D_Op(Node):
                     parent.clear_grad()
                 parent.grad += grad
             return
-        if self.bias is None:
-            x_node, kernel_node = self.parents
-        else:
-            x_node, kernel_node, bias_node = self.parents
-        if x_node.grad is None:
-            x_node.clear_grad()
-        if kernel_node.grad is None:
-            kernel_node.clear_grad()
-        if self.bias is not None and bias_node.grad is None:
-            bias_node.clear_grad()
+        for node in self.parents:
+            if node.requires_grad and node.grad is None:
+                node.clear_grad()
+        if need_b:
+            self.bias.grad += xp.sum(self.grad, axis=(0, 2, 3), dtype=xp.float64).astype(self.bias.grad.dtype)
+        if not (need_x or need_w):
+            return
 
         batch_size, in_channels, input_h, input_w = x_node.value.shape
         out_channels = kernel_node.value.shape[0]
         out_channels_per_group = out_channels // self.groups
-        needs_input_grad = _needs_grad(x_node)
 
         if getattr(self, "_depthwise", False):
             grad_k, grad_x = depthwise_conv2d_backward(
                 self._depthwise_input, kernel_node.value, self.grad, x_node.value.shape, self.stride, self.padding,
-                self.dilation, need_input_grad=needs_input_grad)
-            kernel_node.grad += grad_k
+                self.dilation, need_input_grad=need_x, need_weight_grad=need_w)
+            if need_w:
+                kernel_node.grad += grad_k
             if grad_x is not None:
                 x_node.grad += grad_x
-            if self.bias is not None:
-                bias_node.grad += xp.sum(self.grad, axis=(0, 2, 3), dtype=xp.float64).astype(bias_node.grad.dtype)
             return
 
         for group_index in range(self.groups):
@@ -447,10 +450,11 @@ class Conv2D_Op(Node):
             out_start, out_end = _group_bounds(out_channels, self.groups, group_index)
 
             grad_y = self.grad[:, out_start:out_end].transpose(0, 2, 3, 1).reshape(-1, out_channels_per_group)
-            kernel_node.grad[out_start:out_end] += (
-                grad_y.T @ self.cols[group_index]
-            ).reshape(kernel_node.value[out_start:out_end].shape)
-            if not needs_input_grad:
+            if need_w:
+                kernel_node.grad[out_start:out_end] += (
+                    grad_y.T @ self.cols[group_index]
+                ).reshape(kernel_node.value[out_start:out_end].shape)
+            if not need_x:
                 continue
 
             grad_cols = grad_y @ self.kernel_cols[group_index]
@@ -466,10 +470,6 @@ class Conv2D_Op(Node):
             self._im2col_contexts[group_index] = context
             x_node.grad[:, in_start:in_end] += grad_x
 
-        if self.bias is not None:
-            # FP64 累加后舍入一次，与原生后端的 bias 梯度一致
-            bias_node.grad += xp.sum(self.grad, axis=(0, 2, 3), dtype=xp.float64).astype(bias_node.grad.dtype)
-
 
 class Conv2D_ReLU_Op(Conv2D_Op):
     """融合算子：Conv2D(+bias) 后接 ReLU。原生后端在卷积尾处理 kernel 内完成 ReLU，
@@ -483,7 +483,7 @@ class Conv2D_ReLU_Op(Conv2D_Op):
         if self._activation_fused:
             return
         # 使用 pre-activation 的符号生成 mask，避免数值差异
-        self._relu_mask = self.value > 0
+        self._relu_mask = self.value > 0 if self.requires_grad else None
         self.value = xp.maximum(0, self.value)
 
     def backward(self):
@@ -511,8 +511,9 @@ class Conv2D_LeakyReLU_Op(Conv2D_Op):
         super().forward(x_val, kernel_val, bias_val=bias_val)
         if self._activation_fused:
             return
-        self._leaky_mask = self.value > 0
-        self.value = xp.where(self._leaky_mask, self.value, self.alpha * self.value)
+        mask = self.value > 0
+        self.value = xp.where(mask, self.value, self.alpha * self.value)
+        self._leaky_mask = mask if self.requires_grad else None
 
     def backward(self):
         if not self._activation_fused:
@@ -608,12 +609,13 @@ def _conv_transpose2d_backward_group(
             oo_h = oh[ih_valid, iw_valid]
             oo_w = ow[ih_valid, iw_valid]
 
-            xv = x_group[:, :, ih_valid, iw_valid]
             gv = grad_group[:, :, oo_h, oo_w]
-
-            ks = kernel_group[:, :, kr, kc]
-            grad_x_group[:, :, ih_valid, iw_valid] += xp.einsum("cg,ngv->ncv", ks, gv)
-            grad_kernel_group[:, :, kr, kc] += xp.einsum("ncv,ngv->cg", xv, gv)
+            if grad_x_group is not None:
+                ks = kernel_group[:, :, kr, kc]
+                grad_x_group[:, :, ih_valid, iw_valid] += xp.einsum("cg,ngv->ncv", ks, gv)
+            if grad_kernel_group is not None:
+                xv = x_group[:, :, ih_valid, iw_valid]
+                grad_kernel_group[:, :, kr, kc] += xp.einsum("ncv,ngv->cg", xv, gv)
 
 
 class ConvTranspose2D_Op(Node):
@@ -695,15 +697,16 @@ class ConvTranspose2D_Op(Node):
             x_node, kernel_node = self.parents
         else:
             x_node, kernel_node, bias_node = self.parents
-        if x_node.grad is None:
-            x_node.clear_grad()
-        if kernel_node.grad is None:
-            kernel_node.clear_grad()
-        if self.bias is not None and bias_node.grad is None:
-            bias_node.clear_grad()
+        for node in self.parents:
+            if node.requires_grad and node.grad is None:
+                node.clear_grad()
 
         batch_size, in_channels, input_h, input_w = x_node.value.shape
         _, out_channels_per_group, kernel_h, kernel_w = kernel_node.value.shape
+        if self.bias is not None and self.bias.requires_grad:
+            bias_node.grad += xp.sum(self.grad, axis=(0, 2, 3), dtype=xp.float64).astype(bias_node.grad.dtype)
+        if not (x_node.requires_grad or kernel_node.requires_grad):
+            return
 
         for group_index in range(self.groups):
             in_start, in_end = _group_bounds(in_channels, self.groups, group_index)
@@ -712,8 +715,8 @@ class ConvTranspose2D_Op(Node):
 
             x_group = x_node.value[:, in_start:in_end]
             grad_group = self.grad[:, out_start:out_end]
-            grad_x_group = x_node.grad[:, in_start:in_end]
-            grad_kernel_group = kernel_node.grad[in_start:in_end]
+            grad_x_group = x_node.grad[:, in_start:in_end] if x_node.requires_grad else None
+            grad_kernel_group = kernel_node.grad[in_start:in_end] if kernel_node.requires_grad else None
             kernel_group = kernel_node.value[in_start:in_end]
 
             _conv_transpose2d_backward_group(
@@ -727,17 +730,12 @@ class ConvTranspose2D_Op(Node):
                 self.dilation,
             )
 
-        if self.bias is not None:
-            # FP64 累加后舍入一次，与原生后端的 bias 梯度一致
-            bias_node.grad += xp.sum(self.grad, axis=(0, 2, 3), dtype=xp.float64).astype(bias_node.grad.dtype)
-
-
 class ConvTranspose2D_ReLU_Op(ConvTranspose2D_Op):
     """融合算子：ConvTranspose2D(+bias) 后接 ReLU。"""
 
     def forward(self, x_val, kernel_val, bias_val=None):
         super().forward(x_val, kernel_val, bias_val=bias_val)
-        self._relu_mask = self.value > 0
+        self._relu_mask = self.value > 0 if self.requires_grad else None
         self.value = xp.maximum(0, self.value)
 
     def backward(self):
@@ -754,8 +752,9 @@ class ConvTranspose2D_LeakyReLU_Op(ConvTranspose2D_Op):
 
     def forward(self, x_val, kernel_val, bias_val=None):
         super().forward(x_val, kernel_val, bias_val=bias_val)
-        self._leaky_mask = self.value > 0
-        self.value = xp.where(self._leaky_mask, self.value, self.alpha * self.value)
+        mask = self.value > 0
+        self.value = xp.where(mask, self.value, self.alpha * self.value)
+        self._leaky_mask = mask if self.requires_grad else None
 
     def backward(self):
         # where 保持梯度 dtype；旧写法乘以 where(mask, 1.0, alpha) 会生成 float64 掩码
@@ -784,6 +783,8 @@ class MaxPool2d_Op(Node):
             from .cuda_native.native import maxpool2d_forward
             self.value, self._native_context = maxpool2d_forward(
                 x_val, kernel_size=self.kernel_size, stride=self.stride)
+            if not self.requires_grad:
+                self._native_context = None
             return
         N, C, H, W = x_val.shape
         k_h, k_w = self.kernel_size
@@ -799,8 +800,10 @@ class MaxPool2d_Op(Node):
         patches = cols
         patches = patches.reshape(N, out_H * out_W, C, k_h * k_w).transpose(0, 2, 1, 3)
         max_vals = xp.max(patches, axis=-1)
-        eq = patches == max_vals[..., None]
-        self.max_mask = eq & (eq.cumsum(axis=-1) == 1)
+        self.max_mask = None
+        if self.requires_grad:
+            eq = patches == max_vals[..., None]
+            self.max_mask = eq & (eq.cumsum(axis=-1) == 1)
         self.value = max_vals.reshape(N, C, out_H, out_W)
 
     def backward(self):

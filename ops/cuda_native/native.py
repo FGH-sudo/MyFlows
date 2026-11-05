@@ -321,21 +321,20 @@ def conv2d_forward(x, weight, bias=None, *, stride=(1, 1), padding=(0, 0), activ
 
 
 def conv2d_backward(x, weight, grad_y, cols, *, stride=(1, 1), padding=(0, 0), need_bias_grad=True,
-                    need_input_grad=True, activation=None, alpha=0.0, output=None, engine="register"):
-    """Return (dx, dw, db). dx is None when ``need_input_grad`` is false, db when ``need_bias_grad``
-    is false. A fused ``activation`` is differentiated through the forward ``output``. ``engine``
-    runs the dW and dX GEMMs (see ``GEMM_ENGINES``)."""
+                    need_input_grad=True, need_weight_grad=True, activation=None, alpha=0.0, output=None,
+                    engine="register"):
+    """Return (dx, dw, db) with None for each unrequested gradient. Only dW needs forward cols."""
     cp = _lazy_cupy()
     engine = _engine(engine)
-    x, weight, grad_y, cols = (_array(x, "x"), _array(weight, "weight"),
-                               _array(grad_y, "grad_y"), _array(cols, "cols"))
+    x, weight, grad_y = _array(x, "x"), _array(weight, "weight"), _array(grad_y, "grad_y")
+    cols = _array(cols, "cols") if need_weight_grad else None
     dims = _dims(x, weight, stride, padding)
     act, alpha = _activation(activation, alpha)
     n, ci, h, w, co, kh, kw, oh, ow, sh, sw, ph, pw = dims
     if grad_y.shape != (n, co, oh, ow):
         raise ValueError("grad_y shape does not match convolution output")
     m, k = n * oh * ow, ci * kh * kw
-    if cols.shape != (m, k):
+    if cols is not None and cols.shape != (m, k):
         raise ValueError("cols shape does not match convolution input")
     gate = None
     if act:
@@ -344,16 +343,26 @@ def conv2d_backward(x, weight, grad_y, cols, *, stride=(1, 1), padding=(0, 0), n
         gate = _array(output, "output")
         if gate.shape != grad_y.shape:
             raise ValueError("output shape does not match grad_y")
+    if not (need_input_grad or need_weight_grad or need_bias_grad):
+        return None, None, None
+    direct_dx = need_input_grad and not (need_weight_grad or need_bias_grad)
+    if direct_dx and act:
+        inactive = cp.float32(alpha.value) * grad_y if activation == "leaky_relu" else cp.float32(0)
+        grad_y = cp.where(gate > 0, grad_y, inactive)
+        act, gate = 0, None
     blocks = _spatial_blocks(n, oh * ow, co, x.device.id)
-    dy_rows = cp.empty((m, co), dtype=cp.float32)
-    dw = cp.empty_like(weight)
+    dy_rows = cp.empty((m, co), dtype=cp.float32) if need_weight_grad or (need_input_grad and need_bias_grad) else None
+    dw = cp.empty_like(weight) if need_weight_grad else None
     grad_cols = cp.empty((m, k), dtype=cp.float32) if need_input_grad else None
     dx = cp.empty_like(x) if need_input_grad else None
     partial = cp.empty((n * blocks * co,), dtype=cp.float64) if need_bias_grad else None
     db = cp.empty((co,), dtype=cp.float32) if need_bias_grad else None
     pointer = lambda array: _u64(array.data.ptr if array is not None else 0)
     lib = _library()
-    workspace, floats = _workspace(lib, engine, (co, k, m), *([(m, k, co)] if need_input_grad else []))
+    gemms = [(co, k, m)] if need_weight_grad else []
+    if need_input_grad:
+        gemms.append((oh * ow if direct_dx else m, k, co))
+    workspace, floats = _workspace(lib, engine, *gemms)
     _check(lib.mf_conv_backward(
         pointer(weight), pointer(grad_y), pointer(gate), pointer(cols), pointer(dy_rows), pointer(dw),
         pointer(grad_cols), pointer(dx), pointer(partial), pointer(db),

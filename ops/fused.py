@@ -74,7 +74,7 @@ _BN_SOURCE = r"""
 // block reduction is a fixed tree, so results are reproducible.
 template <int MODE>
 __device__ void bn_partials(const float* x, const float* dy, const float* mean, double* partial,
-                            int N, int C, int HW, int chunk) {
+                            int N, int C, int HW, int chunk, int sum_dy=1, int sum_centered=1) {
     __shared__ double sa[256];
     __shared__ double sb[256];
     const int c = blockIdx.x, s = blockIdx.y, slices = gridDim.y;
@@ -87,7 +87,7 @@ __device__ void bn_partials(const float* x, const float* dy, const float* mean, 
         const long long at = ((long long)n * C + c) * HW + hw;
         const double d = (double)x[at] - center;
         if (MODE == 0) { a += d; b = fma(d, d, b); }
-        else { const double g = (double)dy[at]; a += g; b = fma(g, d, b); }
+        else { const double g = (double)dy[at]; if (sum_dy) a += g; if (sum_centered) b = fma(g, d, b); }
     }
     sa[threadIdx.x] = a;
     sb[threadIdx.x] = b;
@@ -110,8 +110,8 @@ extern "C" __global__ void mf_bn_stats_partials(const float* x, double* partial,
 }
 
 extern "C" __global__ void mf_bn_grad_partials(const float* x, const float* dy, const float* mean, double* partial,
-                                               int N, int C, int HW, int chunk) {
-    bn_partials<1>(x, dy, mean, partial, N, C, HW, chunk);
+                                               int N, int C, int HW, int chunk, int sum_dy, int sum_centered) {
+    bn_partials<1>(x, dy, mean, partial, N, C, HW, chunk, sum_dy, sum_centered);
 }
 
 // Per channel: batch mean / biased variance, inverse std and the running-stat update. The mean is
@@ -155,11 +155,13 @@ extern "C" __global__ void mf_bn_grad_finalize(const double* partial, const floa
     }
     const double istd = (double)inv_std[c];
     const double dgamma = istd * sdyx;
-    gamma_grad[c] += (float)dgamma;
-    beta_grad[c] += (float)sdy;
-    coef[c] = (float)((double)gamma[c] * istd);
-    coef[C + c] = training ? (float)(sdy / count) : 0.f;
-    coef[2 * C + c] = training ? (float)(istd * dgamma / count) : 0.f;
+    if (gamma_grad) gamma_grad[c] += (float)dgamma;
+    if (beta_grad) beta_grad[c] += (float)sdy;
+    if (coef) {
+        coef[c] = (float)((double)gamma[c] * istd);
+        coef[C + c] = training ? (float)(sdy / count) : 0.f;
+        coef[2 * C + c] = training ? (float)(istd * dgamma / count) : 0.f;
+    }
 }
 """
 
@@ -181,6 +183,13 @@ def _bn_dx_kernel():
     return _lazy_cupy().ElementwiseKernel(
         "float32 x, float32 dy, float32 hi, float32 lo, float32 a, float32 k1, float32 k2", "float32 dx",
         "dx += a * (dy - k1 - ((x - hi) - lo) * k2)", "mf_bn_dx_acc_hilo")
+
+
+@cache
+def _bn_eval_dx_kernel():
+    return _lazy_cupy().ElementwiseKernel(
+        "float32 dy, float32 gamma, float32 inv_std", "float32 dx",
+        "dx += (float)((double)gamma * (double)inv_std) * dy", "mf_bn_eval_dx_only")
 
 
 @cache
@@ -254,35 +263,53 @@ def batchnorm2d_forward(x, gamma, beta, running_mean, running_var, *, momentum, 
 
 
 def batchnorm2d_backward(x, dy, gamma, mean, inv_std, *, training, x_grad, gamma_grad, beta_grad):
-    """Accumulate the BatchNorm2d gradients into ``x_grad``, ``gamma_grad`` and ``beta_grad``."""
+    """Accumulate requested gradients. Training-mode dX itself needs the two channel sums."""
+    outputs = [g for g in (x_grad, gamma_grad, beta_grad) if g is not None]
+    if not outputs:
+        return
+    sum_dy = beta_grad is not None or (training and x_grad is not None)
+    sum_centered = gamma_grad is not None or (training and x_grad is not None)
     n, c, h, w = x.shape
     hw = h * w
     count = n * hw
-    if (_on_gpu(x, dy, gamma, mean, inv_std, x_grad, gamma_grad, beta_grad)
-            and _same_float32(x, dy, gamma, mean, inv_std, x_grad, gamma_grad, beta_grad)):
+    arrays = [x, dy, gamma, mean, inv_std, *outputs]
+    if _on_gpu(*arrays) and _same_float32(*arrays):
         cp = _lazy_cupy()
+        if not (sum_dy or sum_centered):
+            _bn_eval_dx_kernel()(dy, _channel(gamma), _channel(inv_std), x_grad)
+            return
         x, dy = cp.ascontiguousarray(x), cp.ascontiguousarray(dy)
         slices, chunk = _bn_grid(n, c, hw)
         partial = cp.empty((c * slices * 2,), dtype=cp.float64)
-        coef = cp.empty((3 * c,), dtype=cp.float32)
+        coef = cp.empty((3 * c,), dtype=cp.float32) if x_grad is not None else None
         module = _bn_module()
         module.get_function("mf_bn_grad_partials")((c, slices), (256,), (
-            x, dy, cp.ascontiguousarray(mean), partial, np.int32(n), np.int32(c), np.int32(hw), np.int32(chunk)))
+            x, dy, cp.ascontiguousarray(mean), partial, np.int32(n), np.int32(c), np.int32(hw), np.int32(chunk),
+            np.int32(sum_dy), np.int32(sum_centered)))
+        pointer = lambda array: array if array is not None else np.uintp(0)
         module.get_function("mf_bn_grad_finalize")((-(-c // 128),), (128,), (
-            partial, gamma, inv_std, gamma_grad, beta_grad, coef, np.int32(c), np.int32(slices),
+            partial, gamma, inv_std, pointer(gamma_grad), pointer(beta_grad), pointer(coef), np.int32(c), np.int32(slices),
             np.float64(count), np.int32(1 if training else 0)))
-        a, k1, k2 = (_channel(part) for part in coef.reshape(3, c))
-        _bn_dx_kernel()(x, dy, _channel(mean[0]), _channel(mean[1]), a, k1, k2, x_grad)
+        if x_grad is not None:
+            a, k1, k2 = (_channel(part) for part in coef.reshape(3, c))
+            _bn_dx_kernel()(x, dy, _channel(mean[0]), _channel(mean[1]), a, k1, k2, x_grad)
         return
 
     axes = (0, 2, 3)
-    centered = x.astype(np.float64) - _channel(mean[0].astype(np.float64) + mean[1].astype(np.float64))
-    dy64 = dy.astype(np.float64)
-    sdy = dy64.sum(axis=axes)
     istd = inv_std.astype(np.float64)
-    dgamma = istd * (dy64 * centered).sum(axis=axes)
-    gamma_grad += dgamma.astype(gamma_grad.dtype)
-    beta_grad += sdy.astype(beta_grad.dtype)
+    if sum_dy or sum_centered:
+        dy64 = dy.astype(np.float64)
+    if sum_dy:
+        sdy = dy64.sum(axis=axes)
+        if beta_grad is not None:
+            beta_grad += sdy.astype(beta_grad.dtype)
+    if sum_centered:
+        centered = x.astype(np.float64) - _channel(mean[0].astype(np.float64) + mean[1].astype(np.float64))
+        dgamma = istd * (dy64 * centered).sum(axis=axes)
+        if gamma_grad is not None:
+            gamma_grad += dgamma.astype(gamma_grad.dtype)
+    if x_grad is None:
+        return
     a = _channel((gamma.astype(np.float64) * istd).astype(x.dtype))
     if training:
         k1 = _channel((sdy / count).astype(x.dtype))

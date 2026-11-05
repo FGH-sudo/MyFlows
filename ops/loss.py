@@ -26,6 +26,8 @@ class PerceptionLoss(Node):
 
     def backward(self):
         # 损失对 y_pred 的梯度
+        if not self.y_pred.requires_grad:
+            return
         grad_signal = xp.where(self.y_true_val * self.y_pred_val < 0, -self.y_true_val, 0)
         n = max(int(self.y_true_val.size), 1)
         if self.y_pred.grad is None:
@@ -51,6 +53,8 @@ class LogLoss(Node):
 
     def backward(self):
         # 前向对全部元素求均值，因此按元素总数归一化（多列标签时与 len() 不同）
+        if not self.y_pred.requires_grad:
+            return
         N = self.x.size
         
         # 梯度公式说明: grad = -y_true / (1 + e^x)
@@ -83,6 +87,8 @@ class CrossEntropy(Node):
 
     def backward(self):
         # 计算 Loss 对 Logits 的梯度：(P - Y) / N；self.grad 由 Graph.backward 传来，为 1.0
+        if not self.logits.requires_grad:
+            return
         final_grad = softmax_cross_entropy_grad(self.probs, self._labels, self._targets)
         if self.logits.grad is None:
             self.logits.clear_grad()
@@ -104,6 +110,8 @@ class MSELoss(Node):
 
     def backward(self):
         y_pred, y_true = self.parents
+        if not y_pred.requires_grad:
+            return
         n = max(y_pred.value.size, 1)
         g = 2.0 * (y_pred.value - y_true.value) / n
         y_pred.grad += self.grad * g

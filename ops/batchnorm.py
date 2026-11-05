@@ -48,19 +48,19 @@ class BatchNorm2d_Op(Node):
             x_val, gamma_val, beta_val, self.running_mean, self.running_var,
             momentum=self.momentum, eps=self.eps, training=self.training,
             unbiased_running_var=self.unbiased_running_var)
+        if not self.requires_grad:
+            self._mean = self._inv_std = None
 
     def backward(self):
         x_node, gamma_node, beta_node = self.parents
-        if x_node.grad is None:
-            x_node.clear_grad()
-        if gamma_node.grad is None:
-            gamma_node.clear_grad()
-        if beta_node.grad is None:
-            beta_node.clear_grad()
+        for node in self.parents:
+            if node.requires_grad and node.grad is None:
+                node.clear_grad()
         batchnorm2d_backward(
             x_node.value, self.grad, gamma_node.value, self._mean, self._inv_std,
-            training=self._training_used, x_grad=x_node.grad,
-            gamma_grad=gamma_node.grad, beta_grad=beta_node.grad)
+            training=self._training_used, x_grad=x_node.grad if x_node.requires_grad else None,
+            gamma_grad=gamma_node.grad if gamma_node.requires_grad else None,
+            beta_grad=beta_node.grad if beta_node.requires_grad else None)
 
 
 class GlobalAvgPool2d_Op(Node):

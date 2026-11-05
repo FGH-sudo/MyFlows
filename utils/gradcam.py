@@ -89,6 +89,7 @@ def compute_gradcam(
 ) -> tuple[np.ndarray, float]:
     target = TargetScore(logits, target_index=target_index, sample_index=sample_index)
     graph = Graph(target)
+    graph.retain_grad(feature_node)
     graph.forward()
     score = float(asnumpy(target.value))
     graph.backward()
