@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import json
-import time
 from pathlib import Path
 from typing import Mapping
 
@@ -136,7 +135,7 @@ class TrainingDashboard:
         epoch: int | None = None,
         extra: Mapping[str, object] | None = None,
     ) -> None:
-        """extra: 额外写进 JSONL step 行的字段（例如分阶段耗时、显存），不写 TensorBoard。"""
+        """Record each completed step. Device timings use their own sampling cadence."""
         samples_per_sec = float(batch_size) / max(step_time_ms / 1000.0, 1e-12)
         step_total_ms = float(data_load_ms) + float(step_time_ms)
         samples_per_sec_total = float(batch_size) / max(step_total_ms / 1000.0, 1e-12)
@@ -151,6 +150,13 @@ class TrainingDashboard:
         })
         if not self.active:
             return
+        if self.log_interval > 0 or force:
+            # Phase timing is scheduled on the zero-based optimizer step, while the displayed
+            # step starts at one. Requiring both intervals to coincide loses all default samples.
+            for name in ("forward_ms", "backward_ms", "optimizer_ms"):
+                value = (extra or {}).get(name)
+                if value is not None:
+                    self.tb.log_scalar(f"train/{name}", value, step)
         if not force and (self.log_interval <= 0 or step % self.log_interval != 0):
             return
         self.tb.log_scalar("train/loss_step", loss, step)
@@ -164,10 +170,10 @@ class TrainingDashboard:
         self.tb.log_scalar("train/samples_per_sec", samples_per_sec, step)
         self.tb.log_scalar("train/step_total_ms", step_total_ms, step)
         self.tb.log_scalar("train/samples_per_sec_total", samples_per_sec_total, step)
-        for name in ("forward_ms", "backward_ms", "optimizer_ms", "cupy_pool_used_mib", "cupy_pool_total_mib"):
+        for name in ("cupy_pool_used_mib", "cupy_pool_total_mib"):
             value = (extra or {}).get(name)
             if value is not None:
-                self.tb.log_scalar(f"{'resources' if name.startswith('cupy') else 'train'}/{name}", value, step)
+                self.tb.log_scalar(f"resources/{name}", value, step)
         self.log_resources()
         if task == "classification":
             if num_classes is None:

@@ -120,6 +120,18 @@ class MonitoringRecordsTest(unittest.TestCase):
             self.assertEqual(dashboard.tb.log_scalar.call_count, count)
             dashboard.close()
 
+    def test_phase_events_survive_noncoincident_logging_intervals(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dashboard = TrainingDashboard(Path(tmp), enabled=False, log_interval=10)
+            dashboard.tb = mock.Mock(active=True)
+            dashboard.log_train_step(21, loss=1., data_load_ms=1., train_step_ms=3., step_time_ms=4.,
+                                     batch_size=2, labels=None, task="regression",
+                                     extra={"forward_ms": 1.5, "backward_ms": 1.5, "optimizer_ms": .2})
+            calls = dashboard.tb.log_scalar.call_args_list
+            self.assertIn(mock.call("train/backward_ms", 1.5, 21), calls)
+            self.assertNotIn(mock.call("train/loss_step", 1., 21), calls)
+            dashboard.close()
+
 
 if __name__ == "__main__":
     unittest.main()
