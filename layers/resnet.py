@@ -277,7 +277,7 @@ class ResNet18(Layer):
                                      compat=self.compat))
         return blocks
 
-    def forward(self, input_node):
+    def spatial_features(self, input_node):
         self._last_feature_nodes = {}
         if self.input_norm == "imagenet":
             from ..ops.pooling import ChannelNormalize_Op
@@ -305,12 +305,25 @@ class ResNet18(Layer):
         for block in self.layer4:
             x = block(x)
         self._last_feature_nodes["layer4"] = x
+        return x
 
+    def forward_features(self, input_node):
+        x = self.spatial_features(input_node)
+        if hasattr(self, "transfer_adapter"):
+            return self.transfer_adapter(x)
         x = self.avgpool(x)
         if self.dropout is not None:
             x = self.dropout(x)
-        x = Linear(x, self.fc_W, self.fc_b)
         return x
+
+    def forward_head(self, features):
+        if hasattr(self, "transfer_head"):
+            return self.transfer_head(features)
+        return Linear(features, self.fc_W, self.fc_b)
+
+    def forward(self, input_node):
+        self._last_transfer_features = self.forward_features(input_node)
+        return self.forward_head(self._last_transfer_features)
 
     def train(self, mode=True):
         for layer in self.sub_layers:

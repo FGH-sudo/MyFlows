@@ -141,16 +141,31 @@ class MobileNetV2(Layer):
         if self.dropout is not None:
             self.sub_layers.append(self.dropout)
 
-    def forward(self, x):
+    def spatial_features(self, x):
         if self.input_norm == "imagenet":
             x = ChannelNormalize_Op(x)
         x = self.stem(x)
         for block in self.blocks:
             x = block(x)
-        x = GlobalAvgPool2d_Op(self.last_conv(x))
+        return self.last_conv(x)
+
+    def forward_features(self, x):
+        x = self.spatial_features(x)
+        if hasattr(self, "transfer_adapter"):
+            return self.transfer_adapter(x)
+        x = GlobalAvgPool2d_Op(x)
         if self.dropout is not None:
             x = self.dropout(x)
-        return Linear(x, self.fc_W, self.fc_b)
+        return x
+
+    def forward_head(self, features):
+        if hasattr(self, "transfer_head"):
+            return self.transfer_head(features)
+        return Linear(features, self.fc_W, self.fc_b)
+
+    def forward(self, x):
+        self._last_transfer_features = self.forward_features(x)
+        return self.forward_head(self._last_transfer_features)
 
     def train(self, mode=True):
         for layer in self.sub_layers:
@@ -209,7 +224,7 @@ class AlexNet(Layer):
         self.params = [p for conv in self.convs for p in conv.params]
         self.params += [self.fc6_W, self.fc6_b, self.fc7_W, self.fc7_b, self.fc_W, self.fc_b]
 
-    def forward(self, x):
+    def forward_features(self, x):
         if self.input_norm == "imagenet":
             x = ChannelNormalize_Op(x)
         for conv, (_, _, _, _, pool) in zip(self.convs, self.CONVS):
@@ -223,7 +238,16 @@ class AlexNet(Layer):
         if self.dropouts:
             x = self.dropouts[1](x)
         x = ReLU(Linear(x, self.fc7_W, self.fc7_b))
-        return Linear(x, self.fc_W, self.fc_b)
+        return self.transfer_adapter(x) if hasattr(self, "transfer_adapter") else x
+
+    def forward_head(self, features):
+        if hasattr(self, "transfer_head"):
+            return self.transfer_head(features)
+        return Linear(features, self.fc_W, self.fc_b)
+
+    def forward(self, x):
+        self._last_transfer_features = self.forward_features(x)
+        return self.forward_head(self._last_transfer_features)
 
     def train(self, mode=True):
         for layer in self.dropouts:
