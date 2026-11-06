@@ -178,6 +178,9 @@ def _collect_optimizer_arrays(optimizer, param_key_by_id):
         "class": optimizer.__class__.__name__,
         "scalars": scalars,
         "states": state_meta,
+        "param_groups": optimizer.groups.serialize(param_key_by_id, optimizer.learning_rate) if hasattr(optimizer, "groups") else [],
+        "parameter_steps": {param_key_by_id[id(node)]: int(step) for node, step in getattr(optimizer, "parameter_steps", {}).items()
+                            if id(node) in param_key_by_id},
     }
 
 
@@ -292,6 +295,16 @@ def load_checkpoint(layers, optimizer=None, filepath="checkpoint"):
     if len(saved_buffers) != len(live_buffers):
         raise ValueError(f"buffer 数量不匹配: checkpoint={len(saved_buffers)}, model={len(live_buffers)}")
 
+    if optimizer is not None:
+        from ..train.param_groups import ParameterGroups
+
+        mapping = {saved["key"]: _param_by_live_record(layers, live) for saved, live in zip(saved_params, live_params)}
+        opt_meta = metadata.get("optimizer", {})
+        ParameterGroups.restore(opt_meta.get("param_groups", []), mapping)
+        for key, step in opt_meta.get("parameter_steps", {}).items():
+            if key not in mapping or type(step) is not int or step < 0:
+                raise ValueError("invalid optimizer per-parameter step")
+
     saved_key_to_var = {}
     with np.load(npz_path, allow_pickle=False) as data:
         for saved, live in zip(saved_params, live_params):
@@ -355,6 +368,13 @@ def _restore_optimizer(optimizer, optimizer_meta, data, saved_key_to_var):
             if var is not None:
                 state[var] = xp.asarray(data[entry["array_key"]], dtype=var.value.dtype).copy()
         setattr(optimizer, state_name, state)
+    if hasattr(optimizer, "groups"):
+        from ..train.param_groups import ParameterGroups
+
+        optimizer.groups = ParameterGroups.restore(optimizer_meta.get("param_groups", []), saved_key_to_var)
+    if hasattr(optimizer, "parameter_steps"):
+        optimizer.parameter_steps = {saved_key_to_var[key]: int(step) for key, step in optimizer_meta.get("parameter_steps", {}).items()
+                                     if key in saved_key_to_var}
 
 
 # ---- TrainingState: transactional, checksummed snapshots for exact resume and rollback -----------------

@@ -3,12 +3,28 @@
 from __future__ import annotations
 
 import math
+import hashlib
+
+from ..core.device import asnumpy
+from ..utils.checkpoint import named_state
 
 from .adapters import FeatureAdapter
-from .freeze import ParameterFreezer, _stage_layers, frozen_fingerprint, parse_schedule
+from .freeze import ParameterFreezer, _stage_layers, freeze_summary, parse_schedule
 from .heads import HeadAdapterBuilder
 from .loader import CheckpointLoader, summarize_load_report
 from .registry import PretrainedModelRegistry
+
+
+def parse_lr_multipliers(value):
+    if not value:
+        return {}
+    try:
+        items = [(name, float(rate)) for name, rate in (entry.split(":") for entry in value.split(","))]
+    except (ValueError, TypeError) as exc:
+        raise ValueError("stage LR multipliers must have the form stem:0.01,layer1:0.1") from exc
+    if len(dict(items)) != len(items):
+        raise ValueError("stage LR names must be unique")
+    return dict(items)
 
 
 class TransferLearningManager:
@@ -32,6 +48,8 @@ class TransferLearningManager:
         self.load_report = load_report
         self.freeze = self.freezer.stages(self.initial_level, mode=freeze_mode, bn_unfreeze=bn_unfreeze)
         self.history = []
+        self.frozen_checks = []
+        self._frozen_reference = None
 
     @classmethod
     def build(cls, arch, output_dim, *, pretrained=None, initializer=None, dropout=0., dropout_seed=None,
@@ -66,11 +84,63 @@ class TransferLearningManager:
             if boundary <= epoch:
                 level = selected
         if level != self.freezer.level:
+            self.verify_frozen()
             self.freeze = self.freezer.stages(level, mode=self.freeze_mode, bn_unfreeze=self.bn_unfreeze)
+            self.begin_tracking()
         entry = {"epoch": int(epoch), "freeze_stages": level, "trainable_values": self.freeze["trainable_values"]}
         if not self.history or self.history[-1]["epoch"] != epoch:
             self.history.append(entry)
         return entry
+
+    def _frozen_hashes(self):
+        params, buffers = named_state(self.model)
+        tensors = {name: p.value for name, p in params.items() if not p.trainable}
+        tensors.update({name: getattr(layer, attr) for name, (layer, attr) in buffers.items() if layer.frozen})
+        result = {}
+        for name, value in tensors.items():
+            array = asnumpy(value)
+            sha = hashlib.sha256(str(array.dtype).encode() + str(array.shape).encode())
+            sha.update(array.tobytes())
+            result[name] = sha.hexdigest()
+        return result
+
+    def begin_tracking(self):
+        self._frozen_reference = self._frozen_hashes()
+
+    def verify_frozen(self):
+        if self._frozen_reference is None:
+            self.begin_tracking()
+            return True
+        current = self._frozen_hashes()
+        changed = [key for key, value in self._frozen_reference.items() if current.get(key) != value]
+        check = {"freeze_stages": self.freezer.level, "tensors": len(self._frozen_reference), "unchanged": not changed}
+        self.frozen_checks.append(check)
+        if changed:
+            raise RuntimeError(f"frozen tensors changed: {changed[:5]}")
+        return True
+
+    def state_dict(self):
+        params, buffers = named_state(self.model)
+        return {"level": self.freezer.level, "history": self.history, "checks": self.frozen_checks,
+                "frozen_parameters": [name for name, p in params.items() if not p.trainable],
+                "bn_frozen": {name: layer.frozen for name, (layer, attr) in buffers.items()},
+                "frozen_reference": self._frozen_reference}
+
+    def restore(self, state):
+        params, buffers = named_state(self.model)
+        frozen = set(state["frozen_parameters"])
+        if frozen - params.keys() or set(state["bn_frozen"]) != buffers.keys():
+            raise ValueError("freeze state names differ from the current model")
+        for name, node in params.items():
+            node.trainable = name not in frozen
+        for name, (layer, attr) in buffers.items():
+            self.freezer._statistics(layer, bool(state["bn_frozen"][name]))
+        self.freezer.level = int(state["level"])
+        self.freeze = freeze_summary(self.model)
+        self.history = list(state["history"])
+        self.frozen_checks = list(state["checks"])
+        self._frozen_reference = state.get("frozen_reference")
+        self.verify_frozen()
 
     def parameter_groups(self):
         groups, assigned = [], set()
@@ -93,6 +163,7 @@ class TransferLearningManager:
 
     def result(self):
         return {"arch": self.model.arch, "freeze_stages": self.freezer.level, "freeze": self.freeze,
+                "initial_freeze_stages": self.initial_level, "frozen_checks": list(self.frozen_checks),
                 "load_report": summarize_load_report(self.load_report) if self.load_report else None,
                 "freeze_history": list(self.history), "backbone_lr_mult": self.backbone_lr_mult,
                 "stage_lr_mults": self.stage_lr_mults, "freeze_mode": self.freeze_mode, "bn_unfreeze": self.bn_unfreeze}

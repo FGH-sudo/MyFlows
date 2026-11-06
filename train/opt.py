@@ -5,13 +5,14 @@ from ..core.node import Variable
 from ..core.graph import Graph
 from ..core.tensor import Tensor
 from ..ops.fused import adam_update
+from .param_groups import ParameterGroups
 
 class Optimizer:
     """
     优化器基类
     用于实现各种优化算法（如SGD、Adam等）
     """
-    def __init__(self, graph, learning_rate):
+    def __init__(self, graph, learning_rate, param_groups=None):
         """
         初始化优化器
         """
@@ -20,6 +21,20 @@ class Optimizer:
         self.learning_rate = learning_rate
         self.acc_gradient = {}  # 累加梯度的字典
         self.acc_no = 0  # 累加次数
+        self.groups = ParameterGroups(param_groups, graph.nodes)
+
+    def set_param_groups(self, groups):
+        self.groups = ParameterGroups(groups, self.graph.nodes)
+
+    def group_learning_rates(self):
+        return self.groups.rates(self.learning_rate)
+
+    def _group_gradient(self, node):
+        gradient = self.get_gradient(node)
+        lr, decay = self.groups.options(node, self.learning_rate)
+        if gradient is not None and decay:
+            gradient = gradient + decay * node.value
+        return gradient, lr
     
     def one_step(self, timer=None):
         """
@@ -112,8 +127,8 @@ class Optimizer:
 
 
 class MBGD(Optimizer):
-    def __init__(self, graph, learning_rate=0.01):
-        super().__init__(graph, learning_rate)
+    def __init__(self, graph, learning_rate=0.01, *, param_groups=None):
+        super().__init__(graph, learning_rate, param_groups)
 
     def _update(self):
         # 计算平均梯度
@@ -126,12 +141,13 @@ class MBGD(Optimizer):
         # 执行参数更新
         for node, grad in avg_gradients.items():
             if getattr(node, "trainable", False) and grad is not None:
-                node.value -= self.learning_rate * grad
+                grad, lr = self._group_gradient(node)
+                node.value -= lr * grad
 
 
 class Momentum(Optimizer):
-    def __init__(self, graph, learning_rate=0.01, momentum=0.9):
-        super().__init__(graph, learning_rate)
+    def __init__(self, graph, learning_rate=0.01, momentum=0.9, *, param_groups=None):
+        super().__init__(graph, learning_rate, param_groups)
         self.momentum = momentum
         self.v = {}  # 储存每个可训练变量的动量
 
@@ -139,21 +155,21 @@ class Momentum(Optimizer):
         for node in self.graph.nodes:
             if isinstance(node, Variable) and node.trainable:  # 如果节点是可训练的变量
                 # 获取该变量在当前epoch的平均梯度
-                grad = self.get_gradient(node)
+                grad, lr = self._group_gradient(node)
                 if grad is None:
                     continue
                 # 若该节点不在动量字典里，将当前梯度作为初始动量
                 if node not in self.v:
-                    self.v[node] = -self.learning_rate * grad
+                    self.v[node] = -lr * grad
                 else:
                     # 更新动量
-                    self.v[node] = self.momentum * self.v[node] - self.learning_rate * grad
+                    self.v[node] = self.momentum * self.v[node] - lr * grad
                 node.value += self.v[node]
 
 
 class AdaGrad(Optimizer):
-    def __init__(self, graph, learning_rate=0.01, eps=1e-8):
-        super().__init__(graph, learning_rate)
+    def __init__(self, graph, learning_rate=0.01, eps=1e-8, *, param_groups=None):
+        super().__init__(graph, learning_rate, param_groups)
         self.eps = eps
         self.s = {}  # 储存每个可训练变量的历史梯度平方
 
@@ -161,7 +177,7 @@ class AdaGrad(Optimizer):
         for node in self.graph.nodes:
             if isinstance(node, Variable) and node.trainable:
                 # 获取变量平均梯度
-                grad = self.get_gradient(node)
+                grad, lr = self._group_gradient(node)
                 if grad is None:
                     continue
                 if node not in self.s:
@@ -169,12 +185,12 @@ class AdaGrad(Optimizer):
                 else:
                     self.s[node] += xp.power(grad, 2)
                 # 更新变量值
-                node.value -= self.learning_rate * grad / (xp.sqrt(self.s[node] + self.eps))
+                node.value -= lr * grad / (xp.sqrt(self.s[node] + self.eps))
 
 
 class RMSProp(Optimizer):
-    def __init__(self, graph, learning_rate=0.01, beta=0.9, eps=1e-8):
-        super().__init__(graph, learning_rate)
+    def __init__(self, graph, learning_rate=0.01, beta=0.9, eps=1e-8, *, param_groups=None):
+        super().__init__(graph, learning_rate, param_groups)
         self.beta = beta
         self.eps = eps
         self.s = {}  # 储存每个可训练变量的历史梯度平方的加权累计(引入指数加权移动平均)
@@ -183,7 +199,7 @@ class RMSProp(Optimizer):
         for node in self.graph.nodes:
             if isinstance(node, Variable) and node.trainable:
                 # 获取变量平均梯度
-                grad = self.get_gradient(node)
+                grad, lr = self._group_gradient(node)
                 if grad is None:
                     continue
                 if node not in self.s:
@@ -191,7 +207,7 @@ class RMSProp(Optimizer):
                 else:
                     self.s[node] = self.beta * self.s[node] + (1 - self.beta) * xp.power(grad, 2)
                 # 更新变量值
-                node.value -= self.learning_rate * grad / (xp.sqrt(self.s[node] + self.eps))
+                node.value -= lr * grad / (xp.sqrt(self.s[node] + self.eps))
 
 
 class Adam(Optimizer):
@@ -203,14 +219,15 @@ class Adam(Optimizer):
     每个参数一次融合更新（GPU 为单个 kernel），CPU 回退与 GPU 的逐步舍入顺序一致。
     """
 
-    def __init__(self, graph, learning_rate=0.01, beta_1=0.9, beta_2=0.999, eps=1e-8):
-        super().__init__(graph, learning_rate)
+    def __init__(self, graph, learning_rate=0.01, beta_1=0.9, beta_2=0.999, eps=1e-8, *, param_groups=None):
+        super().__init__(graph, learning_rate, param_groups)
         self.beta_1 = beta_1
         self.beta_2 = beta_2
         self.eps = eps
         self.v = {}  # 一阶矩：历史梯度的指数加权平均（Momentum）
         self.s = {}  # 二阶矩：历史梯度平方的指数加权平均（RMSProp）
         self.t = 0   # 记录时间步长，用以修正偏差
+        self.parameter_steps = {}
 
     def _update(self):
         # 每次更新，时间步长+1
@@ -226,6 +243,14 @@ class Adam(Optimizer):
                 if node not in self.s:
                     self.v[node] = xp.zeros_like(node.value)
                     self.s[node] = xp.zeros_like(node.value)
-                adam_update(node.value, grad, self.v[node], self.s[node], lr=self.learning_rate,
-                            beta1=self.beta_1, beta2=self.beta_2, eps=self.eps, step=self.t,
-                            grad_scale=scale)
+                    self.parameter_steps[node] = 0
+                # Historical checkpoints carry only the global step; their existing states
+                # have been updated t-1 times. Newly unfrozen parameters start at their first step.
+                step = self.parameter_steps.get(node, self.t - 1) + 1
+                self.parameter_steps[node] = step
+                lr, decay = self.groups.options(node, self.learning_rate)
+                if decay:
+                    grad = grad * scale + decay * node.value
+                adam_update(node.value, grad, self.v[node], self.s[node], lr=lr,
+                            beta1=self.beta_1, beta2=self.beta_2, eps=self.eps, step=step,
+                            grad_scale=1. if decay else scale)
