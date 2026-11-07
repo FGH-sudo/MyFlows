@@ -22,7 +22,7 @@ def export_onnx(graph, filepath, input_nodes=None, output_names=None, opset=13):
     if any(getattr(node, "value", None) is None for node in graph.sorted_nodes):
         graph.forward()
 
-    input_nodes = set(input_nodes or [])
+    input_nodes = None if input_nodes is None else set(input_nodes)
     tensor_names = {}
     nodes = []
     initializers = []
@@ -63,7 +63,9 @@ def export_onnx(graph, filepath, input_nodes=None, output_names=None, opset=13):
     for node in graph.sorted_nodes:
         name = tensor_name(node)
         if isinstance(node, Variable):
-            if node in input_nodes or not getattr(node, "trainable", False):
+            is_input = (node in input_nodes if input_nodes is not None
+                        else not node._is_parameter and not node.constant)
+            if is_input:
                 inputs.append(value_info(name, node.value))
             else:
                 add_initializer(name, node.value)
@@ -120,7 +122,18 @@ def export_onnx(graph, filepath, input_nodes=None, output_names=None, opset=13):
                 name=name,
                 kernel_shape=list(node.kernel_size),
                 strides=list(node.stride),
+                pads=list(node.padding) * 2,
             ))
+        elif op_type == "ChannelNormalize_Op":
+            mean, std, centered = f"{name}_mean", f"{name}_std", f"{name}_centered"
+            add_initializer(mean, np.asarray(node.mean, np.float32).reshape(1, -1, 1, 1))
+            add_initializer(std, np.asarray(node.std, np.float32).reshape(1, -1, 1, 1))
+            nodes.append(helper.make_node("Sub", [parent_names[0], mean], [centered], name=f"{name}_sub"))
+            nodes.append(helper.make_node("Div", [centered, std], [out_name], name=name))
+        elif op_type == "Dropout_Op":
+            if node.training and node.p:
+                raise ValueError("export dropout in evaluation mode")
+            nodes.append(helper.make_node("Identity", parent_names, [out_name], name=name))
         elif op_type == "Flatten_Op":
             nodes.append(helper.make_node("Flatten", parent_names, [out_name], name=name, axis=1))
         elif op_type == "BatchNorm2d_Op":

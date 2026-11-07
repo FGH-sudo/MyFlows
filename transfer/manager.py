@@ -55,7 +55,7 @@ class TransferLearningManager:
     @classmethod
     def build(cls, arch, output_dim, *, pretrained=None, initializer=None, dropout=0., dropout_seed=None,
               conv_backend="auto", input_norm=None, name=None, head="linear", head_hidden=(512, 512),
-              head_dropout=.3, feature_adapter=None, spatial_size=None, **strategy):
+              head_dropout=.3, feature_adapter=None, spatial_size=None, lora_rank=0, lora_alpha=None, **strategy):
         registry = PretrainedModelRegistry()
         model = registry.build(arch, output_dim, initializer=initializer, dropout=dropout, dropout_seed=dropout_seed,
                                conv_backend=conv_backend, input_norm=input_norm, name=name)
@@ -77,7 +77,17 @@ class TransferLearningManager:
             model.sub_layers.append(replacement)
         elif head not in ("linear", "regression"):
             raise ValueError(f"unknown head: {head}")
-        return cls(model, load_report=report, **strategy)
+        manager = cls(model, load_report=report, **strategy)
+        if lora_rank:
+            from .lora import attach_resnet_lora
+
+            if manager.schedule or feature_adapter is not None:
+                raise ValueError("LoRA placement uses fixed base parameters and the original ResNet features")
+            manager.lora = attach_resnet_lora(model,lora_rank,alpha=lora_alpha,seed=dropout_seed)
+            manager.freezer = ParameterFreezer(model)
+            manager.initial_level = manager.freezer.level = len(model.stages())
+            manager.freeze = freeze_summary(model)
+        return manager
 
     def epoch(self, epoch):
         level = self.initial_level
@@ -208,6 +218,7 @@ class TransferLearningManager:
 
     def result(self):
         return {"arch": self.model.arch, "freeze_stages": self.freezer.level, "freeze": self.freeze,
+                "lora": getattr(self, "lora", None),
                 "initial_freeze_stages": self.initial_level, "frozen_checks": list(self.frozen_checks),
                 "load_report": summarize_load_report(self.load_report) if self.load_report else None,
                 "freeze_history": list(self.history), "backbone_lr_mult": self.backbone_lr_mult,
