@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import hashlib
+import numpy as np
 
 from ..core.device import asnumpy
 from ..utils.checkpoint import named_state
@@ -160,6 +161,50 @@ class TransferLearningManager:
             groups.append({"name": "backbone_extra", "params": extra, "lr_mult": self.backbone_lr_mult})
         groups.append({"name": "head", "params": [p for p in self.model.params if p in head_params], "lr_mult": 1.})
         return groups
+
+    def cache_features(self, directory, splits, *, sample_manifest, input_node, batch, load_input, preprocessing):
+        from ..core.graph import Graph
+        from ..core.node import Variable
+        from ..ops.batchnorm import BatchNorm2d_Op
+        from ..ops.dropout import Dropout_Op
+        from .cache import FeatureCache
+
+        if self.schedule and any(level != len(self.model.stages()) for level in self.schedule.values()):
+            raise ValueError("feature caching requires the backbone to remain frozen for every epoch")
+        feature = self.model._last_transfer_features
+        graph = Graph(feature)
+        if input_node.value.dtype != np.float32:
+            raise ValueError("feature caching requires FP32 inputs")
+        if any(isinstance(n, Variable) and n.trainable for n in graph.nodes):
+            raise ValueError("feature caching requires every pre-head parameter to be frozen")
+        if any(isinstance(n, BatchNorm2d_Op) and n.training for n in graph.nodes):
+            raise ValueError("feature caching requires frozen BN statistics")
+        if any(isinstance(n, Dropout_Op) and n.p for n in graph.nodes):
+            raise ValueError("feature caching requires deterministic backbone features, disable backbone dropout")
+        params, buffers = named_state(self.model)
+        required = set(graph.nodes)
+        tensors = {k: p.value for k, p in params.items() if p in required}
+        tensors.update({k: getattr(layer, attr) for k, (layer, attr) in buffers.items()
+                        if getattr(layer, "_last_op", None) in required})
+        sha = hashlib.sha256()
+        for key, array in tensors.items():
+            sha.update(key.encode())
+            sha.update(str(array.dtype).encode())
+            sha.update(str(array.shape).encode())
+            sha.update(asnumpy(array).tobytes())
+        adapter = getattr(self.model, "transfer_adapter", None)
+        width = adapter.output_dim if adapter else int(self.model.fc_W.value.shape[0])
+
+        def encode(selected):
+            images = np.asarray([load_input(sample) for sample in selected], dtype=np.float32)
+            if len(selected) < batch:
+                images = np.concatenate((images, np.repeat(images[-1:], batch-len(selected), axis=0)))
+            input_node.value = images
+            graph.forward()
+            return np.ascontiguousarray(asnumpy(feature.value)[:len(selected)])
+
+        return FeatureCache(directory).materialize(splits, sample_manifest=sample_manifest, weights_sha256=sha.hexdigest(),
+                                                   preprocessing=preprocessing, batch=batch, width=width, encode=encode)
 
     def result(self):
         return {"arch": self.model.arch, "freeze_stages": self.freezer.level, "freeze": self.freeze,

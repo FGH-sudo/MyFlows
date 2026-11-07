@@ -1,3 +1,5 @@
+import weakref
+
 from ..core.device import xp
 from ..core.dtype import resolve_dtype
 from ..core.node import Variable
@@ -393,16 +395,18 @@ class Dropout(Layer):
         self.seed = seed
         self.training = True
         self._last_op = None
+        self._ops = weakref.WeakSet()
 
     def forward(self, input_node):
         op = Dropout_Op(input_node, p=self.p, training=self.training, seed=self.seed, name=self.name)
         self._last_op = op
+        self._ops.add(op)
         return op
 
     def train(self, mode=True):
         self.training = bool(mode)
-        if self._last_op is not None:
-            self._last_op.training = self.training
+        for op in self._ops:
+            op.training = self.training
 
     def eval(self):
         self.train(False)

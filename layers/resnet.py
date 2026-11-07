@@ -13,6 +13,8 @@
   - Residual Add 使用现有 ``Add`` 算子(支持 4D+4D 等形状)，梯度经拓扑排序自然分叉/汇合。
 """
 
+import weakref
+
 from ..core.device import xp
 from ..core.dtype import resolve_dtype
 
@@ -58,6 +60,7 @@ class BatchNorm2d(Layer):
         self.running_mean = xp.zeros((self.num_features,), dtype=dtype)
         self.running_var = xp.ones((self.num_features,), dtype=dtype)
         self._last_op = None
+        self._ops = weakref.WeakSet()
 
     def forward(self, input_node):
         op = BatchNorm2d_Op(
@@ -72,12 +75,13 @@ class BatchNorm2d(Layer):
             unbiased_running_var=self.unbiased_running_var,
         )
         self._last_op = op
+        self._ops.add(op)
         return op
 
     def train(self, mode=True):
         self.training = bool(mode) and not self.frozen
-        if self._last_op is not None:
-            self._last_op.training = self.training
+        for op in self._ops:
+            op.training = self.training
 
     def eval(self):
         self.train(False)
