@@ -1,16 +1,18 @@
 import unittest
 
-import cupy as cp
 import numpy as np
 
-from MyFlows.core.device import cuda_available, set_device
+from MyFlows.core.device import _lazy_cupy, cuda_available, set_device
 from MyFlows.core.node import Variable
 from MyFlows.ops.convolution import Conv2D_Op
 from MyFlows.tests.cuda_fixtures import conv_fixture
 
 
 # A missing native library is built on first use, so only a missing GPU skips these tests.
-@unittest.skipUnless(cuda_available(), "CUDA is required")
+cp = _lazy_cupy() if cuda_available() else None
+
+
+@unittest.skipUnless(cp is not None, "requires CUDA and CuPy")
 class NativeCublasConvolutionTests(unittest.TestCase):
     def setUp(self):
         set_device("cuda")
