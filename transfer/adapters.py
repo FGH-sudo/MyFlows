@@ -1,16 +1,16 @@
 """Feature transformations between a backbone and a replacement head."""
 
-from ..core.node import Node
+from ..core.node import GradientOp
 from ..layers.layer import Conv2D, Dropout, Flatten, Layer
 from ..layers.resnet import BatchNorm2d, GlobalAvgPool2d
 
 
-class _VectorToMap(Node):
+class _VectorToMap(GradientOp):
     def forward(self, value):
         self.value = value[:, :, None, None]
 
     def backward(self):
-        self.parents[0].grad += self.grad[:, :, 0, 0]
+        self.parents[0].accumulate_grad(self.grad[:, :, 0, 0])
 
 
 class FeatureAdapter(Layer):

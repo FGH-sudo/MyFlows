@@ -34,33 +34,46 @@ def _same_float32(*arrays):
 # Activations
 # ---------------------------------------------------------------------------------------------
 @cache
-def _relu_backward_kernel():
+def _relu_backward_kernel(add):
+    op = "+=" if add else "="
     return _lazy_cupy().ElementwiseKernel(
-        "T x, T g", "T out", "out += x > (T)0 ? g : (T)0", "mf_relu_backward_acc")
+        "T x, T g", "T out", f"out {op} x > (T)0 ? g : (T)0", f"mf_relu_backward_{int(add)}")
 
 
 @cache
-def _leaky_relu_backward_kernel():
+def _leaky_relu_backward_kernel(add):
+    op = "+=" if add else "="
     return _lazy_cupy().ElementwiseKernel(
-        "T x, T g, T alpha", "T out", "out += x > (T)0 ? g : alpha * g", "mf_leaky_relu_backward_acc")
+        "T x, T g, T alpha", "T out", f"out {op} x > (T)0 ? g : alpha * g", f"mf_leaky_backward_{int(add)}")
 
 
 def relu_backward_accumulate(x, grad, out):
     """``out += grad`` where ``x > 0`` (one pass, dtype of ``out`` preserved)."""
-    if _on_gpu(x, grad, out) and x.dtype == grad.dtype == out.dtype:
-        _relu_backward_kernel()(x, grad, out)
+    if _on_gpu(x, grad) and x.dtype == grad.dtype and (out is None or x.dtype == out.dtype):
+        if out is None:
+            return _relu_backward_kernel(False)(x, grad)
+        return _relu_backward_kernel(True)(x, grad, out)
     else:
-        out += np.where(x > 0, grad, 0) if isinstance(out, np.ndarray) else _lazy_cupy().where(x > 0, grad, 0)
+        module = np if isinstance(x, np.ndarray) else _lazy_cupy()
+        result = module.where(x > 0, grad, 0)
+        if out is None:
+            return result.astype(x.dtype, copy=False)
+        out += result
     return out
 
 
 def leaky_relu_backward_accumulate(x, grad, out, alpha):
     """``out += grad`` where ``x > 0`` and ``alpha * grad`` elsewhere."""
-    if _on_gpu(x, grad, out) and x.dtype == grad.dtype == out.dtype:
-        _leaky_relu_backward_kernel()(x, grad, out.dtype.type(alpha), out)
+    if _on_gpu(x, grad) and x.dtype == grad.dtype and (out is None or x.dtype == out.dtype):
+        if out is None:
+            return _leaky_relu_backward_kernel(False)(x, grad, x.dtype.type(alpha))
+        return _leaky_relu_backward_kernel(True)(x, grad, x.dtype.type(alpha), out)
     else:
-        module = np if isinstance(out, np.ndarray) else _lazy_cupy()
-        out += module.where(x > 0, grad, float(alpha) * grad)
+        module = np if isinstance(x, np.ndarray) else _lazy_cupy()
+        result = module.where(x > 0, grad, float(alpha) * grad)
+        if out is None:
+            return result.astype(x.dtype, copy=False)
+        out += result
     return out
 
 
@@ -145,7 +158,8 @@ extern "C" __global__ void mf_bn_stats_finalize(const double* partial, const flo
 // Per channel: accumulate dgamma/dbeta and the coefficients of dx = a * (dy - k1 - (x - mean) * k2).
 extern "C" __global__ void mf_bn_grad_finalize(const double* partial, const float* gamma, const float* inv_std,
                                                float* gamma_grad, float* beta_grad, float* coef,
-                                               int C, int slices, double count, int training) {
+                                               int C, int slices, double count, int training,
+                                               int add_gamma, int add_beta) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= C) return;
     double sdy = 0.0, sdyx = 0.0;
@@ -155,8 +169,8 @@ extern "C" __global__ void mf_bn_grad_finalize(const double* partial, const floa
     }
     const double istd = (double)inv_std[c];
     const double dgamma = istd * sdyx;
-    if (gamma_grad) gamma_grad[c] += (float)dgamma;
-    if (beta_grad) beta_grad[c] += (float)sdy;
+    if (gamma_grad) gamma_grad[c] = add_gamma ? gamma_grad[c] + (float)dgamma : (float)dgamma;
+    if (beta_grad) beta_grad[c] = add_beta ? beta_grad[c] + (float)sdy : (float)sdy;
     if (coef) {
         coef[c] = (float)((double)gamma[c] * istd);
         coef[C + c] = training ? (float)(sdy / count) : 0.f;
@@ -179,17 +193,19 @@ def _bn_normalize_kernel():
 
 
 @cache
-def _bn_dx_kernel():
+def _bn_dx_kernel(add):
+    op = "+=" if add else "="
     return _lazy_cupy().ElementwiseKernel(
         "float32 x, float32 dy, float32 hi, float32 lo, float32 a, float32 k1, float32 k2", "float32 dx",
-        "dx += a * (dy - k1 - ((x - hi) - lo) * k2)", "mf_bn_dx_acc_hilo")
+        f"dx {op} a * (dy - k1 - ((x - hi) - lo) * k2)", f"mf_bn_dx_hilo_{int(add)}")
 
 
 @cache
-def _bn_eval_dx_kernel():
+def _bn_eval_dx_kernel(add):
+    op = "+=" if add else "="
     return _lazy_cupy().ElementwiseKernel(
         "float32 dy, float32 gamma, float32 inv_std", "float32 dx",
-        "dx += (float)((double)gamma * (double)inv_std) * dy", "mf_bn_eval_dx_only")
+        f"dx {op} (float)((double)gamma * (double)inv_std) * dy", f"mf_bn_eval_dx_{int(add)}")
 
 
 @cache
@@ -262,7 +278,8 @@ def batchnorm2d_forward(x, gamma, beta, running_mean, running_var, *, momentum, 
     return y, mean, inv_std
 
 
-def batchnorm2d_backward(x, dy, gamma, mean, inv_std, *, training, x_grad, gamma_grad, beta_grad):
+def batchnorm2d_backward(x, dy, gamma, mean, inv_std, *, training, x_grad, gamma_grad, beta_grad,
+                         accumulate=(True, True, True)):
     """Accumulate requested gradients. Training-mode dX itself needs the two channel sums."""
     outputs = [g for g in (x_grad, gamma_grad, beta_grad) if g is not None]
     if not outputs:
@@ -276,7 +293,7 @@ def batchnorm2d_backward(x, dy, gamma, mean, inv_std, *, training, x_grad, gamma
     if _on_gpu(*arrays) and _same_float32(*arrays):
         cp = _lazy_cupy()
         if not (sum_dy or sum_centered):
-            _bn_eval_dx_kernel()(dy, _channel(gamma), _channel(inv_std), x_grad)
+            _bn_eval_dx_kernel(accumulate[0])(dy, _channel(gamma), _channel(inv_std), x_grad)
             return
         x, dy = cp.ascontiguousarray(x), cp.ascontiguousarray(dy)
         slices, chunk = _bn_grid(n, c, hw)
@@ -289,10 +306,10 @@ def batchnorm2d_backward(x, dy, gamma, mean, inv_std, *, training, x_grad, gamma
         pointer = lambda array: array if array is not None else np.uintp(0)
         module.get_function("mf_bn_grad_finalize")((-(-c // 128),), (128,), (
             partial, gamma, inv_std, pointer(gamma_grad), pointer(beta_grad), pointer(coef), np.int32(c), np.int32(slices),
-            np.float64(count), np.int32(1 if training else 0)))
+            np.float64(count), np.int32(training), np.int32(accumulate[1]), np.int32(accumulate[2])))
         if x_grad is not None:
             a, k1, k2 = (_channel(part) for part in coef.reshape(3, c))
-            _bn_dx_kernel()(x, dy, _channel(mean[0]), _channel(mean[1]), a, k1, k2, x_grad)
+            _bn_dx_kernel(accumulate[0])(x, dy, _channel(mean[0]), _channel(mean[1]), a, k1, k2, x_grad)
         return
 
     axes = (0, 2, 3)
@@ -302,21 +319,29 @@ def batchnorm2d_backward(x, dy, gamma, mean, inv_std, *, training, x_grad, gamma
     if sum_dy:
         sdy = dy64.sum(axis=axes)
         if beta_grad is not None:
-            beta_grad += sdy.astype(beta_grad.dtype)
+            _store_gradient(beta_grad, sdy.astype(beta_grad.dtype), accumulate[2])
     if sum_centered:
         centered = x.astype(np.float64) - _channel(mean[0].astype(np.float64) + mean[1].astype(np.float64))
         dgamma = istd * (dy64 * centered).sum(axis=axes)
         if gamma_grad is not None:
-            gamma_grad += dgamma.astype(gamma_grad.dtype)
+            _store_gradient(gamma_grad, dgamma.astype(gamma_grad.dtype), accumulate[1])
     if x_grad is None:
         return
     a = _channel((gamma.astype(np.float64) * istd).astype(x.dtype))
     if training:
         k1 = _channel((sdy / count).astype(x.dtype))
         k2 = _channel((istd * dgamma / count).astype(x.dtype))
-        x_grad += a * (dy - k1 - ((x - _channel(mean[0])) - _channel(mean[1])) * k2)
+        dx = a * (dy - k1 - ((x - _channel(mean[0])) - _channel(mean[1])) * k2)
     else:
-        x_grad += a * dy
+        dx = a * dy
+    _store_gradient(x_grad, dx, accumulate[0])
+
+
+def _store_gradient(out, value, add):
+    if add:
+        out += value
+    else:
+        out[...] = value
 
 
 # ---------------------------------------------------------------------------------------------

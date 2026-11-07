@@ -6,10 +6,10 @@ from __future__ import annotations
 import numpy as np
 
 from ..core.device import xp
-from ..core.node import Node
+from ..core.node import GradientOp
 
 
-class Dropout_Op(Node):
+class Dropout_Op(GradientOp):
     def __init__(self, x, p: float = 0.5, training: bool = True, seed: int | None = None, name=None):
         self.p = float(p)
         if self.p < 0.0 or self.p >= 1.0:
@@ -38,6 +38,4 @@ class Dropout_Op(Node):
 
     def backward(self):
         x_node = self.parents[0]
-        if x_node.grad is None:
-            x_node.grad = xp.zeros_like(x_node.value)
-        x_node.grad += self.grad * self._mask
+        x_node.accumulate_grad(self.grad * self._mask, owned=True)

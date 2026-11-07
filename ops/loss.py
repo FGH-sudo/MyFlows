@@ -1,10 +1,10 @@
 import numpy as np
 
 from ..core.device import xp
-from ..core.node import Node
+from ..core.node import GradientOp
 from .fused import softmax_cross_entropy, softmax_cross_entropy_grad
 
-class PerceptionLoss(Node):
+class PerceptionLoss(GradientOp):
     """
     两个父节点：y_pred (预测) 和 y_true (标签)
     """
@@ -30,12 +30,10 @@ class PerceptionLoss(Node):
             return
         grad_signal = xp.where(self.y_true_val * self.y_pred_val < 0, -self.y_true_val, 0)
         n = max(int(self.y_true_val.size), 1)
-        if self.y_pred.grad is None:
-            self.y_pred.clear_grad()
-        self.y_pred.grad += self.grad * (grad_signal / n)
+        self.y_pred.accumulate_grad(self.grad * (grad_signal / n), owned=True)
 
 
-class LogLoss(Node):
+class LogLoss(GradientOp):
     def __init__(self, y_pred, y_true, name="LogLoss"):
         # 保持与基类一致
         super().__init__(y_pred, y_true, name=name)
@@ -65,10 +63,10 @@ class LogLoss(Node):
         # 最终梯度
         final_grad = (self.grad * grad_x * self.y_true.value) / N
         
-        self.y_pred.grad += final_grad
+        self.y_pred.accumulate_grad(final_grad, owned=True)
 
 
-class CrossEntropy(Node):
+class CrossEntropy(GradientOp):
     """Softmax 交叉熵。logits 为 (N, C)；标签可为类别下标 (N,)/(N, 1) 或 (N, C) 的 one-hot/软标签。
 
     按 log-sum-exp 直接求 log softmax（FP64 累加），不再计算 log(softmax + 1e-10)；
@@ -90,12 +88,10 @@ class CrossEntropy(Node):
         if not self.logits.requires_grad:
             return
         final_grad = softmax_cross_entropy_grad(self.probs, self._labels, self._targets)
-        if self.logits.grad is None:
-            self.logits.clear_grad()
-        self.logits.grad += self.grad * final_grad
+        self.logits.accumulate_grad(self.grad * final_grad, owned=True)
 
 
-class MSELoss(Node):
+class MSELoss(GradientOp):
     """均方误差，用于回归(如 user/angle、user/throttle)。"""
     def __init__(self, y_pred, y_true, name="MSELoss"):
         super().__init__(y_pred, y_true, name=name)
@@ -114,4 +110,4 @@ class MSELoss(Node):
             return
         n = max(y_pred.value.size, 1)
         g = 2.0 * (y_pred.value - y_true.value) / n
-        y_pred.grad += self.grad * g
+        y_pred.accumulate_grad(self.grad * g, owned=True)

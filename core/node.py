@@ -1,5 +1,6 @@
 import numpy as np
 from .tensor import Tensor
+from .device import xp
 
 class Node:
     # Standalone operators retain their historical backward behavior until bound to a graph.
@@ -61,6 +62,30 @@ class Node:
         else:
             # 如果还没有计算 value 保持 None
             self._grad = None
+
+    def accumulate_grad(self, contribution, *, owned=False):
+        """Write the first contribution, then sum. Only freshly allocated results may transfer ownership."""
+        value = self.value
+        if not hasattr(contribution, "dtype"):
+            contribution = xp.asarray(contribution)
+        if self._grad is not None:
+            self._grad.data += contribution.astype(value.dtype, copy=False)
+            return
+        if contribution.shape != value.shape:
+            contribution = xp.broadcast_to(contribution, value.shape)
+            owned = False
+        self.grad = contribution.astype(value.dtype, order="C", copy=not owned)
+
+    def grad_buffer(self):
+        """Return a writable gradient and whether the caller must add to its existing contents."""
+        add = self._grad is not None
+        if not add:
+            self.grad = xp.empty_like(self.value)
+        return self.grad, add
+
+
+class GradientOp(Node):
+    """Operator whose backward implementation handles the first write to each parent's gradient."""
 
 
 class Variable(Node):

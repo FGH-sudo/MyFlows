@@ -5,7 +5,7 @@ import math
 import numpy as np
 
 from ..core.device import xp
-from ..core.node import Node
+from ..core.node import GradientOp
 
 
 def adaptive_bins(size, out_size):
@@ -20,7 +20,7 @@ def _averaging_matrix(size, out_size, dtype):
     return xp.asarray(matrix.astype(dtype))
 
 
-class AdaptiveAvgPool2d_Op(Node):
+class AdaptiveAvgPool2d_Op(GradientOp):
     """(N, C, H, W) -> (N, C, oh, ow)。
 
     每个输出是一个矩形窗口的均值，窗口按行、列分别分箱，所以 y = Ph · x · Pwᵀ（Ph、Pw 是每行和为 1 的平均矩阵），
@@ -51,20 +51,18 @@ class AdaptiveAvgPool2d_Op(Node):
 
     def backward(self):
         x_node = self.parents[0]
-        if x_node.grad is None:
-            x_node.clear_grad()
         if self._identity:
-            x_node.grad += self.grad
+            x_node.accumulate_grad(self.grad)
             return
         _, ph, pw = self._matrices
-        x_node.grad += ph.T @ self.grad @ pw
+        x_node.accumulate_grad(ph.T @ self.grad @ pw, owned=True)
 
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
-class ChannelNormalize_Op(Node):
+class ChannelNormalize_Op(GradientOp):
     """y = (x - mean[c]) / std[c]：torchvision 预训练权重要求的输入归一化（输入为 [0, 1] 的 RGB）。"""
 
     def __init__(self, x, mean=IMAGENET_MEAN, std=IMAGENET_STD, name=None):
@@ -86,6 +84,4 @@ class ChannelNormalize_Op(Node):
         x_node = self.parents[0]
         if not getattr(x_node, "requires_grad", True):
             return
-        if x_node.grad is None:
-            x_node.clear_grad()
-        x_node.grad += self.grad / self._channel(self.std, self.grad.dtype)
+        x_node.accumulate_grad(self.grad / self._channel(self.std, self.grad.dtype), owned=True)

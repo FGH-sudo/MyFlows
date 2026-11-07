@@ -1,10 +1,10 @@
 import numpy as np
 
-from ..core.node import Node
+from ..core.node import GradientOp
 from .fused import batchnorm2d_backward, batchnorm2d_forward
 
 
-class BatchNorm2d_Op(Node):
+class BatchNorm2d_Op(GradientOp):
     """2D 批归一化算子。
 
     输入:  x (N, C, H, W), gamma (C,), beta (C,)
@@ -53,17 +53,14 @@ class BatchNorm2d_Op(Node):
 
     def backward(self):
         x_node, gamma_node, beta_node = self.parents
-        for node in self.parents:
-            if node.requires_grad and node.grad is None:
-                node.clear_grad()
+        outputs = [node.grad_buffer() if node.requires_grad else (None, False) for node in self.parents]
         batchnorm2d_backward(
             x_node.value, self.grad, gamma_node.value, self._mean, self._inv_std,
-            training=self._training_used, x_grad=x_node.grad if x_node.requires_grad else None,
-            gamma_grad=gamma_node.grad if gamma_node.requires_grad else None,
-            beta_grad=beta_node.grad if beta_node.requires_grad else None)
+            training=self._training_used, x_grad=outputs[0][0], gamma_grad=outputs[1][0],
+            beta_grad=outputs[2][0], accumulate=tuple(add for _, add in outputs))
 
 
-class GlobalAvgPool2d_Op(Node):
+class GlobalAvgPool2d_Op(GradientOp):
     """全局平均池化：(N, C, H, W) -> (N, C)。"""
 
     def forward(self, x_val):
@@ -73,9 +70,7 @@ class GlobalAvgPool2d_Op(Node):
 
     def backward(self):
         x_node = self.parents[0]
-        if x_node.grad is None:
-            x_node.clear_grad()
         N, C, H, W = self._in_shape
         grad = self.grad.reshape(N, C, 1, 1) / (H * W)
         # 广播累加，不先物化一份 (N, C, H, W) 的副本
-        x_node.grad += grad
+        x_node.accumulate_grad(grad)

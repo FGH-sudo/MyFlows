@@ -1,7 +1,7 @@
 from ..core.device import xp
-from ..core.node import Node
+from ..core.node import GradientOp
 
-class Add(Node):
+class Add(GradientOp):
     def forward(self, a, b):
         self.a_shape = a.shape
         self.b_shape = b.shape
@@ -20,10 +20,10 @@ class Add(Node):
         
         # 处理 a 的梯度
         if a.requires_grad:
-            a.grad += self._handle_broadcast(self.grad, self.a_broadcast_shape, self.a_shape)
+            a.accumulate_grad(self._handle_broadcast(self.grad, self.a_broadcast_shape, self.a_shape))
         # 处理 b 的梯度
         if b.requires_grad:
-            b.grad += self._handle_broadcast(self.grad, self.b_broadcast_shape, self.b_shape)
+            b.accumulate_grad(self._handle_broadcast(self.grad, self.b_broadcast_shape, self.b_shape))
 
     def _handle_broadcast(self, grad, broadcast_shape, original_shape):
         # 将上游梯度沿着被广播的维度求和，再恢复成原始张量形状
@@ -38,7 +38,7 @@ class Add(Node):
         return grad.reshape(original_shape)
 
 
-class MatMul(Node):
+class MatMul(GradientOp):
     def forward(self, a, b):
         self.value = xp.dot(a, b)
 
@@ -46,9 +46,9 @@ class MatMul(Node):
         a, b = self.parents
         # 不需要梯度的输入（如输入数据）跳过对应的 GEMM
         if getattr(a, "requires_grad", True):
-            a.grad += xp.dot(self.grad, b.value.T)
+            a.accumulate_grad(xp.dot(self.grad, b.value.T), owned=True)
         if getattr(b, "requires_grad", True):
-            b.grad += xp.dot(a.value.T, self.grad)
+            b.accumulate_grad(xp.dot(a.value.T, self.grad), owned=True)
 
 
 LINEAR_BACKENDS = ("auto", "numpy", "cupy", "cuda_native_register", "cuda_native_cublas",
@@ -70,7 +70,7 @@ def _reduce_to(grad, shape):
     return total.reshape(shape).astype(grad.dtype, copy=False)
 
 
-class Linear(Node):
+class Linear(GradientOp):
     """融合算子：y = x @ W + b（减少 MatMul+Add 的节点与调度开销）。
 
     backend：
@@ -129,13 +129,13 @@ class Linear(Node):
         grad = self.grad
         if grad.ndim == 2:
             if getattr(x, "requires_grad", True):
-                x.grad += self._matmul(grad, w.value, trans_b=True)
+                x.accumulate_grad(self._matmul(grad, w.value, trans_b=True), owned=True)
             if w.requires_grad:
-                w.grad += self._matmul(x.value, grad, trans_a=True)
+                w.accumulate_grad(self._matmul(x.value, grad, trans_a=True), owned=True)
         else:
             if getattr(x, "requires_grad", True):
-                x.grad += xp.dot(grad, w.value.T)
+                x.accumulate_grad(xp.dot(grad, w.value.T), owned=True)
             if w.requires_grad:
-                w.grad += xp.tensordot(x.value, grad, axes=(tuple(range(x.value.ndim - 1)),) * 2)
+                w.accumulate_grad(xp.tensordot(x.value, grad, axes=(tuple(range(x.value.ndim - 1)),) * 2), owned=True)
         if b.requires_grad:
-            b.grad += _reduce_to(grad, b.value.shape)
+            b.accumulate_grad(_reduce_to(grad, b.value.shape))

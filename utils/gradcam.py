@@ -10,10 +10,10 @@ import numpy as np
 
 from MyFlows.core.device import asnumpy, xp
 from MyFlows.core.graph import Graph
-from MyFlows.core.node import Node
+from MyFlows.core.node import GradientOp
 
 
-class TargetScore(Node):
+class TargetScore(GradientOp):
     """Scalar node selecting one model output for explanation."""
 
     def __init__(self, logits, target_index: int = 0, sample_index: int = 0, name: str = "TargetScore"):
@@ -27,11 +27,9 @@ class TargetScore(Node):
 
     def backward(self):
         logits = self.parents[0]
-        if logits.grad is None:
-            logits.clear_grad()
         grad = xp.zeros_like(logits.value)
         grad[self.sample_index, self.target_index] = self.grad
-        logits.grad += grad
+        logits.accumulate_grad(grad, owned=True)
 
 
 @dataclass

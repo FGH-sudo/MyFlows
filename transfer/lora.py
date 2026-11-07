@@ -4,7 +4,7 @@ import math
 import numpy as np
 
 from ..core.device import xp
-from ..core.node import Node, Variable
+from ..core.node import GradientOp, Variable
 from ..layers.layer import Conv2D, Dense, Layer
 from ..layers.resnet import BatchNorm2d
 from ..ops.basic import Linear
@@ -12,7 +12,7 @@ from ..ops.convolution import Conv2D_Op
 from ..utils.checkpoint import collect_layers
 
 
-class _Residual(Node):
+class _Residual(GradientOp):
     def __init__(self, base, update, scale):
         super().__init__(base, update)
         self.scale = scale
@@ -24,9 +24,9 @@ class _Residual(Node):
     def backward(self):
         base, update = self.parents
         if base.requires_grad:
-            base.grad += self.grad
+            base.accumulate_grad(self.grad)
         if update.requires_grad:
-            update.grad += self.scale * self.grad
+            update.accumulate_grad(self.scale * self.grad, owned=True)
 
 
 def _factors(a_shape, b_shape, dtype, fan_in, rank, alpha, seed, name):

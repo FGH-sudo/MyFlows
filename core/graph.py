@@ -1,5 +1,5 @@
 from .device import xp
-from .node import Node, Variable
+from .node import GradientOp, Node, Variable
 from .graph_opt import apply_graph_optimizations
 
 class Graph:
@@ -64,6 +64,9 @@ class Graph:
             self._active = frozenset(node for node, required in needed.items() if required)
             self._flags = tuple(needed.items())
             self._backward_nodes = tuple(reversed(propagate))
+            self._legacy_parents = {n: tuple(p for p in n.parents if needed[p]) for n in propagate
+                                    if not isinstance(n, GradientOp)}
+            self._keep_grads = tuple(n for n in self.nodes if needed[n] and (not n.parents or n in self._retained))
             self._clear_nodes = tuple(node for node in self.nodes if node in self._active)
             self._signature = signature
             self._plan = object()
@@ -117,14 +120,25 @@ class Graph:
         if self.target_node not in self._active:
             return
         for n in self._clear_nodes:
-            n.clear_grad()
+            n.grad = None
             
         self.target_node.grad = xp.ones_like(self.target_node.value)
         
         # 使用预先计算好的反向排序列表
         for node in self._backward_nodes:
+            if node.grad is None:
+                continue
+            for parent in self._legacy_parents.get(node, ()):
+                # Third-party Node subclasses may still write parent.grad += contribution.
+                if parent.grad is None:
+                    parent.clear_grad()
+            saved = node.grad_tensor if node in self._retained else None
             if self.profiler is None:
                 node.backward()
             else:
                 with self.profiler.node(node, "backward"):
                     node.backward()
+            node.grad_tensor = saved
+        for node in self._keep_grads:
+            if node.grad is None:
+                node.clear_grad()

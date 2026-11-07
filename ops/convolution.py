@@ -1,7 +1,7 @@
 from functools import cache
 
 from ..core.device import _lazy_cupy, xp, get_device
-from ..core.node import Node
+from ..core.node import GradientOp
 
 
 # 原生 CUDA 后端 -> GEMM 引擎：im2col/col2im、尾处理与池化都是项目自己的 kernel，卷积的三个 GEMM 用
@@ -282,7 +282,7 @@ def col2im(rows, input_shape, kernel_size, stride=1, padding=0, dilation=1, cont
     return output[:, :, pad_h:pad_h + input_shape[2], pad_w:pad_w + input_shape[3]], context
 
 
-class Conv2D_Op(Node):
+class Conv2D_Op(GradientOp):
     def _fused_activation(self):
         # 子类在原生后端把激活融合进卷积尾处理时返回 "relu"/"leaky_relu"
         return None
@@ -417,17 +417,12 @@ class Conv2D_Op(Node):
                                     alpha=self._activation_alpha(), output=self.value,
                                     engine=NATIVE_BACKENDS[self.actual_backend])
             for parent, grad in zip(self.parents, grads):
-                if grad is None:
-                    continue
-                if parent.grad is None:
-                    parent.clear_grad()
-                parent.grad += grad
+                if grad is not None:
+                    parent.accumulate_grad(grad, owned=True)
             return
-        for node in self.parents:
-            if node.requires_grad and node.grad is None:
-                node.clear_grad()
         if need_b:
-            self.bias.grad += xp.sum(self.grad, axis=(0, 2, 3), dtype=xp.float64).astype(self.bias.grad.dtype)
+            db = xp.sum(self.grad, axis=(0, 2, 3), dtype=xp.float64)
+            self.bias.accumulate_grad(db, owned=True)
         if not (need_x or need_w):
             return
 
@@ -440,20 +435,27 @@ class Conv2D_Op(Node):
                 self._depthwise_input, kernel_node.value, self.grad, x_node.value.shape, self.stride, self.padding,
                 self.dilation, need_input_grad=need_x, need_weight_grad=need_w)
             if need_w:
-                kernel_node.grad += grad_k
+                kernel_node.accumulate_grad(grad_k, owned=True)
             if grad_x is not None:
-                x_node.grad += grad_x
+                x_node.accumulate_grad(grad_x, owned=True)
             return
 
+        # Every group writes a disjoint slab. Allocate once and avoid clearing the buffer on its first write.
+        dw, add_w = kernel_node.grad_buffer() if need_w and self.groups > 1 else (None, False)
+        dx, add_x = x_node.grad_buffer() if need_x and self.groups > 1 else (None, False)
         for group_index in range(self.groups):
             in_start, in_end = _group_bounds(in_channels, self.groups, group_index)
             out_start, out_end = _group_bounds(out_channels, self.groups, group_index)
 
             grad_y = self.grad[:, out_start:out_end].transpose(0, 2, 3, 1).reshape(-1, out_channels_per_group)
             if need_w:
-                kernel_node.grad[out_start:out_end] += (
-                    grad_y.T @ self.cols[group_index]
-                ).reshape(kernel_node.value[out_start:out_end].shape)
+                grad_w = (grad_y.T @ self.cols[group_index]).reshape(kernel_node.value[out_start:out_end].shape)
+                if dw is None:
+                    kernel_node.accumulate_grad(grad_w, owned=True)
+                elif add_w:
+                    dw[out_start:out_end] += grad_w
+                else:
+                    dw[out_start:out_end] = grad_w
             if not need_x:
                 continue
 
@@ -468,7 +470,12 @@ class Conv2D_Op(Node):
                 context=self._im2col_contexts[group_index],
             )
             self._im2col_contexts[group_index] = context
-            x_node.grad[:, in_start:in_end] += grad_x
+            if dx is None:
+                x_node.accumulate_grad(grad_x, owned=True)
+            elif add_x:
+                dx[:, in_start:in_end] += grad_x
+            else:
+                dx[:, in_start:in_end] = grad_x
 
 
 class Conv2D_ReLU_Op(Conv2D_Op):
@@ -618,7 +625,7 @@ def _conv_transpose2d_backward_group(
                 grad_kernel_group[:, :, kr, kc] += xp.einsum("ncv,ngv->cg", xv, gv)
 
 
-class ConvTranspose2D_Op(Node):
+class ConvTranspose2D_Op(GradientOp):
     def __init__(self, x, kernel, stride=1, padding=0, output_padding=0, groups=1, dilation=1, bias=None):
         if bias is None:
             super().__init__(x, kernel)
@@ -762,7 +769,7 @@ class ConvTranspose2D_LeakyReLU_Op(ConvTranspose2D_Op):
         super().backward()
 
 
-class MaxPool2d_Op(Node):
+class MaxPool2d_Op(GradientOp):
     """最大池化。``padding`` 按 -inf 补边（与 torch.nn.MaxPool2d 相同），补边后各后端的路径不变。"""
 
     def __init__(self, x, kernel_size=2, stride=2, backend="auto", padding=0):
@@ -813,14 +820,9 @@ class MaxPool2d_Op(Node):
         if self.actual_backend in NATIVE_BACKENDS:
             from .cuda_native.native import maxpool2d_backward
             parent = self.parents[0]
-            if parent.grad is None:
-                parent.clear_grad()
-            parent.grad += self._unpad(maxpool2d_backward(self.grad, self._native_context))
+            parent.accumulate_grad(self._unpad(maxpool2d_backward(self.grad, self._native_context)), owned=True)
             return
         x_node = self.parents[0]
-        if x_node.grad is None:
-            x_node.clear_grad()
-
         N, C, out_H, out_W = self.value.shape
         grad = self.grad.reshape(N, C, out_H * out_W)
         grad_patches = self.max_mask * grad[..., None]
@@ -834,7 +836,7 @@ class MaxPool2d_Op(Node):
             dilation=1,
             context=self._im2col_context,
         )
-        x_node.grad += self._unpad(grad_x)
+        x_node.accumulate_grad(self._unpad(grad_x), owned=True)
 
     def _unpad(self, grad):
         ph, pw = self.padding
@@ -843,9 +845,9 @@ class MaxPool2d_Op(Node):
         return grad[:, :, ph:grad.shape[2] - ph, pw:grad.shape[3] - pw]
 
 
-class Flatten_Op(Node):
+class Flatten_Op(GradientOp):
     def forward(self, x):
         self.in_shape = x.shape
         self.value = x.reshape(x.shape[0], -1)
     def backward(self):
-        self.parents[0].grad += self.grad.reshape(self.in_shape)
+        self.parents[0].accumulate_grad(self.grad.reshape(self.in_shape))
