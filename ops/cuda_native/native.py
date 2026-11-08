@@ -121,6 +121,8 @@ def _configure(lib):
     lib.mf_conv_im2col.restype = i32
     lib.mf_conv_backward.argtypes = [u64] * 10 + [i32] * 13 + [i32, i32, f32, i32, u64, i64, u64]
     lib.mf_conv_backward.restype = i32
+    lib.mf_conv_backward_plans.argtypes = [u64] * 10 + [i32] * 13 + [i32, i32, f32, i32, i32, u64, i64, u64]
+    lib.mf_conv_backward_plans.restype = i32
     lib.mf_pool_forward.argtypes = [u64] * 3 + [i32] * 10 + [u64]
     lib.mf_pool_forward.restype = i32
     lib.mf_pool_backward.argtypes = [u64] * 3 + [i32] * 10 + [u64]
@@ -264,15 +266,38 @@ def _engine(engine):
     return GEMM_ENGINES[engine]
 
 
-def _workspace(lib, engine, *gemms):
-    """Split-K workspace of the register engine, sized for the largest of the call's (M, N, K) GEMMs."""
+def _plan_code(tile, requested):
+    if tile not in GEMM_TILES or type(requested) is not int or not 1 <= requested <= 32:
+        raise ValueError("expected a register tile and 1..32 split-K slices")
+    return 16 + GEMM_TILES.index(tile) * 32 + requested - 1
+
+
+def _slices(k, requested):
+    chunk = ((k+requested-1)//requested+15)//16*16
+    return (k+chunk-1)//chunk
+
+
+def _choose_engine(engine, layout, m, n, k):
+    if engine == GEMM_ENGINES["register"] and os.environ.get("MYFLOWS_GEMM_AUTOTUNE") == "1":
+        from .autotune import selected_plan
+        return _plan_code(*selected_plan(layout, m, n, k))
+    return engine
+
+
+def _workspace(lib, *requests):
+    """The backward GEMMs share the larger of their two requested workspaces."""
     floats = 0
-    if engine == GEMM_ENGINES["register"]:
-        for m, n, k in gemms:
+    for engine, m, n, k in requests:
+        if engine == GEMM_ENGINES["register"]:
             size = lib.mf_gemm_workspace(m, n, k)
             if size < 0:
                 raise NativeCudaError(f"native CUDA call failed: {lib.mf_last_error().decode(errors='replace')}")
-            floats = max(floats, size)
+        elif engine >= 16:
+            splits = _slices(k, (engine-16) % 32 + 1)
+            size = splits*m*n if splits > 1 else 0
+        else:
+            size = 0
+        floats = max(floats, size)
     if not floats:
         return None, 0
     cp = _lazy_cupy()
@@ -312,7 +337,8 @@ def conv2d_forward(x, weight, bias=None, *, stride=(1, 1), padding=(0, 0), activ
     rows = cp.empty((m, co), dtype=cp.float32)
     y = cp.empty((n, co, oh, ow), dtype=cp.float32)
     lib = _library()
-    workspace, floats = _workspace(lib, engine, (m, co, k))
+    engine = _choose_engine(engine, "NT", m, co, k)
+    workspace, floats = _workspace(lib, (engine, m, co, k))
     _check(lib.mf_conv_forward(
         _u64(x.data.ptr), _u64(weight.data.ptr), _u64(bias.data.ptr if bias is not None else 0),
         _u64(cols.data.ptr), _u64(rows.data.ptr), _u64(y.data.ptr),
@@ -367,14 +393,18 @@ def conv2d_backward(x, weight, grad_y, cols, *, stride=(1, 1), padding=(0, 0), n
     db = cp.empty((co,), dtype=cp.float32) if need_bias_grad else None
     pointer = lambda array: _u64(array.data.ptr if array is not None else 0)
     lib = _library()
-    gemms = [(co, k, m)] if need_weight_grad else []
+    dw_engine = _choose_engine(engine, "TN", co, k, m) if need_weight_grad else engine
+    dx_engine = engine
+    requests = [(dw_engine, co, k, m)] if need_weight_grad else []
     if need_input_grad:
-        gemms.append((oh * ow if direct_dx else m, k, co))
-    workspace, floats = _workspace(lib, engine, *gemms)
-    _check(lib.mf_conv_backward(
+        dx_rows = oh * ow if direct_dx else m
+        dx_engine = _choose_engine(engine, "TN" if direct_dx else "NN", dx_rows, k, co)
+        requests.append((dx_engine, dx_rows, k, co))
+    workspace, floats = _workspace(lib, *requests)
+    _check(lib.mf_conv_backward_plans(
         pointer(weight), pointer(grad_y), pointer(gate), pointer(cols), pointer(dy_rows), pointer(dw),
         pointer(grad_cols), pointer(dx), pointer(partial), pointer(db),
-        *[_i32(v) for v in dims], _i32(blocks), _i32(act), alpha, _i32(engine), pointer(workspace),
+        *[_i32(v) for v in dims], _i32(blocks), _i32(act), alpha, _i32(dw_engine), _i32(dx_engine), pointer(workspace),
         ctypes.c_int64(floats), _u64(cp.cuda.get_current_stream().ptr)), lib)
     return dx, dw, db
 
@@ -469,17 +499,21 @@ def matmul(a, b, bias=None, *, variant="shared", tile=32, accumulate="kahan", ou
     return out
 
 
-def gemm_plan(m, n, k):
+def gemm_plan(m, n, k, *, layout=None):
     """Tile (``GEMM_TILES``) and split-K slices the register engine uses for an (m, n) output over k."""
     if min(m, n, k) <= 0:
         raise ValueError("gemm dimensions must be positive")
+    if layout is not None and os.environ.get("MYFLOWS_GEMM_AUTOTUNE") == "1":
+        from .autotune import selected_plan
+        tile, requested = selected_plan(layout, m, n, k)
+        return tile, _slices(k, requested)
     lib = _library()
     shape, slices = ctypes.c_int(), ctypes.c_int()
     _check(lib.mf_gemm_plan(_i32(m), _i32(n), _i32(k), ctypes.byref(shape), ctypes.byref(slices)), lib)
     return GEMM_TILES[shape.value], slices.value
 
 
-def gemm(a, b, bias=None, *, trans_a=False, trans_b=False, engine="register", out=None):
+def gemm(a, b, bias=None, *, trans_a=False, trans_b=False, engine="register", out=None, plan=None):
     """Row-major ``op(a) @ op(b) (+ bias)`` on a GEMM engine of the native layers.
 
     ``op(a)`` is ``a.T`` when ``trans_a`` (``a`` stored K x M), ``op(b)`` is ``b.T`` when
@@ -508,7 +542,13 @@ def gemm(a, b, bias=None, *, trans_a=False, trans_b=False, engine="register", ou
     elif not isinstance(out, cp.ndarray) or out.dtype != cp.float32 or out.shape != (m, n) or not out.flags.c_contiguous:
         raise ValueError("out must be a contiguous CuPy float32 array of the result shape")
     lib = _library()
-    workspace, floats = _workspace(lib, engine, (m, n, k))
+    if plan is not None:
+        if engine != GEMM_ENGINES["register"]:
+            raise ValueError("explicit tiles require the register engine")
+        engine = _plan_code(*plan)
+    else:
+        engine = _choose_engine(engine, "TN" if trans_a else "NT" if trans_b else "NN", m, n, k)
+    workspace, floats = _workspace(lib, (engine, m, n, k))
     _check(lib.mf_gemm(
         _i32(engine), _i32(trans_a), _i32(trans_b), _u64(a.data.ptr), _u64(b.data.ptr),
         _u64(bias.data.ptr if bias is not None else 0), _u64(out.data.ptr), _i32(m), _i32(n), _i32(k),

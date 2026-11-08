@@ -1023,6 +1023,7 @@ constexpr GemmShape GEMM_SHAPES[] = {{128, 128}, {128, 64}, {256, 32}, {64, 128}
 constexpr int GEMM_BK = 16;
 constexpr int GEMM_MIN_CHUNK = 64;
 constexpr int GEMM_MAX_SLICES = 32;
+constexpr int EXPLICIT_PLAN_BASE = 16;
 
 struct GemmPlan {
     int shape, slices, k_chunk;
@@ -1064,6 +1065,14 @@ int gemm_rows(int engine, CUstream stream, bool trans_a, bool trans_b, int M, in
                     N, M, K, b, ldb, a, lda, c, ldc, line);
     if (trans_a && trans_b) return fail(MF_ERR_ARG, line, "the register engine has no A^T B^T kernel");
     GemmPlan plan = gemm_plan(M, N, K);
+    if (engine >= EXPLICIT_PLAN_BASE) {
+        const int code = engine - EXPLICIT_PLAN_BASE;
+        const int requested = code % GEMM_MAX_SLICES + 1;
+        const auto rounded = ((static_cast<std::int64_t>(K) + requested - 1) / requested +
+                              GEMM_BK - 1) / GEMM_BK * GEMM_BK;
+        const int chunk = static_cast<int>(std::min<std::int64_t>(K, rounded));
+        plan = GemmPlan{code / GEMM_MAX_SLICES, static_cast<int>((static_cast<std::int64_t>(K)+chunk-1)/chunk), chunk};
+    }
     if (plan.slices > 1 && (!workspace || workspace_floats < static_cast<std::int64_t>(plan.slices) * M * N))
         plan = GemmPlan{plan.shape, 1, K};
     const bool split = plan.slices > 1;
@@ -1115,8 +1124,9 @@ int check_conv(const ConvDims& d, int line) {
 }
 
 int check_engine(int engine, int line) {
-    if (engine != ENGINE_CUBLAS && engine != ENGINE_REGISTER)
-        return fail(MF_ERR_ARG, line, "GEMM engine must be 0 (cuBLAS) or 1 (register-tiled)");
+    if (engine != ENGINE_CUBLAS && engine != ENGINE_REGISTER &&
+        !(engine >= EXPLICIT_PLAN_BASE && engine < EXPLICIT_PLAN_BASE + 5 * GEMM_MAX_SLICES))
+        return fail(MF_ERR_ARG, line, "unknown GEMM engine or register plan");
     return MF_OK;
 }
 
@@ -1182,17 +1192,18 @@ MF_API int mf_conv_forward(
 
 // Backward: dyT = gate(dy) transposed to (M, CO) with FP64 bias partials, dW = dyT^T cols,
 // grad_cols = dyT W, dx = col2im(grad_cols). dx/grad_cols and partial/db are optional (0).
-MF_API int mf_conv_backward(
+MF_API int mf_conv_backward_plans(
     std::uint64_t weight, std::uint64_t dy, std::uint64_t y, std::uint64_t cols,
     std::uint64_t dyT, std::uint64_t dw, std::uint64_t grad_cols, std::uint64_t dx,
     std::uint64_t partial, std::uint64_t db, int N, int CI, int H, int W, int CO, int KH, int KW,
     int OH, int OW, int SH, int SW, int PH, int PW, int grid_x, int activation, float alpha,
-    int engine, std::uint64_t workspace, std::int64_t workspace_floats, std::uint64_t stream_ptr) {
+    int engine, int input_engine, std::uint64_t workspace, std::int64_t workspace_floats, std::uint64_t stream_ptr) {
     MF_TRY(check_ready());
     const ConvDims d{N, CI, H, W, CO, KH, KW, OH, OW, SH, SW, PH, PW};
     MF_TRY(check_conv(d, __LINE__));
     MF_TRY(check_activation(activation, alpha, __LINE__));
     MF_TRY(check_engine(engine, __LINE__));
+    MF_TRY(check_engine(input_engine, __LINE__));
     const bool direct_dx = dx && !dw && !db;
     MF_REQUIRE(weight && dy, "conv backward requires weight and dy");
     MF_REQUIRE(!dw || (cols && dyT), "dW requires cols and transposed dy");
@@ -1228,15 +1239,26 @@ MF_API int mf_conv_backward(
         for (int n = 0; n < N; ++n) {
             auto image = dy + static_cast<std::uint64_t>(n) * CO * OHW * sizeof(float);
             auto grad_image = grad_cols + static_cast<std::uint64_t>(n) * OHW * K * sizeof(float);
-            MF_TRY(gemm_rows(engine, stream, true, false, OHW, K, CO, image, OHW, weight, K, grad_image, K,
+            MF_TRY(gemm_rows(input_engine, stream, true, false, OHW, K, CO, image, OHW, weight, K, grad_image, K,
                              workspace, workspace_floats, __LINE__));
         }
     } else {
-        MF_TRY(gemm_rows(engine, stream, false, false, M, K, CO, dyT, CO, weight, K, grad_cols, K, workspace,
+        MF_TRY(gemm_rows(input_engine, stream, false, false, M, K, CO, dyT, CO, weight, K, grad_cols, K, workspace,
                          workspace_floats, __LINE__));
     }
     void* args[] = {&grad_cols, &dx, &N, &CI, &H, &W, &KH, &KW, &OH, &OW, &SH, &SW, &PH, &PW};
     return launch(K_COL2IM, blocks_for(static_cast<std::int64_t>(N) * CI * H * W, 256), 1, 1, 256, 1, stream, args, __LINE__);
+}
+
+MF_API int mf_conv_backward(
+    std::uint64_t weight, std::uint64_t dy, std::uint64_t y, std::uint64_t cols, std::uint64_t dyT,
+    std::uint64_t dw, std::uint64_t grad_cols, std::uint64_t dx, std::uint64_t partial, std::uint64_t db,
+    int N, int CI, int H, int W, int CO, int KH, int KW, int OH, int OW, int SH, int SW, int PH, int PW,
+    int grid_x, int activation, float alpha, int engine, std::uint64_t workspace, std::int64_t workspace_floats,
+    std::uint64_t stream_ptr) {
+    return mf_conv_backward_plans(weight, dy, y, cols, dyT, dw, grad_cols, dx, partial, db, N, CI, H, W,
+                                  CO, KH, KW, OH, OW, SH, SW, PH, PW, grid_x, activation, alpha, engine, engine,
+                                  workspace, workspace_floats, stream_ptr);
 }
 
 MF_API int mf_pool_forward(
