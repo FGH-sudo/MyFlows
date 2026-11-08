@@ -93,11 +93,13 @@ class Conv2D(Layer):
         dtype=None,
         backend="auto",
         bias=True,
+        recompute_im2col=None,
     ):
         super().__init__(name=name)
 
         from ..ops.convolution import _backend_name
         self.backend = _backend_name(backend)
+        self.recompute_im2col = recompute_im2col
         in_channels = _positive_int(in_channels, "in_channels")
         out_channels = _positive_int(out_channels, "out_channels")
         groups = _positive_int(groups, "groups")
@@ -147,6 +149,7 @@ class Conv2D(Layer):
                         dilation=self.dilation,
                         bias=self.b,
                         backend=self.backend,
+                        recompute_im2col=self.recompute_im2col,
                     )
                     return conv_out
             except Exception:
@@ -162,6 +165,7 @@ class Conv2D(Layer):
             dilation=self.dilation,
             bias=self.b,
             backend=self.backend,
+            recompute_im2col=self.recompute_im2col,
         )
         return self.activation(conv_out) if self.activation else conv_out
 

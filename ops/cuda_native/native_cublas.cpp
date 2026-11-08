@@ -1091,6 +1091,13 @@ struct ConvDims {
     int N, CI, H, W, CO, KH, KW, OH, OW, SH, SW, PH, PW;
 };
 
+int launch_im2col(std::uint64_t x, std::uint64_t cols, ConvDims d, CUstream stream) {
+    void* args[] = {&x, &cols, &d.N, &d.CI, &d.H, &d.W, &d.KH, &d.KW, &d.OH, &d.OW,
+                    &d.SH, &d.SW, &d.PH, &d.PW};
+    std::int64_t elements = static_cast<std::int64_t>(d.N) * d.OH * d.OW * d.CI * d.KH * d.KW;
+    return launch(K_IM2COL, blocks_for(elements, 256), 1, 1, 256, 1, stream, args, __LINE__);
+}
+
 int check_conv(const ConvDims& d, int line) {
     const bool positive = d.N > 0 && d.CI > 0 && d.H > 0 && d.W > 0 && d.CO > 0 && d.KH > 0 &&
                           d.KW > 0 && d.OH > 0 && d.OW > 0 && d.SH > 0 && d.SW > 0 && d.PH >= 0 && d.PW >= 0;
@@ -1140,6 +1147,16 @@ MF_API int mf_init(const char* cublas_path, const char* nvrtc_path, const char* 
 }
 
 // Forward: im2col, rows = cols W^T (GEMM engine), then the NCHW epilogue (bias + activation).
+MF_API int mf_conv_im2col(std::uint64_t x, std::uint64_t cols, int N, int CI, int H, int W,
+                         int CO, int KH, int KW, int OH, int OW, int SH, int SW, int PH, int PW,
+                         std::uint64_t stream_ptr) {
+    MF_TRY(check_ready());
+    const ConvDims d{N, CI, H, W, CO, KH, KW, OH, OW, SH, SW, PH, PW};
+    MF_TRY(check_conv(d, __LINE__));
+    MF_REQUIRE(x && cols, "im2col requires input and output buffers");
+    return launch_im2col(x, cols, d, reinterpret_cast<CUstream>(stream_ptr));
+}
+
 // engine: 0 cuBLAS, 1 register-tiled, with an optional split-K workspace (see mf_gemm).
 MF_API int mf_conv_forward(
     std::uint64_t x, std::uint64_t weight, std::uint64_t bias, std::uint64_t cols,
@@ -1156,10 +1173,7 @@ MF_API int mf_conv_forward(
     const int M = N * OH * OW;
     const int K = CI * KH * KW;
     int OHW = OH * OW;
-    {
-        void* args[] = {&x, &cols, &N, &CI, &H, &W, &KH, &KW, &OH, &OW, &SH, &SW, &PH, &PW};
-        MF_TRY(launch(K_IM2COL, blocks_for(static_cast<std::int64_t>(M) * K, 256), 1, 1, 256, 1, stream, args, __LINE__));
-    }
+    MF_TRY(launch_im2col(x, cols, d, stream));
     MF_TRY(gemm_rows(engine, stream, false, true, M, CO, K, cols, K, weight, K, rows, CO, workspace,
                      workspace_floats, __LINE__));
     void* args[] = {&rows, &bias, &y, &OHW, &CO, &activation, &alpha};

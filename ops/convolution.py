@@ -1,4 +1,5 @@
 from functools import cache
+import os
 
 from ..core.device import _lazy_cupy, xp, get_device
 from ..core.node import GradientOp
@@ -290,7 +291,8 @@ class Conv2D_Op(GradientOp):
     def _activation_alpha(self):
         return 0.0
 
-    def __init__(self, x, kernel, stride=1, padding=0, groups=1, dilation=1, bias=None, backend="auto"):
+    def __init__(self, x, kernel, stride=1, padding=0, groups=1, dilation=1, bias=None, backend="auto",
+                 recompute_im2col=None):
         # x: 图像, kernel: 卷积核；可选 bias 与输出通道对齐，前向融合加偏置（减少 Add 节点）
         if bias is None:
             super().__init__(x, kernel)
@@ -306,6 +308,8 @@ class Conv2D_Op(GradientOp):
         self.groups = _normalize_groups(groups)
         self.dilation = _normalize_pair(dilation, "dilation")
         self._im2col_contexts = []
+        self.recompute_im2col = (os.environ.get("MYFLOWS_RECOMPUTE_IM2COL") == "1"
+                                 if recompute_im2col is None else bool(recompute_im2col))
         self._activation_fused = False
 
     def _validate_kernel(self, x_val, kernel_val):
@@ -337,7 +341,7 @@ class Conv2D_Op(GradientOp):
                 activation=activation, alpha=self._activation_alpha(),
                 engine=NATIVE_BACKENDS[self.actual_backend])
             self._activation_fused = activation is not None
-            self._cuda_im2col_cols = cols if self.parents[1].requires_grad else None
+            self._cuda_im2col_cols = cols if self.parents[1].requires_grad and not self.recompute_im2col else None
             self._cuda_inputs = (x_val, kernel_val) if self.requires_grad else None
             return
         # x_val: (N, C_in, H, W), kernel_val: (C_out, C_in, kH, kW)
@@ -368,6 +372,7 @@ class Conv2D_Op(GradientOp):
         out_channels_per_group = C_out // self.groups
         self.cols = []
         self.kernel_cols = []
+        self._recompute_input = x_val if self.recompute_im2col and self.parents[1].requires_grad else None
         outputs = []
 
         for group_index in range(self.groups):
@@ -387,7 +392,7 @@ class Conv2D_Op(GradientOp):
             group_out = cols @ group_kernel_cols.T
             out_H, out_W = context["output_size"]
 
-            if self.parents[1].requires_grad:
+            if self.parents[1].requires_grad and not self.recompute_im2col:
                 self.cols.append(cols)
             if self.parents[0].requires_grad:
                 self.kernel_cols.append(group_kernel_cols)
@@ -415,7 +420,7 @@ class Conv2D_Op(GradientOp):
                                     need_bias_grad=need_b, need_weight_grad=need_w, need_input_grad=need_x,
                                     activation=self._fused_activation() if self._activation_fused else None,
                                     alpha=self._activation_alpha(), output=self.value,
-                                    engine=NATIVE_BACKENDS[self.actual_backend])
+                                    engine=NATIVE_BACKENDS[self.actual_backend], recompute_cols=self.recompute_im2col)
             for parent, grad in zip(self.parents, grads):
                 if grad is not None:
                     parent.accumulate_grad(grad, owned=True)
@@ -449,7 +454,13 @@ class Conv2D_Op(GradientOp):
 
             grad_y = self.grad[:, out_start:out_end].transpose(0, 2, 3, 1).reshape(-1, out_channels_per_group)
             if need_w:
-                grad_w = (grad_y.T @ self.cols[group_index]).reshape(kernel_node.value[out_start:out_end].shape)
+                if self.recompute_im2col:
+                    cols, _, _ = im2col(self._recompute_input[:, in_start:in_end], kernel_node.value.shape[2:],
+                                        stride=self.stride, padding=self.padding, dilation=self.dilation,
+                                        context=self._im2col_contexts[group_index])
+                else:
+                    cols = self.cols[group_index]
+                grad_w = (grad_y.T @ cols).reshape(kernel_node.value[out_start:out_end].shape)
                 if dw is None:
                     kernel_node.accumulate_grad(grad_w, owned=True)
                 elif add_w:

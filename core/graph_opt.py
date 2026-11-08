@@ -297,6 +297,7 @@ def fuse_conv_activation_ops(target_node: Node) -> tuple[Node, int]:
                 fused_node = Conv2D_ReLU_Op(
                     x,
                     kernel,
+                    recompute_im2col=parent.recompute_im2col,
                     stride=parent.stride,
                     padding=parent.padding,
                     groups=parent.groups,
@@ -308,6 +309,7 @@ def fuse_conv_activation_ops(target_node: Node) -> tuple[Node, int]:
                 fused_node = Conv2D_LeakyReLU_Op(
                     x,
                     kernel,
+                    recompute_im2col=parent.recompute_im2col,
                     stride=parent.stride,
                     padding=parent.padding,
                     groups=parent.groups,

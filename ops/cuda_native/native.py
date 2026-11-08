@@ -117,6 +117,8 @@ def _configure(lib):
     lib.mf_set_debug_sync.restype = None
     lib.mf_conv_forward.argtypes = [u64] * 6 + [i32] * 13 + [i32, f32, i32, u64, i64, u64]
     lib.mf_conv_forward.restype = i32
+    lib.mf_conv_im2col.argtypes = [u64, u64] + [i32] * 13 + [u64]
+    lib.mf_conv_im2col.restype = i32
     lib.mf_conv_backward.argtypes = [u64] * 10 + [i32] * 13 + [i32, i32, f32, i32, u64, i64, u64]
     lib.mf_conv_backward.restype = i32
     lib.mf_pool_forward.argtypes = [u64] * 3 + [i32] * 10 + [u64]
@@ -322,18 +324,24 @@ def conv2d_forward(x, weight, bias=None, *, stride=(1, 1), padding=(0, 0), activ
 
 def conv2d_backward(x, weight, grad_y, cols, *, stride=(1, 1), padding=(0, 0), need_bias_grad=True,
                     need_input_grad=True, need_weight_grad=True, activation=None, alpha=0.0, output=None,
-                    engine="register"):
+                    engine="register", recompute_cols=False):
     """Return (dx, dw, db) with None for each unrequested gradient. Only dW needs forward cols."""
     cp = _lazy_cupy()
     engine = _engine(engine)
     x, weight, grad_y = _array(x, "x"), _array(weight, "weight"), _array(grad_y, "grad_y")
-    cols = _array(cols, "cols") if need_weight_grad else None
     dims = _dims(x, weight, stride, padding)
     act, alpha = _activation(activation, alpha)
     n, ci, h, w, co, kh, kw, oh, ow, sh, sw, ph, pw = dims
     if grad_y.shape != (n, co, oh, ow):
         raise ValueError("grad_y shape does not match convolution output")
     m, k = n * oh * ow, ci * kh * kw
+    if need_weight_grad and recompute_cols:
+        cols = cp.empty((m, k), dtype=cp.float32)
+        lib = _library()
+        _check(lib.mf_conv_im2col(_u64(x.data.ptr), _u64(cols.data.ptr), *[_i32(v) for v in dims],
+                                  _u64(cp.cuda.get_current_stream().ptr)), lib)
+    else:
+        cols = _array(cols, "cols") if need_weight_grad else None
     if cols is not None and cols.shape != (m, k):
         raise ValueError("cols shape does not match convolution input")
     gate = None

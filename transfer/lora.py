@@ -116,10 +116,12 @@ class LoRAConv2d(Layer):
             "padding": base.padding,
             "dilation": base.dilation,
             "backend": base.backend,
+            "recompute_im2col": base.recompute_im2col,
         }
         value = Conv2D_Op(x, self.kernel, bias=self.b, **common)
         low = Conv2D_Op(x, self.A, **common)
-        value = _Residual(value, Conv2D_Op(low, self.B, backend=base.backend), self.scale)
+        high = Conv2D_Op(low, self.B, backend=base.backend, recompute_im2col=base.recompute_im2col)
+        value = _Residual(value, high, self.scale)
         return base.activation(value) if base.activation else value
 
     def merge(self):
