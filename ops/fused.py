@@ -448,6 +448,15 @@ def softmax_cross_entropy_grad(probs, labels, targets):
 # ---------------------------------------------------------------------------------------------
 # Adam
 # ---------------------------------------------------------------------------------------------
+_ADAM_UPDATE = """
+    const float gs = scale == 1.f ? g : __fmul_rn(g, scale);
+    m = __fadd_rn(__fmul_rn(b1, m), __fmul_rn(omb1, gs));
+    v = __fadd_rn(__fmul_rn(b2, v), __fmul_rn(omb2, __fmul_rn(gs, gs)));
+    const float denom = __fadd_rn(__fsqrt_rn(__fdiv_rn(v, bc2)), eps);
+    p = __fsub_rn(p, __fdiv_rn(__fmul_rn(lr, __fdiv_rn(m, bc1)), denom));
+"""
+
+
 @cache
 def _adam_kernel():
     # Each operation rounds explicitly, in the order of the NumPy fallback below.
@@ -455,19 +464,16 @@ def _adam_kernel():
         "float32 g, float32 scale, float32 b1, float32 omb1, float32 b2, float32 omb2, "
         "float32 bc1, float32 bc2, float32 lr, float32 eps",
         "float32 p, float32 m, float32 v",
-        """
-        const float gs = scale == 1.f ? g : __fmul_rn(g, scale);
-        m = __fadd_rn(__fmul_rn(b1, m), __fmul_rn(omb1, gs));
-        v = __fadd_rn(__fmul_rn(b2, v), __fmul_rn(omb2, __fmul_rn(gs, gs)));
-        const float denom = __fadd_rn(__fsqrt_rn(__fdiv_rn(v, bc2)), eps);
-        p = __fsub_rn(p, __fdiv_rn(__fmul_rn(lr, __fdiv_rn(m, bc1)), denom));
-        """,
+        _ADAM_UPDATE,
         "mf_adam_step")
 
 
-def adam_update(param, grad, m, v, *, lr, beta1, beta2, eps, step, grad_scale=1.0):
+def adam_update(param, grad, m, v, *, lr, beta1, beta2, eps, step, grad_scale=1.0, weight_decay=0.0):
     """One textbook Adam step (zero-initialized moments, bias-corrected) applied in place."""
     dtype = param.dtype.type
+    if weight_decay:
+        grad = grad * grad_scale + weight_decay * param
+        grad_scale = 1.
     bc1, bc2 = 1.0 - beta1 ** step, 1.0 - beta2 ** step
     scalars = [dtype(value) for value in (grad_scale, beta1, 1.0 - beta1, beta2, 1.0 - beta2, bc1, bc2, lr, eps)]
     if _on_gpu(param, grad, m, v) and _same_float32(param, grad, m, v):
@@ -482,6 +488,94 @@ def adam_update(param, grad, m, v, *, lr, beta1, beta2, eps, step, grad_scale=1.
     denom = _sqrt(v / bc2)
     denom += eps
     param -= (lr * (m / bc1)) / denom
+
+
+_ADAM_DESCRIPTOR = np.dtype([(k, np.uint64) for k in ("p", "g", "m", "v", "size", "end_block")]
+                            + [(k, np.float32) for k in ("lr", "decay", "bc1", "bc2")], align=True)
+
+
+@cache
+def _multi_adam_kernel():
+    code = r"""
+    struct Update {
+        float *p; const float *g; float *m; float *v;
+        unsigned long long size, end_block;
+        float lr, decay, bc1, bc2;
+    };
+    static_assert(sizeof(Update) == 64, "Adam metadata layout");
+    extern "C" __global__ void mf_multi_adam(const Update *items, int count, float grad_scale,
+                                             float b1, float omb1, float b2, float omb2, float eps) {
+        __shared__ int owner;
+        if (threadIdx.x == 0) {
+            int left = 0, right = count-1;
+            while (left < right) {
+                int mid = left + (right-left)/2;
+                if (blockIdx.x < items[mid].end_block) right = mid;
+                else left = mid+1;
+            }
+            owner = left;
+        }
+        __syncthreads();
+        const Update u = items[owner];
+        const auto begin = owner ? items[owner-1].end_block : 0ULL;
+        const auto i = (blockIdx.x - begin) * blockDim.x + threadIdx.x;
+        if (i >= u.size) return;
+        float p = u.p[i], m = u.m[i], v = u.v[i], g = u.g[i], scale = grad_scale;
+        if (u.decay != 0.f) {
+            g = __fadd_rn(__fmul_rn(g, scale), __fmul_rn(u.decay, p));
+            scale = 1.f;
+        }
+        const float lr = u.lr, bc1 = u.bc1, bc2 = u.bc2;
+    """ + _ADAM_UPDATE + """
+        u.p[i] = p; u.m[i] = m; u.v[i] = v;
+    }
+    """
+    return _lazy_cupy().RawKernel(code, "mf_multi_adam", options=("--std=c++17",))
+
+
+def _multi_adam_table(updates, beta1, beta2):
+    """Return descriptors for independent, contiguous FP32 buffers on the active CUDA device."""
+    cp = _lazy_cupy()
+    device = cp.cuda.runtime.getDevice()
+    rows, spans = [], []
+    blocks = 0
+    for p, g, m, v, lr, decay, step in updates:
+        ptrs = []
+        for index, a in enumerate((p, g, m, v)):
+            if (not isinstance(a, cp.ndarray) or a.dtype != np.float32 or a.shape != p.shape
+                    or not a.flags.c_contiguous or a.device.id != device):
+                return None
+            ptr = a.data.ptr
+            ptrs.append(ptr)
+            if a.size:
+                spans.append((ptr, ptr+a.nbytes, index != 1))
+        if p.size:
+            blocks += (p.size+255)//256
+            rows.append((*ptrs, p.size, blocks, lr, decay, 1.-beta1**step, 1.-beta2**step))
+    # Shared storage may have an intentionally ordered scalar update. Preserve that order on fallback.
+    end, write_end = 0, 0
+    for start, stop, writable in sorted(spans):
+        if start < write_end or writable and start < end:
+            return None
+        end = max(end, stop)
+        if writable:
+            write_end = stop
+    return np.array(rows, dtype=_ADAM_DESCRIPTOR), blocks
+
+
+def adam_update_many(updates, *, beta1, beta2, eps, grad_scale):
+    table = _multi_adam_table(updates, beta1, beta2)
+    if table is None:
+        for p, g, m, v, lr, decay, step in updates:
+            adam_update(p, g, m, v, lr=lr, beta1=beta1, beta2=beta2, eps=eps, step=step,
+                        grad_scale=grad_scale, weight_decay=decay)
+        return
+    host, blocks = table
+    if blocks:
+        # Use an opaque byte array for CuPy versions without structured-dtype support.
+        device_table = _lazy_cupy().asarray(host.view(np.uint8))
+        scalars = tuple(np.float32(v) for v in (grad_scale, beta1, 1.-beta1, beta2, 1.-beta2, eps))
+        _multi_adam_kernel()((blocks,), (256,), (device_table, np.int32(len(host)), *scalars))
 
 
 def _sqrt(array):

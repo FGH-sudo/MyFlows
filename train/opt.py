@@ -1,10 +1,11 @@
 from contextlib import nullcontext
+import os
 
-from ..core.device import xp
+from ..core.device import get_device, xp
 from ..core.node import Variable
 from ..core.graph import Graph
 from ..core.tensor import Tensor
-from ..ops.fused import adam_update
+from ..ops.fused import adam_update, adam_update_many
 from .param_groups import ParameterGroups
 
 class Optimizer:
@@ -216,10 +217,11 @@ class Adam(Optimizer):
     一阶矩 v 与二阶矩 s 从 0 开始，m_t = b1 m + (1 - b1) g，s_t = b2 s + (1 - b2) g^2，
     再按 1 - b^t 修正偏差。旧实现首步直接令 v = g、s = g^2 后仍做偏差修正，首步步长只有
     标准值的约 0.32 倍，且 g_1^2 在 s 中被放大 1000 倍、上千步才衰减。
-    每个参数一次融合更新（GPU 为单个 kernel），CPU 回退与 GPU 的逐步舍入顺序一致。
+    连续且互不冲突的 FP32 CUDA 张量合并为一次更新，CPU 和逐参数路径采用相同的舍入顺序。
     """
 
-    def __init__(self, graph, learning_rate=0.01, beta_1=0.9, beta_2=0.999, eps=1e-8, *, param_groups=None):
+    def __init__(self, graph, learning_rate=0.01, beta_1=0.9, beta_2=0.999, eps=1e-8, *, param_groups=None,
+                 multi_tensor=None):
         super().__init__(graph, learning_rate, param_groups)
         self.beta_1 = beta_1
         self.beta_2 = beta_2
@@ -228,12 +230,15 @@ class Adam(Optimizer):
         self.s = {}  # 二阶矩：历史梯度平方的指数加权平均（RMSProp）
         self.t = 0   # 记录时间步长，用以修正偏差
         self.parameter_steps = {}
+        self.multi_tensor = (os.environ.get("MYFLOWS_MULTI_ADAM", "1") == "1"
+                             if multi_tensor is None else bool(multi_tensor))
 
     def _update(self):
         # 每次更新，时间步长+1
         self.t += 1
         # 平均梯度 = 累加梯度 / 累加次数，作为缩放因子传入融合 kernel，不单独生成新数组
         scale = 1.0 if self.acc_no in (0, 1) else 1.0 / self.acc_no
+        batch = [] if self.multi_tensor and get_device() == "cuda" else None
 
         for node in self.graph.nodes:
             if isinstance(node, Variable) and node.trainable:
@@ -249,8 +254,10 @@ class Adam(Optimizer):
                 step = self.parameter_steps.get(node, self.t - 1) + 1
                 self.parameter_steps[node] = step
                 lr, decay = self.groups.options(node, self.learning_rate)
-                if decay:
-                    grad = grad * scale + decay * node.value
-                adam_update(node.value, grad, self.v[node], self.s[node], lr=lr,
-                            beta1=self.beta_1, beta2=self.beta_2, eps=self.eps, step=step,
-                            grad_scale=1. if decay else scale)
+                if batch is not None:
+                    batch.append((node.value, grad, self.v[node], self.s[node], lr, decay, step))
+                else:
+                    adam_update(node.value, grad, self.v[node], self.s[node], lr=lr, beta1=self.beta_1,
+                                beta2=self.beta_2, eps=self.eps, step=step, grad_scale=scale, weight_decay=decay)
+        if batch:
+            adam_update_many(batch, beta1=self.beta_1, beta2=self.beta_2, eps=self.eps, grad_scale=scale)
