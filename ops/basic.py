@@ -1,5 +1,6 @@
 from ..core.device import xp
 from ..core.node import GradientOp
+from . import precision
 
 class Add(GradientOp):
     def forward(self, a, b):
@@ -52,7 +53,7 @@ class MatMul(GradientOp):
 
 
 LINEAR_BACKENDS = ("auto", "numpy", "cupy", "cuda_native_register", "cuda_native_cublas",
-                   "cuda_native_kahan", "cuda_native_dot2")
+                   "cuda_native_kahan", "cuda_native_dot2", *precision.BACKENDS)
 
 
 def _linear_backend(backend):
@@ -99,6 +100,15 @@ class Linear(GradientOp):
         self.x_shape = x.shape
         self.w_shape = w.shape
         self.b_shape = b.shape
+        if self.backend in precision.BACKENDS:
+            rows = x.reshape(-1, x.shape[-1])
+            packed_x = precision.pack(rows, self.backend)
+            packed_w = precision.pack(w, self.backend)
+            self._packed_x = packed_x if self.parents[1].requires_grad else None
+            self._packed_w = packed_w if self.parents[0].requires_grad else None
+            shape = (*x.shape[:-1], w.shape[-1])
+            self.value = precision.gemm(packed_x, packed_w, self.backend).reshape(shape) + b
+            return
         spec = self._native_spec()
         if spec is None or x.ndim != 2:
             self.value = xp.dot(x, w) + b
@@ -127,6 +137,17 @@ class Linear(GradientOp):
     def backward(self):
         x, w, b = self.parents
         grad = self.grad
+        if self.backend in precision.BACKENDS:
+            if x.requires_grad or w.requires_grad:
+                shape = (*self.x_shape[:-1], self.w_shape[-1])
+                dy = precision.pack(_reduce_to(grad, shape).reshape(-1, shape[-1]), self.backend)
+                if x.requires_grad:
+                    x.accumulate_grad(precision.gemm(dy, self._packed_w, self.backend, trans_b=True).reshape(self.x_shape), owned=True)
+                if w.requires_grad:
+                    w.accumulate_grad(precision.gemm(self._packed_x, dy, self.backend, trans_a=True), owned=True)
+            if b.requires_grad:
+                b.accumulate_grad(_reduce_to(grad, b.value.shape))
+            return
         if grad.ndim == 2:
             if getattr(x, "requires_grad", True):
                 x.accumulate_grad(self._matmul(grad, w.value, trans_b=True), owned=True)

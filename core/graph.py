@@ -121,7 +121,7 @@ class Graph:
                 with self.profiler.node(node, "forward"):
                     node.forward(*inputs)
 
-    def backward(self):
+    def backward(self, loss_scale=1.0):
         self._refresh_gradients()
         if self._forward_active is not None and self._forward_active is not self._active:
             if not self._active.issubset(self._forward_active) or self._forward_groups != self._group_signature:
@@ -131,7 +131,8 @@ class Graph:
         for n in self._clear_nodes:
             n.grad = None
             
-        self.target_node.grad = xp.ones_like(self.target_node.value)
+        self.target_node.grad = (xp.ones_like(self.target_node.value) if loss_scale == 1.0
+                                 else xp.full_like(self.target_node.value, loss_scale))
         
         # 使用预先计算好的反向排序列表
         for node, output in self._backward_nodes:

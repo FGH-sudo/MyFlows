@@ -177,6 +177,7 @@ def _collect_optimizer_arrays(optimizer, param_key_by_id):
     return arrays, {
         "class": optimizer.__class__.__name__,
         "scalars": scalars,
+        "loss_scaler": optimizer.loss_scaler.state_dict() if getattr(optimizer, "loss_scaler", None) else None,
         "states": state_meta,
         "param_groups": optimizer.groups.serialize(param_key_by_id, optimizer.learning_rate) if hasattr(optimizer, "groups") else [],
         "parameter_steps": {param_key_by_id[id(node)]: int(step) for node, step in getattr(optimizer, "parameter_steps", {}).items()
@@ -301,6 +302,9 @@ def load_checkpoint(layers, optimizer=None, filepath="checkpoint"):
         mapping = {saved["key"]: _param_by_live_record(layers, live) for saved, live in zip(saved_params, live_params)}
         opt_meta = metadata.get("optimizer", {})
         ParameterGroups.restore(opt_meta.get("param_groups", []), mapping)
+        if opt_meta.get("loss_scaler") is not None:
+            from ..train.loss_scaling import DynamicLossScaler
+            DynamicLossScaler.from_state(opt_meta["loss_scaler"])
         for key, step in opt_meta.get("parameter_steps", {}).items():
             if key not in mapping or type(step) is not int or step < 0:
                 raise ValueError("invalid optimizer per-parameter step")
@@ -354,6 +358,9 @@ def _param_by_live_record(layers, live_record):
 def _restore_optimizer(optimizer, optimizer_meta, data, saved_key_to_var):
     if optimizer is None:
         return
+    if optimizer_meta.get("loss_scaler") is not None:
+        from ..train.loss_scaling import DynamicLossScaler
+        optimizer.loss_scaler = DynamicLossScaler.from_state(optimizer_meta["loss_scaler"])
 
     for attr, value in optimizer_meta.get("scalars", {}).items():
         if hasattr(optimizer, attr):

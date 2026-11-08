@@ -24,6 +24,7 @@ from ..ops.batchnorm import BatchNorm2d_Op, GlobalAvgPool2d_Op
 from ..ops.activation import ReLU
 from ..ops.convolution import Conv2D_Op, Conv2D_ReLU_Op, Flatten_Op
 from ..ops.basic import Linear
+from ..ops.precision import BACKENDS as PRECISION_BACKENDS
 from .layer import Layer, Conv2D, Dropout
 from ..utils.initializers import make_initializer
 
@@ -224,6 +225,7 @@ class ResNet18(Layer):
             raise ValueError("input_norm must be None or 'imagenet'")
         from ..ops.convolution import _backend_name
         self.conv_backend = _backend_name(conv_backend)
+        self.linear_backend = self.conv_backend if self.conv_backend in PRECISION_BACKENDS else "auto"
         self.stem_type = stem
         self.compat = compat
         self.input_norm = input_norm
@@ -323,7 +325,7 @@ class ResNet18(Layer):
     def forward_head(self, features):
         if hasattr(self, "transfer_head"):
             return self.transfer_head(features)
-        return Linear(features, self.fc_W, self.fc_b)
+        return Linear(features, self.fc_W, self.fc_b, backend=self.linear_backend)
 
     def forward(self, input_node):
         self._last_transfer_features = self.forward_features(input_node)

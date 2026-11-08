@@ -10,6 +10,7 @@ from ..core.dtype import resolve_dtype
 from ..core.node import Variable
 from ..ops.activation import ReLU, ReLU6
 from ..ops.basic import Add, Linear
+from ..ops.precision import BACKENDS as PRECISION_BACKENDS
 from ..ops.batchnorm import GlobalAvgPool2d_Op
 from ..ops.convolution import Flatten_Op, MaxPool2d_Op
 from ..ops.pooling import AdaptiveAvgPool2d_Op, ChannelNormalize_Op
@@ -116,6 +117,7 @@ class MobileNetV2(Layer):
         super().__init__(name=name)
         from ..ops.convolution import _backend_name
         self.conv_backend = _backend_name(conv_backend)
+        self.linear_backend = self.conv_backend if self.conv_backend in PRECISION_BACKENDS else "auto"
         self.input_norm = _check_input_norm(input_norm)
         self.output_dim = int(output_dim)
         self.stem = ConvBNAct(3, 32, kernel_size=3, stride=2, initializer=initializer, conv_backend=self.conv_backend)
@@ -161,7 +163,7 @@ class MobileNetV2(Layer):
     def forward_head(self, features):
         if hasattr(self, "transfer_head"):
             return self.transfer_head(features)
-        return Linear(features, self.fc_W, self.fc_b)
+        return Linear(features, self.fc_W, self.fc_b, backend=self.linear_backend)
 
     def forward(self, x):
         self._last_transfer_features = self.forward_features(x)
@@ -206,6 +208,7 @@ class AlexNet(Layer):
         super().__init__(name=name)
         from ..ops.convolution import _backend_name
         self.conv_backend = _backend_name(conv_backend)
+        self.linear_backend = self.conv_backend if self.conv_backend in PRECISION_BACKENDS else "auto"
         self.input_norm = _check_input_norm(input_norm)
         self.output_dim = int(output_dim)
         self.convs = []
@@ -234,16 +237,16 @@ class AlexNet(Layer):
         x = Flatten_Op(AdaptiveAvgPool2d_Op(x, (6, 6)))
         if self.dropouts:
             x = self.dropouts[0](x)
-        x = ReLU(Linear(x, self.fc6_W, self.fc6_b))
+        x = ReLU(Linear(x, self.fc6_W, self.fc6_b, backend=self.linear_backend))
         if self.dropouts:
             x = self.dropouts[1](x)
-        x = ReLU(Linear(x, self.fc7_W, self.fc7_b))
+        x = ReLU(Linear(x, self.fc7_W, self.fc7_b, backend=self.linear_backend))
         return self.transfer_adapter(x) if hasattr(self, "transfer_adapter") else x
 
     def forward_head(self, features):
         if hasattr(self, "transfer_head"):
             return self.transfer_head(features)
-        return Linear(features, self.fc_W, self.fc_b)
+        return Linear(features, self.fc_W, self.fc_b, backend=self.linear_backend)
 
     def forward(self, x):
         self._last_transfer_features = self.forward_features(x)

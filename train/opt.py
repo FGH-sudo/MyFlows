@@ -23,6 +23,7 @@ class Optimizer:
         self.acc_gradient = {}  # 累加梯度的字典
         self.acc_no = 0  # 累加次数
         self.groups = ParameterGroups(param_groups, graph.nodes)
+        self.loss_scaler = None
 
     def set_param_groups(self, groups):
         self.groups = ParameterGroups(groups, self.graph.nodes)
@@ -96,7 +97,10 @@ class Optimizer:
             self.apply_gradients(var_gradients, summarize=False)
 
         # 调用子类实现的具体更新逻辑
-        self._update()
+        if self.loss_scaler is None or not self.loss_scaler.overflow:
+            self._update()
+        if self.loss_scaler is not None:
+            self.loss_scaler.finish()
 
         # 清空累积梯度和次数
         self.acc_gradient.clear()
@@ -113,7 +117,16 @@ class Optimizer:
 
         with (timer("backward") if timer else nullcontext()):
             # 反向传播
-            self.graph.backward()
+            if self.loss_scaler is None:
+                self.graph.backward()
+            else:
+                self.graph.backward(loss_scale=self.loss_scaler.scale)
+                parameters = [p for p in self.graph.nodes if p.trainable and p.grad is not None]
+                if not self.loss_scaler.unscale(p.grad for p in parameters):
+                    self.acc_gradient.clear()
+                    for p in parameters:
+                        p.grad = None
+                    return
             self._accumulate_gradients()
 
     def _accumulate_gradients(self):
@@ -221,7 +234,7 @@ class Adam(Optimizer):
     """
 
     def __init__(self, graph, learning_rate=0.01, beta_1=0.9, beta_2=0.999, eps=1e-8, *, param_groups=None,
-                 multi_tensor=None):
+                 multi_tensor=None, loss_scaler="auto"):
         super().__init__(graph, learning_rate, param_groups)
         self.beta_1 = beta_1
         self.beta_2 = beta_2
@@ -230,6 +243,11 @@ class Adam(Optimizer):
         self.s = {}  # 二阶矩：历史梯度平方的指数加权平均（RMSProp）
         self.t = 0   # 记录时间步长，用以修正偏差
         self.parameter_steps = {}
+        if loss_scaler == "auto":
+            from ..ops.precision import MIXED
+            from .loss_scaling import DynamicLossScaler
+            loss_scaler = DynamicLossScaler() if any(getattr(n, "backend", None) in MIXED for n in graph.nodes) else None
+        self.loss_scaler = loss_scaler
         self.multi_tensor = (os.environ.get("MYFLOWS_MULTI_ADAM", "1") == "1"
                              if multi_tensor is None else bool(multi_tensor))
 

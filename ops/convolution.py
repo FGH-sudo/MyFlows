@@ -3,6 +3,7 @@ import os
 
 from ..core.device import _lazy_cupy, xp, get_device
 from ..core.node import GradientOp
+from . import precision
 
 
 # 原生 CUDA 后端 -> GEMM 引擎：im2col/col2im、尾处理与池化都是项目自己的 kernel，卷积的三个 GEMM 用
@@ -11,15 +12,15 @@ NATIVE_BACKENDS = {"cuda_native_register": "register", "cuda_native_cublas": "cu
 
 
 def _backend_name(backend):
-    if backend not in ("auto", "numpy", "cupy", *NATIVE_BACKENDS):
-        raise ValueError("backend must be auto, numpy, cupy, cuda_native_register or cuda_native_cublas")
+    if backend not in ("auto", "numpy", "cupy", "winograd", *NATIVE_BACKENDS, *precision.BACKENDS):
+        raise ValueError(f"unknown convolution backend: {backend}")
     return backend
 
 
 def _resolve_backend(backend, *arrays):
     device = get_device()
     actual = ("numpy" if device == "cpu" else "cupy") if backend == "auto" else backend
-    if (actual == "numpy") != (device == "cpu"):
+    if actual != "winograd" and (actual == "numpy") != (device == "cpu"):
         raise ValueError(f"backend={actual} is incompatible with device={device}")
     for value in arrays:
         if value is not None and not isinstance(value, xp.ndarray):
@@ -330,6 +331,19 @@ class Conv2D_Op(GradientOp):
     def forward(self, x_val, kernel_val, bias_val=None):
         self.actual_backend = _resolve_backend(self.backend, x_val, kernel_val, bias_val)
         self._activation_fused = False
+        if self.actual_backend == "winograd":
+            if self.groups == 1 and self.stride == self.dilation == (1, 1) and kernel_val.shape[2:] == (3, 3):
+                from . import winograd
+                self._validate_kernel(x_val, kernel_val)
+                if self.bias is not None and (bias_val is None or bias_val.shape != (kernel_val.shape[0],)):
+                    raise ValueError("bias shape must be (C_out,)")
+                output, self._winograd = winograd.forward(x_val, kernel_val, self.padding,
+                                                          need_dx=self.parents[0].requires_grad,
+                                                          need_dw=self.parents[1].requires_grad)
+                self.value = output if bias_val is None else output + bias_val.reshape(1,-1,1,1)
+                return
+            self.actual_backend = ("cuda_native_register" if get_device()=="cuda" and x_val.dtype==xp.float32
+                                   and self.groups==1 and self.dilation==(1,1) else _resolve_backend("auto", x_val))
         if self.actual_backend in NATIVE_BACKENDS:
             if self.bias is not None and bias_val is None:
                 raise ValueError("bias value is missing")
@@ -355,7 +369,8 @@ class Conv2D_Op(GradientOp):
             if bias_val.shape != (C_out,):
                 raise ValueError("bias shape must be (C_out,)")
 
-        self._depthwise = self.groups > 1 and self.groups == C_in == C_out
+        mixed_gemm = self.actual_backend in precision.BACKENDS
+        self._depthwise = self.groups > 1 and self.groups == C_in == C_out and not mixed_gemm
         if self._depthwise:
             self.value, self._depthwise_input = depthwise_conv2d_forward(
                 x_val, kernel_val, self.stride, self.padding, self.dilation)
@@ -372,6 +387,9 @@ class Conv2D_Op(GradientOp):
         out_channels_per_group = C_out // self.groups
         self.cols = []
         self.kernel_cols = []
+        if mixed_gemm:
+            x_val = precision.pack(x_val, self.actual_backend)
+            kernel_val = precision.pack(kernel_val, self.actual_backend)
         self._recompute_input = x_val if self.recompute_im2col and self.parents[1].requires_grad else None
         outputs = []
 
@@ -389,7 +407,8 @@ class Conv2D_Op(GradientOp):
             )
             self._im2col_contexts[group_index] = context
             group_kernel_cols = kernel_val[out_start:out_end].reshape(out_channels_per_group, -1)
-            group_out = cols @ group_kernel_cols.T
+            group_out = (precision.gemm(cols, group_kernel_cols, self.actual_backend, trans_b=True)
+                         if mixed_gemm else cols @ group_kernel_cols.T)
             out_H, out_W = context["output_size"]
 
             if self.parents[1].requires_grad and not self.recompute_im2col:
@@ -412,6 +431,17 @@ class Conv2D_Op(GradientOp):
         need_x, need_w = x_node.requires_grad, kernel_node.requires_grad
         need_b = self.bias is not None and self.bias.requires_grad
         if not (need_x or need_w or need_b):
+            return
+        if self.actual_backend == "winograd":
+            from . import winograd
+            if need_x or need_w:
+                dx, dw = winograd.backward(self.grad, self._winograd)
+                if need_x:
+                    x_node.accumulate_grad(dx, owned=True)
+                if need_w:
+                    kernel_node.accumulate_grad(dw, owned=True)
+            if need_b:
+                self.bias.accumulate_grad(self.grad.sum(axis=(0,2,3), dtype=xp.float64), owned=True)
             return
         if self.actual_backend in NATIVE_BACKENDS:
             from .cuda_native.native import conv2d_backward
@@ -448,11 +478,13 @@ class Conv2D_Op(GradientOp):
         # Every group writes a disjoint slab. Allocate once and avoid clearing the buffer on its first write.
         dw, add_w = kernel_node.grad_buffer() if need_w and self.groups > 1 else (None, False)
         dx, add_x = x_node.grad_buffer() if need_x and self.groups > 1 else (None, False)
+        mixed_gemm = self.actual_backend in precision.BACKENDS
+        dy = precision.pack(self.grad, self.actual_backend) if mixed_gemm else self.grad
         for group_index in range(self.groups):
             in_start, in_end = _group_bounds(in_channels, self.groups, group_index)
             out_start, out_end = _group_bounds(out_channels, self.groups, group_index)
 
-            grad_y = self.grad[:, out_start:out_end].transpose(0, 2, 3, 1).reshape(-1, out_channels_per_group)
+            grad_y = dy[:, out_start:out_end].transpose(0, 2, 3, 1).reshape(-1, out_channels_per_group)
             if need_w:
                 if self.recompute_im2col:
                     cols, _, _ = im2col(self._recompute_input[:, in_start:in_end], kernel_node.value.shape[2:],
@@ -460,7 +492,8 @@ class Conv2D_Op(GradientOp):
                                         context=self._im2col_contexts[group_index])
                 else:
                     cols = self.cols[group_index]
-                grad_w = (grad_y.T @ cols).reshape(kernel_node.value[out_start:out_end].shape)
+                grad_w = (precision.gemm(grad_y, cols, self.actual_backend, trans_a=True) if mixed_gemm else grad_y.T @ cols)
+                grad_w = grad_w.reshape(kernel_node.value[out_start:out_end].shape)
                 if dw is None:
                     kernel_node.accumulate_grad(grad_w, owned=True)
                 elif add_w:
@@ -470,7 +503,8 @@ class Conv2D_Op(GradientOp):
             if not need_x:
                 continue
 
-            grad_cols = grad_y @ self.kernel_cols[group_index]
+            weights = self.kernel_cols[group_index]
+            grad_cols = precision.gemm(grad_y, weights, self.actual_backend) if mixed_gemm else grad_y @ weights
             grad_x, context = col2im(
                 grad_cols,
                 (batch_size, in_end - in_start, input_h, input_w),

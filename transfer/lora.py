@@ -168,6 +168,7 @@ def attach_resnet_lora(model, rank, *, alpha=None, seed=0):
         alpha=alpha,
         seed=None if seed is None else seed + len(swaps),
         name="fc",
+        backend=getattr(model, "linear_backend", "auto"),
     )
     model.params.extend((model.transfer_head.A, model.transfer_head.B))
     model._lora_swaps = swaps
