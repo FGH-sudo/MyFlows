@@ -87,7 +87,8 @@ _BN_SOURCE = r"""
 // block reduction is a fixed tree, so results are reproducible.
 template <int MODE>
 __device__ void bn_partials(const float* x, const float* dy, const float* mean, double* partial,
-                            int N, int C, int HW, int chunk, int sum_dy=1, int sum_centered=1) {
+                            int N, int C, int HW, int chunk, int sum_dy=1, int sum_centered=1,
+                            const float* gate=nullptr, float* residual_grad=nullptr, int add_residual=0) {
     __shared__ double sa[256];
     __shared__ double sb[256];
     const int c = blockIdx.x, s = blockIdx.y, slices = gridDim.y;
@@ -100,7 +101,14 @@ __device__ void bn_partials(const float* x, const float* dy, const float* mean, 
         const long long at = ((long long)n * C + c) * HW + hw;
         const double d = (double)x[at] - center;
         if (MODE == 0) { a += d; b = fma(d, d, b); }
-        else { const double g = (double)dy[at]; if (sum_dy) a += g; if (sum_centered) b = fma(g, d, b); }
+        else {
+            const float signal = MODE == 2 && !(gate[at] > 0.f) ? 0.f : dy[at];
+            if (MODE == 2 && residual_grad)
+                residual_grad[at] = add_residual ? residual_grad[at] + signal : signal;
+            const double g = (double)signal;
+            if (sum_dy) a += g;
+            if (sum_centered) b = fma(g, d, b);
+        }
     }
     sa[threadIdx.x] = a;
     sb[threadIdx.x] = b;
@@ -125,6 +133,12 @@ extern "C" __global__ void mf_bn_stats_partials(const float* x, double* partial,
 extern "C" __global__ void mf_bn_grad_partials(const float* x, const float* dy, const float* mean, double* partial,
                                                int N, int C, int HW, int chunk, int sum_dy, int sum_centered) {
     bn_partials<1>(x, dy, mean, partial, N, C, HW, chunk, sum_dy, sum_centered);
+}
+
+extern "C" __global__ void mf_bn_relu_partials(const float* x, const float* dy, const float* mean, double* partial,
+                                               int N, int C, int HW, int chunk, int sum_dy, int sum_centered,
+                                               const float* gate, float* residual_grad, int add_residual) {
+    bn_partials<2>(x, dy, mean, partial, N, C, HW, chunk, sum_dy, sum_centered, gate, residual_grad, add_residual);
 }
 
 // Per channel: batch mean / biased variance, inverse std and the running-stat update. The mean is
@@ -186,18 +200,26 @@ def _bn_module():
 
 
 @cache
-def _bn_normalize_kernel():
+def _bn_normalize_kernel(relu=False, residual=False):
+    inputs = "float32 x, float32 hi, float32 lo, float32 inv_std, float32 gamma, float32 beta"
+    code = "float value = fmaf(((x - hi) - lo) * inv_std, gamma, beta);"
+    if residual:
+        inputs += ", float32 skip"
+        code += "value = __fadd_rn(value, skip);"
+    code += "y = value < 0.f ? 0.f : value;" if relu else "y = value;"
     return _lazy_cupy().ElementwiseKernel(
-        "float32 x, float32 hi, float32 lo, float32 inv_std, float32 gamma, float32 beta", "float32 y",
-        "y = fmaf(((x - hi) - lo) * inv_std, gamma, beta)", "mf_bn_normalize_hilo")
+        inputs, "float32 y", code, f"mf_bn_normalize_{int(relu)}_{int(residual)}")
 
 
 @cache
-def _bn_dx_kernel(add):
+def _bn_dx_kernel(add, gated=False):
     op = "+=" if add else "="
+    inputs = "float32 x, float32 dy, float32 hi, float32 lo, float32 a, float32 k1, float32 k2"
+    inputs += ", float32 gate" if gated else ""
+    signal = "(gate > 0.f ? dy : 0.f)" if gated else "dy"
     return _lazy_cupy().ElementwiseKernel(
-        "float32 x, float32 dy, float32 hi, float32 lo, float32 a, float32 k1, float32 k2", "float32 dx",
-        f"dx {op} a * (dy - k1 - ((x - hi) - lo) * k2)", f"mf_bn_dx_hilo_{int(add)}")
+        inputs, "float32 dx", f"dx {op} a * ({signal} - k1 - ((x - hi) - lo) * k2)",
+        f"mf_bn_dx_hilo_{int(add)}_{int(gated)}")
 
 
 @cache
@@ -226,7 +248,7 @@ def _channel(array):
 
 
 def batchnorm2d_forward(x, gamma, beta, running_mean, running_var, *, momentum, eps, training,
-                        unbiased_running_var=False):
+                        unbiased_running_var=False, relu=False, residual=None):
     """Return ``(y, mean, inv_std)``; updates the running statistics in place when training.
 
     ``mean`` has shape (2, C): the FP64 mean split into ``mean[0] + mean[1]`` (see
@@ -257,8 +279,9 @@ def batchnorm2d_forward(x, gamma, beta, running_mean, running_var, *, momentum, 
         else:
             mean = cp.stack([running_mean, cp.zeros_like(running_mean)])
             inv_std = (1.0 / cp.sqrt(running_var.astype(cp.float64) + eps)).astype(cp.float32)
-        y = _bn_normalize_kernel()(x, _channel(mean[0]), _channel(mean[1]), _channel(inv_std),
-                                   _channel(gamma), _channel(beta))
+        extra = () if residual is None else (residual,)
+        y = _bn_normalize_kernel(relu, residual is not None)(x, _channel(mean[0]), _channel(mean[1]),
+                                                            _channel(inv_std), _channel(gamma), _channel(beta), *extra)
         return y, mean, inv_std
 
     axes = (0, 2, 3)
@@ -275,17 +298,28 @@ def batchnorm2d_forward(x, gamma, beta, running_mean, running_var, *, momentum, 
     mean = module.stack([hi, (mean64 - hi).astype(x.dtype)])
     inv_std = (1.0 / module.sqrt(var64 + eps)).astype(x.dtype)
     y = (((x - _channel(mean[0])) - _channel(mean[1])) * _channel(inv_std)) * _channel(gamma) + _channel(beta)
+    if residual is not None:
+        y = y + residual
+    if relu:
+        y = module.maximum(0, y)
     return y, mean, inv_std
 
 
 def batchnorm2d_backward(x, dy, gamma, mean, inv_std, *, training, x_grad, gamma_grad, beta_grad,
-                         accumulate=(True, True, True)):
+                         accumulate=(True, True, True), gate=None, residual_grad=None, add_residual=False):
     """Accumulate requested gradients. Training-mode dX itself needs the two channel sums."""
     outputs = [g for g in (x_grad, gamma_grad, beta_grad) if g is not None]
-    if not outputs:
-        return
     sum_dy = beta_grad is not None or (training and x_grad is not None)
     sum_centered = gamma_grad is not None or (training and x_grad is not None)
+    if gate is not None and (not (sum_dy or sum_centered) or
+                             residual_grad is not None and not residual_grad.flags.c_contiguous):
+        module = np if isinstance(x, np.ndarray) else _lazy_cupy()
+        dy = module.where(gate > 0, dy, 0)
+        if residual_grad is not None:
+            _store_gradient(residual_grad, dy, add_residual)
+        gate, residual_grad = None, None
+    if not outputs:
+        return
     n, c, h, w = x.shape
     hw = h * w
     count = n * hw
@@ -300,19 +334,28 @@ def batchnorm2d_backward(x, dy, gamma, mean, inv_std, *, training, x_grad, gamma
         partial = cp.empty((c * slices * 2,), dtype=cp.float64)
         coef = cp.empty((3 * c,), dtype=cp.float32) if x_grad is not None else None
         module = _bn_module()
-        module.get_function("mf_bn_grad_partials")((c, slices), (256,), (
-            x, dy, cp.ascontiguousarray(mean), partial, np.int32(n), np.int32(c), np.int32(hw), np.int32(chunk),
-            np.int32(sum_dy), np.int32(sum_centered)))
         pointer = lambda array: array if array is not None else np.uintp(0)
+        gate_args = () if gate is None else (cp.ascontiguousarray(gate), pointer(residual_grad), np.int32(add_residual))
+        partials = "mf_bn_grad_partials" if gate is None else "mf_bn_relu_partials"
+        module.get_function(partials)((c, slices), (256,), (
+            x, dy, cp.ascontiguousarray(mean), partial, np.int32(n), np.int32(c), np.int32(hw), np.int32(chunk),
+            np.int32(sum_dy), np.int32(sum_centered), *gate_args))
         module.get_function("mf_bn_grad_finalize")((-(-c // 128),), (128,), (
             partial, gamma, inv_std, pointer(gamma_grad), pointer(beta_grad), pointer(coef), np.int32(c), np.int32(slices),
             np.float64(count), np.int32(training), np.int32(accumulate[1]), np.int32(accumulate[2])))
         if x_grad is not None:
             a, k1, k2 = (_channel(part) for part in coef.reshape(3, c))
-            _bn_dx_kernel(accumulate[0])(x, dy, _channel(mean[0]), _channel(mean[1]), a, k1, k2, x_grad)
+            extra = () if gate is None else (gate,)
+            _bn_dx_kernel(accumulate[0], gate is not None)(x, dy, _channel(mean[0]), _channel(mean[1]),
+                                                           a, k1, k2, *extra, x_grad)
         return
 
     axes = (0, 2, 3)
+    if gate is not None:
+        module = np if isinstance(x, np.ndarray) else _lazy_cupy()
+        dy = module.where(gate > 0, dy, 0)
+        if residual_grad is not None:
+            _store_gradient(residual_grad, dy, add_residual)
     istd = inv_std.astype(np.float64)
     if sum_dy or sum_centered:
         dy64 = dy.astype(np.float64)

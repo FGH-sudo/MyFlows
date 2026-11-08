@@ -60,6 +60,53 @@ class BatchNorm2d_Op(GradientOp):
             beta_grad=outputs[2][0], accumulate=tuple(add for _, add in outputs))
 
 
+class BatchNormActivation:
+    """Execution unit for BN, optional same-shape residual Add, and ReLU. Logical nodes stay addressable."""
+
+    def __init__(self, bn, add, output, residual):
+        self.bn, self.add, self.output, self.residual = bn, add, output, residual
+        self.hidden = (bn, add) if add is not None else (bn,)
+        self.parents = [*bn.parents] + ([residual] if residual is not None else [])
+        self.name = "BatchNormAddReLU" if add is not None else "BatchNormReLU"
+
+    def forward(self, x, gamma, beta, residual=None):
+        bn = self.bn
+        if gamma.shape != (x.shape[1],) or beta.shape != gamma.shape:
+            raise ValueError("gamma/beta shape must be (C,)")
+        self.fallback = residual is not None and (residual.shape != x.shape or residual.dtype != x.dtype)
+        if self.fallback:
+            # Add also supports broadcasting. Keep its original shape and reduction semantics in this case.
+            bn.forward(x, gamma, beta)
+            self.add.forward(*(p.value for p in self.add.parents))
+            self.output.forward(self.add.value)
+            return
+        self.training = bn.training
+        self.output.value, self.mean, self.inv_std = batchnorm2d_forward(
+            x, gamma, beta, bn.running_mean, bn.running_var, momentum=bn.momentum, eps=bn.eps,
+            training=self.training, unbiased_running_var=bn.unbiased_running_var, relu=True, residual=residual)
+        for node in self.hidden:
+            node.value = None
+        if not bn.requires_grad:
+            self.mean = self.inv_std = None
+
+    def backward(self):
+        bn = self.bn
+        if self.fallback:
+            self.output.backward()
+            self.add.backward()
+            if bn.requires_grad:
+                bn.backward()
+            for node in self.hidden:
+                node.grad = None
+            return
+        grads = [p.grad_buffer() if p.requires_grad else (None, False) for p in self.parents]
+        residual, add_residual = grads[3] if self.residual is not None else (None, False)
+        batchnorm2d_backward(bn.parents[0].value, self.output.grad, bn.parents[1].value, self.mean, self.inv_std,
+                             training=self.training, x_grad=grads[0][0], gamma_grad=grads[1][0], beta_grad=grads[2][0],
+                             accumulate=tuple(add for _, add in grads[:3]), gate=self.output.value,
+                             residual_grad=residual, add_residual=add_residual)
+
+
 class GlobalAvgPool2d_Op(GradientOp):
     """全局平均池化：(N, C, H, W) -> (N, C)。"""
 

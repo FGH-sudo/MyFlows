@@ -90,7 +90,7 @@ class TrainingProfiler:
     def bind_graph(self, graph):
         if not self.nodes_enabled:
             return
-        for index, node in enumerate(graph.sorted_nodes):
+        for index, node in enumerate((*graph.sorted_nodes, *getattr(graph, "_bn_groups", {}).values())):
             for direction in ("forward", "backward"):
                 method = getattr(type(node), direction)
                 label = f"node:{direction}:{index}:{node.name}"

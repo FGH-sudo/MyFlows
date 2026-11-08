@@ -228,6 +228,35 @@ def apply_graph_optimizations(
     return root, stats
 
 
+def batchnorm_activation_groups(nodes):
+    """Match private intermediates. Shared logical nodes and aliases remain separate graph operations."""
+    from collections import Counter
+    from ..ops.activation import ReLU
+    from ..ops.basic import Add
+    from ..ops.batchnorm import BatchNorm2d_Op, BatchNormActivation
+
+    uses = Counter(p for n in nodes for p in n.parents)
+    stats = Counter(id(n.running_mean) for n in nodes if type(n) is BatchNorm2d_Op)
+    groups = {}
+    for output in nodes:
+        if type(output) is not ReLU:
+            continue
+        parent = output.parents[0]
+        add = parent if type(parent) is Add else None
+        if add is not None and uses[add] != 1:
+            continue
+        for bn in add.parents if add is not None else (parent,):
+            if (type(bn) is not BatchNorm2d_Op or uses[bn] != 1 or stats[id(bn.running_mean)] != 1
+                    or any(uses[p] != 1 for p in bn.parents[1:])):
+                continue
+            residual = None if add is None else next((p for p in add.parents if p is not bn), None)
+            if residual in bn.parents:
+                continue
+            groups[output] = BatchNormActivation(bn, add, output, residual)
+            break
+    return groups
+
+
 def fuse_linear_ops(target_node: Node) -> tuple[Node, int]:
     """将 Add(MatMul(x, W), b) 或 Add(b, MatMul(x, W)) 融合为 Linear(x, W, b)。"""
     from ..ops.basic import Add, MatMul, Linear

@@ -1,6 +1,6 @@
 from .device import xp
 from .node import GradientOp, Node, Variable
-from .graph_opt import apply_graph_optimizations
+from .graph_opt import apply_graph_optimizations, batchnorm_activation_groups
 
 class Graph:
     _active_plan = None
@@ -34,11 +34,15 @@ class Graph:
         # self.nodes 是所有节点的集合
         
         self.nodes = self.sorted_nodes
+        self._bn_groups = batchnorm_activation_groups(self.nodes) if optimize and fuse_activations else {}
+        if self._opt_stats is not None:
+            self._opt_stats["bn_activation_fusions"] = len(self._bn_groups)
         self.profiler = None
         self._leaves = [node for node in self.nodes if not node.parents]
         self._retained = set()
         self._signature = None
         self._forward_active = None
+        self._forward_groups = None
         self._refresh_gradients()
 
     def retain_grad(self, *nodes):
@@ -63,7 +67,11 @@ class Graph:
                         propagate.append(node)
             self._active = frozenset(node for node, required in needed.items() if required)
             self._flags = tuple(needed.items())
-            self._backward_nodes = tuple(reversed(propagate))
+            groups = {n: g for n, g in self._bn_groups.items() if self._retained.isdisjoint(g.hidden)}
+            hidden = {node for group in groups.values() for node in group.hidden}
+            self._group_signature = frozenset(groups)
+            self._execution_nodes = tuple(groups.get(n, n) for n in self.nodes if n not in hidden)
+            self._backward_nodes = tuple((groups.get(n, n), n) for n in reversed(propagate) if n not in hidden)
             self._legacy_parents = {n: tuple(p for p in n.parents if needed[p]) for n in propagate
                                     if not isinstance(n, GradientOp)}
             self._keep_grads = tuple(n for n in self.nodes if needed[n] and (not n.parents or n in self._retained))
@@ -99,7 +107,8 @@ class Graph:
     def forward(self):
         self._refresh_gradients()
         self._forward_active = self._active
-        for node in self.sorted_nodes:
+        self._forward_groups = self._group_signature
+        for node in self._execution_nodes:
             if node.parents:
                 inputs = [p.value for p in node.parents]
             elif isinstance(node, Variable):
@@ -115,7 +124,7 @@ class Graph:
     def backward(self):
         self._refresh_gradients()
         if self._forward_active is not None and self._forward_active is not self._active:
-            if not self._active.issubset(self._forward_active):
+            if not self._active.issubset(self._forward_active) or self._forward_groups != self._group_signature:
                 raise RuntimeError("new gradients requested after forward; run forward again to rebuild saved tensors")
         if self.target_node not in self._active:
             return
@@ -125,20 +134,20 @@ class Graph:
         self.target_node.grad = xp.ones_like(self.target_node.value)
         
         # 使用预先计算好的反向排序列表
-        for node in self._backward_nodes:
-            if node.grad is None:
+        for node, output in self._backward_nodes:
+            if output.grad is None:
                 continue
             for parent in self._legacy_parents.get(node, ()):
                 # Third-party Node subclasses may still write parent.grad += contribution.
                 if parent.grad is None:
                     parent.clear_grad()
-            saved = node.grad_tensor if node in self._retained else None
+            saved = output.grad_tensor if output in self._retained else None
             if self.profiler is None:
                 node.backward()
             else:
                 with self.profiler.node(node, "backward"):
                     node.backward()
-            node.grad_tensor = saved
+            output.grad_tensor = saved
         for node in self._keep_grads:
             if node.grad is None:
                 node.clear_grad()
