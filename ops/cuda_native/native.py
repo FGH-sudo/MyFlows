@@ -123,6 +123,10 @@ def _configure(lib):
     lib.mf_conv_backward.restype = i32
     lib.mf_conv_backward_plans.argtypes = [u64] * 10 + [i32] * 13 + [i32, i32, f32, i32, i32, u64, i64, u64]
     lib.mf_conv_backward_plans.restype = i32
+    lib.mf_gemm_tile_count.argtypes = []
+    lib.mf_gemm_tile_count.restype = i32
+    lib.mf_gemm_tile_info.argtypes = [i32, ctypes.POINTER(i32)]
+    lib.mf_gemm_tile_info.restype = i32
     lib.mf_pool_forward.argtypes = [u64] * 3 + [i32] * 10 + [u64]
     lib.mf_pool_forward.restype = i32
     lib.mf_pool_backward.argtypes = [u64] * 3 + [i32] * 10 + [u64]
@@ -266,22 +270,69 @@ def _engine(engine):
     return GEMM_ENGINES[engine]
 
 
+@lru_cache(maxsize=1)
+def tile_catalog():
+    """Compiled tile names, launch geometry and reduction width in native kernel order."""
+    lib = _library()
+    result = {}
+    for index in range(lib.mf_gemm_tile_count()):
+        values = (ctypes.c_int * 5)()
+        _check(lib.mf_gemm_tile_info(_i32(index), values),lib)
+        bm,bn,tm,tn,bk = values
+        name = GEMM_TILES[index] if index < len(GEMM_TILES) else f"{bm}x{bn}/{tm}x{tn}/k{bk}"
+        result[name] = (index, bm,bn,tm,tn,bk)
+    return result
+
+
+@lru_cache(maxsize=2048)
 def _plan_code(tile, requested):
-    if tile not in GEMM_TILES or type(requested) is not int or not 1 <= requested <= 32:
-        raise ValueError("expected a register tile and 1..32 split-K slices")
-    return 16 + GEMM_TILES.index(tile) * 32 + requested - 1
+    if type(requested) is not int or requested < 1:
+        raise ValueError("expected a positive integer split count")
+    if tile in GEMM_TILES and requested <= 32:
+        return 16 + GEMM_TILES.index(tile) * 32 + requested - 1
+    if not isinstance(tile,str) or "/" not in tile or requested > 128:
+        raise ValueError("unknown tile or unsupported split count")
+    entry = tile_catalog().get(tile)
+    if entry is None:
+        raise ValueError(f"unknown tile {tile}")
+    return 1024 + entry[0] * 128 + requested - 1
 
 
-def _slices(k, requested):
-    chunk = ((k+requested-1)//requested+15)//16*16
+def _slices(k, requested, bk=16):
+    chunk = ((k+requested-1)//requested+bk-1)//bk*bk
     return (k+chunk-1)//chunk
 
 
+@lru_cache(maxsize=8)
+def _device_profile(device):
+    props = _lazy_cupy().cuda.runtime.getDeviceProperties(device)
+    if (props["major"],props["minor"],props["multiProcessorCount"],props["name"].decode()) == (
+            8,9,24,"NVIDIA GeForce RTX 4060 Laptop GPU"):
+        from .ada_plans import PLANS
+        return PLANS
+    return {}
+
+
+def _static_choice(layout, m, n, k):
+    return _device_profile(_lazy_cupy().cuda.runtime.getDevice()).get((layout,m,n,k))
+
+
 def _choose_engine(engine, layout, m, n, k):
-    if engine == GEMM_ENGINES["register"] and os.environ.get("MYFLOWS_GEMM_AUTOTUNE") == "1":
+    if engine != GEMM_ENGINES["register"]:
+        return engine
+    if os.environ.get("MYFLOWS_GEMM_AUTOTUNE") == "1":
         from .autotune import selected_plan
         return _plan_code(*selected_plan(layout, m, n, k))
-    return engine
+    choice = _static_choice(layout,m,n,k)
+    return _plan_code(*choice) if choice else engine
+
+
+@lru_cache(maxsize=2048)
+def _split_parameters(code):
+    if code < 1024:
+        return (code-16) % 32 + 1, 16
+    index, part = divmod(code-1024,128)
+    return part+1, tuple(tile_catalog().values())[index][-1]
 
 
 def _workspace(lib, *requests):
@@ -293,7 +344,8 @@ def _workspace(lib, *requests):
             if size < 0:
                 raise NativeCudaError(f"native CUDA call failed: {lib.mf_last_error().decode(errors='replace')}")
         elif engine >= 16:
-            splits = _slices(k, (engine-16) % 32 + 1)
+            requested,bk = _split_parameters(engine)
+            splits = _slices(k, requested, bk)
             size = splits*m*n if splits > 1 else 0
         else:
             size = 0
@@ -506,7 +558,12 @@ def gemm_plan(m, n, k, *, layout=None):
     if layout is not None and os.environ.get("MYFLOWS_GEMM_AUTOTUNE") == "1":
         from .autotune import selected_plan
         tile, requested = selected_plan(layout, m, n, k)
-        return tile, _slices(k, requested)
+        return tile, _slices(k, requested, tile_catalog()[tile][-1])
+    if layout is not None:
+        choice = _static_choice(layout,m,n,k)
+        if choice:
+            tile, requested = choice
+            return tile, _slices(k, requested, tile_catalog()[tile][-1])
     lib = _library()
     shape, slices = ctypes.c_int(), ctypes.c_int()
     _check(lib.mf_gemm_plan(_i32(m), _i32(n), _i32(k), ctypes.byref(shape), ctypes.byref(slices)), lib)

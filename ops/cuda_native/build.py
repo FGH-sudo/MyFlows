@@ -26,7 +26,7 @@ PROJECT = Path(__file__).resolve().parent
 ROOT = PROJECT.parents[2]
 WINDOWS = os.name == "nt"
 OUTPUT = ROOT / "build" / "native-cuda" / ("native_cublas.dll" if WINDOWS else "native_cublas.so")
-SOURCES = (PROJECT / "native_cublas.cpp", PROJECT / "CMakeLists.txt")
+SOURCES = (PROJECT / "native_cublas.cpp", PROJECT / "gemm_tiles.inc", PROJECT / "CMakeLists.txt")
 # SHA-256 of SOURCES that OUTPUT was built from, written after every successful build.
 STAMP = OUTPUT.with_name(OUTPUT.name + ".sources")
 LOG = OUTPUT.with_name("build.log")

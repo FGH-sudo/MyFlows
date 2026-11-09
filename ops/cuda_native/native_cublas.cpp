@@ -656,20 +656,40 @@ extern "C" __global__ void gemm_split_reduce(const float* partial, float* C, int
     C[(i / N) * ldc + i % N] = (float)s;
 }
 
-// GEMM engine (fp32, BK = 16): five tile shapes x NN / NT / TN x scalar / float4 access.
-#define MF_GEMM(S, BM, BN, TM, TN, T, TA, TB, V) extern "C" __global__ void __launch_bounds__(256) \
+// For very small outputs distribute the fixed FP64 reduction across eight warps per output stripe.
+extern "C" __global__ void gemm_split_reduce_parallel(const float* partial, float* out, int slices,
+                                                       int M, int N, int ldc) {
+    __shared__ double sums[8][32];
+    int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    int i = blockIdx.x * 32 + lane, elements = M * N;
+    double sum = 0.0;
+    if (i < elements) {
+        for (int z = warp; z < slices; z += 8) sum += (double)partial[(long long)z * elements + i];
+    }
+    sums[warp][lane] = sum;
+    __syncthreads();
+    if (warp == 0 && i < elements) {
+        sum = sums[0][lane];
+#pragma unroll
+        for (int w = 1; w < 8; ++w) sum += sums[w][lane];
+        out[(long long)(i/N)*ldc + i%N] = (float)sum;
+    }
+}
+
+#define MF_GEMM(S, BM, BN, TM, TN, BK, T, TA, TB, V) \
+    extern "C" __global__ void __launch_bounds__((BM/TM)*(BN/TN)) \
     gemm_register_##S##_##T##_v##V(const float* a, const float* b, float* c, int M, int N, int K, int lda, \
                                     int ldb, int ldc, int k_chunk, long long c_stride) { \
-    gemm_register<BM, BN, 16, TM, TN, 0, 1, TA, TB, V != 0>(a, b, c, M, N, K, lda, ldb, ldc, k_chunk, c_stride); }
-#define MF_GEMM_SHAPE(S, BM, BN, TM, TN) \
-    MF_GEMM(S, BM, BN, TM, TN, nn, false, false, 0) MF_GEMM(S, BM, BN, TM, TN, nn, false, false, 1) \
-    MF_GEMM(S, BM, BN, TM, TN, nt, false, true, 0) MF_GEMM(S, BM, BN, TM, TN, nt, false, true, 1) \
-    MF_GEMM(S, BM, BN, TM, TN, tn, true, false, 0) MF_GEMM(S, BM, BN, TM, TN, tn, true, false, 1)
-MF_GEMM_SHAPE(s, 128, 128, 8, 8)
-MF_GEMM_SHAPE(h, 128, 64, 8, 4)
-MF_GEMM_SHAPE(t, 256, 32, 8, 4)
-MF_GEMM_SHAPE(w, 64, 128, 4, 8)
-MF_GEMM_SHAPE(x, 32, 256, 4, 8)
+    gemm_register<BM, BN, BK, TM, TN, 0, 1, TA, TB, V != 0>(a, b, c, M, N, K, lda, ldb, ldc, k_chunk, c_stride); }
+#define MF_GEMM_SHAPE(S, BM, BN, TM, TN, BK) \
+    MF_GEMM(S, BM, BN, TM, TN, BK, nn, false, false, 0) MF_GEMM(S, BM, BN, TM, TN, BK, nn, false, false, 1) \
+    MF_GEMM(S, BM, BN, TM, TN, BK, nt, false, true, 0) MF_GEMM(S, BM, BN, TM, TN, BK, nt, false, true, 1) \
+    MF_GEMM(S, BM, BN, TM, TN, BK, tn, true, false, 0) MF_GEMM(S, BM, BN, TM, TN, BK, tn, true, false, 1)
+)CUDA"
+#define MF_TILE(S, BM, BN, TM, TN, BK) "MF_GEMM_SHAPE(" #S "," #BM "," #BN "," #TM "," #TN "," #BK ")\n"
+#include "gemm_tiles.inc"
+#undef MF_TILE
+R"CUDA(
 // Lecture comparison with compensated summation (128 x 128 tiles, BK = 8: at BK = 16 dot2 runs out of
 // registers and slows down 1.5-3x). The fp32 register variant is gemm_register_s_nn without a split.
 #define MF_REGISTER(A, V) extern "C" __global__ void __launch_bounds__(256) matmul_register_a##A##_v##V( \
@@ -695,19 +715,19 @@ Kernel kernels[] = {
     {"matmul_shared_t32_a0", nullptr}, {"matmul_shared_t32_a1", nullptr}, {"matmul_shared_t32_a2", nullptr},
     {"matmul_register_a1_v0", nullptr}, {"matmul_register_a1_v1", nullptr},  // (accumulate - 1) * 2 + vec
     {"matmul_register_a2_v0", nullptr}, {"matmul_register_a2_v1", nullptr},
-    {"gemm_split_reduce", nullptr},
-#define MF_GEMM_NAMES(S)                                                                 \
+    {"gemm_split_reduce", nullptr}, {"gemm_split_reduce_parallel", nullptr},
+#define MF_TILE(S, BM, BN, TM, TN, BK)                                                                 \
     {"gemm_register_" #S "_nn_v0", nullptr}, {"gemm_register_" #S "_nn_v1", nullptr}, \
     {"gemm_register_" #S "_nt_v0", nullptr}, {"gemm_register_" #S "_nt_v1", nullptr}, \
     {"gemm_register_" #S "_tn_v0", nullptr}, {"gemm_register_" #S "_tn_v1", nullptr},
-    MF_GEMM_NAMES(s) MF_GEMM_NAMES(h) MF_GEMM_NAMES(t) MF_GEMM_NAMES(w) MF_GEMM_NAMES(x)  // shape * 6 + layout * 2 + vec
-#undef MF_GEMM_NAMES
+#include "gemm_tiles.inc"
+#undef MF_TILE
 };
 enum KernelId : int {
     K_IM2COL = 0, K_COL2IM, K_EPILOGUE, K_GRAD_ROWS, K_REDUCE, K_ADD_BIAS, K_POOL_FWD, K_POOL_BWD,
     K_MATMUL_NAIVE, K_MATMUL_TILED16 = K_MATMUL_NAIVE + 3, K_MATMUL_TILED32 = K_MATMUL_TILED16 + 3,
     K_MATMUL_SHARED16 = K_MATMUL_TILED32 + 3, K_MATMUL_SHARED32 = K_MATMUL_SHARED16 + 3,
-    K_MATMUL_REGISTER = K_MATMUL_SHARED32 + 3, K_SPLIT_REDUCE = K_MATMUL_REGISTER + 4, K_GEMM_REGISTER,
+    K_MATMUL_REGISTER = K_MATMUL_SHARED32 + 3, K_SPLIT_REDUCE = K_MATMUL_REGISTER + 4, K_SPLIT_PARALLEL, K_GEMM_REGISTER,
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -1017,9 +1037,16 @@ int gemm(CUstream stream, int trans_a, int trans_b, int m, int n, int k,
 // fewer of the computed outputs fall outside C.
 enum GemmEngine : int { ENGINE_CUBLAS = 0, ENGINE_REGISTER = 1 };
 struct GemmShape {
-    int bm, bn;
+    int bm, bn, tm, tn, bk;
 };
-constexpr GemmShape GEMM_SHAPES[] = {{128, 128}, {128, 64}, {256, 32}, {64, 128}, {32, 256}};
+constexpr GemmShape GEMM_SHAPES[] = {
+#define MF_TILE(S, BM, BN, TM, TN, BK) {BM, BN, TM, TN, BK},
+#include "gemm_tiles.inc"
+#undef MF_TILE
+};
+constexpr int NUM_GEMM_SHAPES = sizeof(GEMM_SHAPES)/sizeof(GEMM_SHAPES[0]);
+constexpr int EXTENDED_PLAN_BASE = 1024;
+constexpr int EXTENDED_SPLIT_LIMIT = 128;
 constexpr int GEMM_BK = 16;
 constexpr int GEMM_MIN_CHUNK = 64;
 constexpr int GEMM_MAX_SLICES = 32;
@@ -1066,12 +1093,14 @@ int gemm_rows(int engine, CUstream stream, bool trans_a, bool trans_b, int M, in
     if (trans_a && trans_b) return fail(MF_ERR_ARG, line, "the register engine has no A^T B^T kernel");
     GemmPlan plan = gemm_plan(M, N, K);
     if (engine >= EXPLICIT_PLAN_BASE) {
-        const int code = engine - EXPLICIT_PLAN_BASE;
-        const int requested = code % GEMM_MAX_SLICES + 1;
-        const auto rounded = ((static_cast<std::int64_t>(K) + requested - 1) / requested +
-                              GEMM_BK - 1) / GEMM_BK * GEMM_BK;
+        const bool extended = engine >= EXTENDED_PLAN_BASE;
+        const int code = engine - (extended ? EXTENDED_PLAN_BASE : EXPLICIT_PLAN_BASE);
+        const int limit = extended ? EXTENDED_SPLIT_LIMIT : GEMM_MAX_SLICES;
+        const int shape = code / limit, requested = code % limit + 1;
+        const int bk = GEMM_SHAPES[shape].bk;
+        const auto rounded = ((static_cast<std::int64_t>(K) + requested - 1) / requested + bk - 1) / bk * bk;
         const int chunk = static_cast<int>(std::min<std::int64_t>(K, rounded));
-        plan = GemmPlan{code / GEMM_MAX_SLICES, static_cast<int>((static_cast<std::int64_t>(K)+chunk-1)/chunk), chunk};
+        plan = GemmPlan{shape, static_cast<int>((static_cast<std::int64_t>(K)+chunk-1)/chunk), chunk};
     }
     if (plan.slices > 1 && (!workspace || workspace_floats < static_cast<std::int64_t>(plan.slices) * M * N))
         plan = GemmPlan{plan.shape, 1, K};
@@ -1089,10 +1118,13 @@ int gemm_rows(int engine, CUstream stream, bool trans_a, bool trans_b, int M, in
     {
         void* args[] = {&a, &b, &out, &M, &N, &K, &lda, &ldb, &ld_out, &plan.k_chunk, &stride};
         MF_TRY(launch(K_GEMM_REGISTER + plan.shape * 6 + layout * 2 + vec, blocks_for(N, tile.bn),
-                      blocks_for(M, tile.bm), static_cast<unsigned>(plan.slices), 256, 1, stream, args, line));
+                      blocks_for(M, tile.bm), static_cast<unsigned>(plan.slices),
+                      (tile.bm/tile.tm)*(tile.bn/tile.tn), 1, stream, args, line));
     }
     if (!split) return MF_OK;
     void* args[] = {&workspace, &c, &plan.slices, &M, &N, &ldc};
+    if (static_cast<std::int64_t>(M)*N <= 32768 && plan.slices >= 48)
+        return launch(K_SPLIT_PARALLEL, blocks_for(static_cast<std::int64_t>(M)*N,32), 1, 1, 256, 1, stream, args, line);
     return launch(K_SPLIT_REDUCE, blocks_for(static_cast<std::int64_t>(M) * N, 256), 1, 1, 256, 1, stream, args, line);
 }
 
@@ -1125,7 +1157,8 @@ int check_conv(const ConvDims& d, int line) {
 
 int check_engine(int engine, int line) {
     if (engine != ENGINE_CUBLAS && engine != ENGINE_REGISTER &&
-        !(engine >= EXPLICIT_PLAN_BASE && engine < EXPLICIT_PLAN_BASE + 5 * GEMM_MAX_SLICES))
+        !(engine >= EXPLICIT_PLAN_BASE && engine < EXPLICIT_PLAN_BASE + 5 * GEMM_MAX_SLICES) &&
+        !(engine >= EXTENDED_PLAN_BASE && engine < EXTENDED_PLAN_BASE + NUM_GEMM_SHAPES * EXTENDED_SPLIT_LIMIT))
         return fail(MF_ERR_ARG, line, "unknown GEMM engine or register plan");
     return MF_OK;
 }
@@ -1344,6 +1377,15 @@ MF_API int mf_matmul(
 
 // Tile shape (index into s, h, t, w, x) and split-K slices of the register engine for C(M,N) with
 // inner size K.
+MF_API int mf_gemm_tile_count() { return NUM_GEMM_SHAPES; }
+
+MF_API int mf_gemm_tile_info(int index, int* values) {
+    MF_REQUIRE(values && index >= 0 && index < NUM_GEMM_SHAPES, "unknown register tile");
+    const GemmShape& g = GEMM_SHAPES[index];
+    values[0] = g.bm; values[1] = g.bn; values[2] = g.tm; values[3] = g.tn; values[4] = g.bk;
+    return MF_OK;
+}
+
 MF_API int mf_gemm_plan(int M, int N, int K, int* shape, int* slices) {
     MF_TRY(check_ready());
     MF_REQUIRE(M > 0 && N > 0 && K > 0, "GEMM dimensions must be positive");

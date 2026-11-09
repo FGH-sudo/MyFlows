@@ -80,7 +80,9 @@ def _calibrate(layout, shape, identity):
     exact = cp.asnumpy((a.T if ta else a)[ia]).astype(np.float64) @ cp.asnumpy(
         (b.T if tb else b)[:, ib]
     ).astype(np.float64)
-    manual = native.gemm_plan(m, n, k)
+    static = native._static_choice(layout, m, n, k)
+    manual = ((static[0], native._slices(k, static[1], native.tile_catalog()[static[0]][-1]))
+              if static else native.gemm_plan(m, n, k))
     sample = lambda: cp.asnumpy(out[ia[:, None], ib[None, :]])
 
     def launch(tile, requested):
@@ -90,14 +92,16 @@ def _calibrate(layout, shape, identity):
     unsplit = sample()
     free, total = cp.cuda.runtime.memGetInfo()
     workspace_budget = max(0, int(free) - max(512 * 2**20, int(total) // 8))
-    seen, rows = set(), []
-    for requested in range(1, 33):
-        slices = native._slices(k, requested)
-        if slices in seen:
-            continue
-        seen.add(slices)
-        bytes_needed = 4 * m * n * slices if slices > 1 else 0
-        for tile in native.GEMM_TILES:
+    rows = []
+    for tile, geometry in native.tile_catalog().items():
+        seen = set()
+        limit = 128 if tile not in native.GEMM_TILES and m*n <= 32768 else 32
+        for requested in range(1, limit+1):
+            slices = native._slices(k, requested, geometry[-1])
+            if slices in seen:
+                continue
+            seen.add(slices)
+            bytes_needed = 4*m*n*slices if slices > 1 else 0
             rows.append(
                 {
                     "tile": tile,
