@@ -61,6 +61,25 @@ class RegisterPlanTest(unittest.TestCase):
         np.testing.assert_allclose(first, a.astype(np.float64).T@b.astype(np.float64), rtol=1e-5, atol=6e-4)
 
     @unittest.skipUnless(cuda_available(), "compiled tile geometries require CUDA")
+    def test_every_measured_ada_plan_names_a_compiled_tile_and_a_launchable_split(self):
+        from MyFlows.ops.cuda_native.ada_plans import PLANS
+
+        self.addCleanup(set_device, get_device())
+        set_device("cuda")
+        catalog = native.tile_catalog()
+        for (layout, m, n, k), (tile, requested) in PLANS.items():
+            self.assertIn(layout, ("NN", "NT", "TN"))
+            self.assertIn(tile, catalog, (layout, m, n, k))
+            native._plan_code(tile, requested)
+            self.assertLessEqual(native._slices(k, requested, catalog[tile][-1]), requested)
+        profile = native._device_profile(xp.cuda.runtime.getDevice())
+        if profile:  # the measured table applies only to the 24-SM RTX 4060 Laptop GPU
+            with patch.dict(os.environ, {"MYFLOWS_GEMM_AUTOTUNE": "0"}):
+                for (layout, m, n, k), (tile, requested) in PLANS.items():
+                    expected = (tile, native._slices(k, requested, catalog[tile][-1]))
+                    self.assertEqual(native.gemm_plan(m, n, k, layout=layout), expected)
+
+    @unittest.skipUnless(cuda_available(), "compiled tile geometries require CUDA")
     def test_all_compiled_tiles_cover_aligned_and_ragged_operands(self):
         self.addCleanup(set_device, get_device())
         set_device("cuda")
