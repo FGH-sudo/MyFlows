@@ -50,6 +50,20 @@ class BNActivationTest(unittest.TestCase):
     def test_cpu(self):
         self.compare("cpu")
 
+    def test_shape_and_content_inspection_materializes_values_for_one_step(self):
+        from MyFlows.utils.model_inspector import inspect_graph
+        set_device("cpu")
+        x = ms.Variable(np.ones((2, 3, 3, 3), np.float32), trainable=True)
+        bn = BatchNorm2d(3)(x)
+        graph = ms.Graph(ms.ReLU(bn), optimize=True)
+        graph.materialize_intermediates()
+        graph.forward()
+        self.assertTrue(inspect_graph(graph, check_shape=True, check_content=True)["ok"])
+        graph.backward()
+        graph.materialize_intermediates(False)
+        graph.forward()
+        self.assertIsNone(bn.value)
+
     @unittest.skipUnless(cuda_available(), "CUDA is required for the fused reduction and epilogue")
     def test_cuda(self):
         self.compare("cuda")

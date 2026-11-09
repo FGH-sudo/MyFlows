@@ -51,6 +51,7 @@ class TransferLearningManager:
         self.history = []
         self.frozen_checks = []
         self._frozen_reference = None
+        self.probe = None
 
     @classmethod
     def build(cls, arch, output_dim, *, pretrained=None, initializer=None, dropout=0., dropout_seed=None,
@@ -135,7 +136,7 @@ class TransferLearningManager:
         return {"level": self.freezer.level, "history": self.history, "checks": self.frozen_checks,
                 "frozen_parameters": [name for name, p in params.items() if not p.trainable],
                 "bn_frozen": {name: layer.frozen for name, (layer, attr) in buffers.items()},
-                "frozen_reference": self._frozen_reference}
+                "frozen_reference": self._frozen_reference, "probe": self.probe}
 
     def restore(self, state):
         params, buffers = named_state(self.model)
@@ -151,6 +152,7 @@ class TransferLearningManager:
         self.history = list(state["history"])
         self.frozen_checks = list(state["checks"])
         self._frozen_reference = state.get("frozen_reference")
+        self.probe = state.get("probe")
         self.verify_frozen()
 
     def parameter_groups(self):
@@ -218,7 +220,7 @@ class TransferLearningManager:
 
     def result(self):
         return {"arch": self.model.arch, "freeze_stages": self.freezer.level, "freeze": self.freeze,
-                "lora": getattr(self, "lora", None),
+                "lora": getattr(self, "lora", None), "probe": self.probe,
                 "initial_freeze_stages": self.initial_level, "frozen_checks": list(self.frozen_checks),
                 "load_report": summarize_load_report(self.load_report) if self.load_report else None,
                 "freeze_history": list(self.history), "backbone_lr_mult": self.backbone_lr_mult,

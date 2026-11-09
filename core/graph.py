@@ -43,7 +43,14 @@ class Graph:
         self._signature = None
         self._forward_active = None
         self._forward_groups = None
+        self._materialize_values = False
         self._refresh_gradients()
+
+    def materialize_intermediates(self, enabled=True):
+        """Keep logical BN and residual values on the next forward for full graph inspection."""
+        if self._materialize_values != bool(enabled):
+            self._materialize_values = bool(enabled)
+            self._signature = None
 
     def retain_grad(self, *nodes):
         """Request intermediate adjoints, e.g. an otherwise frozen Grad-CAM feature."""
@@ -67,7 +74,8 @@ class Graph:
                         propagate.append(node)
             self._active = frozenset(node for node, required in needed.items() if required)
             self._flags = tuple(needed.items())
-            groups = {n: g for n, g in self._bn_groups.items() if self._retained.isdisjoint(g.hidden)}
+            groups = {} if self._materialize_values else {
+                n: g for n, g in self._bn_groups.items() if self._retained.isdisjoint(g.hidden)}
             hidden = {node for group in groups.values() for node in group.hidden}
             self._group_signature = frozenset(groups)
             self._execution_nodes = tuple(groups.get(n, n) for n in self.nodes if n not in hidden)

@@ -57,6 +57,8 @@ LINEAR_BACKENDS = ("auto", "numpy", "cupy", "cuda_native_register", "cuda_native
 
 
 def _linear_backend(backend):
+    if backend == "winograd":
+        return "auto"  # This model-level choice applies to 3x3 convolutions only.
     if backend not in LINEAR_BACKENDS:
         raise ValueError(f"backend must be one of {', '.join(LINEAR_BACKENDS)}")
     return backend
