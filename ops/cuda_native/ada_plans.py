@@ -1,6 +1,8 @@
 """Register GEMM starting plans measured on the 24-SM Ada RTX 4060 Laptop GPU.
 
 Keys are row-major layout and M, N, K. Values are the output/block geometry and requested K splits.
+Tiles ending in /s<stages> run their TN float4 kernel as a cp.async pipeline (same results as the
+tile without the suffix).
 Unlisted shapes use the analytic scheduler. The on-device tuner can measure a new choice for either.
 """
 
@@ -57,16 +59,16 @@ PLANS = {
     ('TN', 64, 288, 10240): ('64x64/8x4/k16', 24),
     ('TN', 64, 576, 10240): ('64x64/8x4/k16', 8),
     ('TN', 64, 576, 36192): ('64x64/8x4/k16', 8),
-    ('TN', 128, 64, 2560): ('32x64/4x4/k16', 11),
+    ('TN', 128, 64, 2560): ('64x64/8x4/k16/s3', 11),
     ('TN', 128, 64, 9600): ('128x64', 23),
     ('TN', 128, 576, 2560): ('128x64/8x8/k16', 8),
     ('TN', 128, 576, 9600): ('128x64', 8),
     ('TN', 128, 1152, 2560): ('64x128/8x8/k16', 4),
     ('TN', 128, 1152, 9600): ('128x128', 5),
-    ('TN', 256, 128, 2560): ('128x64', 6),
-    ('TN', 256, 1152, 2560): ('64x128/8x8/k16', 2),
+    ('TN', 256, 128, 2560): ('64x64/8x4/k16/s4', 6),
+    ('TN', 256, 1152, 2560): ('64x64/8x4/k16/s3', 2),
     ('TN', 256, 2304, 2560): ('128x64/8x8/k16', 1),
-    ('TN', 512, 256, 640): ('32x64/4x4/k16', 1),
+    ('TN', 512, 256, 640): ('32x64/4x4/k32/s2', 1),
     ('TN', 512, 2304, 640): ('128x128', 1),
     ('TN', 512, 4608, 640): ('128x128', 1),
 }

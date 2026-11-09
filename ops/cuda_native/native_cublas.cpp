@@ -675,18 +675,225 @@ extern "C" __global__ void gemm_split_reduce_parallel(const float* partial, floa
         out[(long long)(i/N)*ldc + i%N] = (float)sum;
     }
 }
+)CUDA"  // MSVC caps one string literal at 16 KB; adjacent literals are concatenated
+R"CUDA(
+// ---- Split-K reductions that return the bits of gemm_split_reduce with little or no FP64 work ------
+// gemm_split_reduce computes (float)(((0.0 + p0) + p1) + ... + p[S-1]) in FP64. GeForce GPUs run FP64
+// at 1/64 of the FP32 rate, so that loop was FP64-pipe bound. The kernels below give the same result:
+// in FP32 for two slices, as an exact integer sum for 3-32 slices, and through the FP64 loop itself for
+// the inputs those arguments do not cover. Requires IEEE subnormals (no -ftz), as compiled here.
+__device__ __noinline__ float split_sum_fp64(const float* p, long long total, int slices) {
+    double s = 0.0;
+    for (int z = 0; z < slices; ++z) s += (double)p[z * total];
+    return (float)s;
+}
 
-#define MF_GEMM(S, BM, BN, TM, TN, BK, T, TA, TB, V) \
+// Two slices. Rounding p0 + p1 to binary64 and then to binary32 gives the binary32 rounding of p0 + p1
+// (double rounding is innocuous for addition since 53 >= 2 * 24 + 2), and 0.0f + p0 turns -0 into +0
+// like 0.0 + p0. FP32 adds return the canonical NaN; a NaN result is recomputed in FP64 for its payload.
+extern "C" __global__ void gemm_split_pair(const float* partial, float* C, int slices, int M, int N, int ldc) {
+    const long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x, total = (long long)M * N;
+    if (i >= total) return;
+    float s = __fadd_rn(__fadd_rn(0.0f, partial[i]), partial[total + i]);
+    if (isnan(s)) s = split_sum_fp64(partial + i, total, 2);
+    C[(i / N) * ldc + i % N] = s;
+}
+
+// 3 to G * V slices; G lanes of a warp per output, lane g holding slices g, g + G, ... Let lo and hi be
+// the smallest and largest exponent fields of the nonzero partials (1 for subnormals). Every partial is
+// a multiple of u = 2^(lo - 150) and below 2^(hi - 126) in magnitude, so while hi - lo <= 29 -
+// ceil(log2 S) each partial sum of the FP64 loop is an integer multiple of u below 2^53 u: every FP64
+// addition is exact and the loop returns the exact sum rounded once (+0 when it is zero). The lanes add
+// the partials as 64-bit integers in units of u, round once with cvt.rn.f32.s64 and scale by u through
+// the exponent field. Wider exponent spans, infinities, NaNs and subnormal or overflowing results take
+// the FP64 loop.
+template <int G, int V>
+__device__ __forceinline__ void split_exact(const float* partial, float* C, int slices, int M, int N, int ldc) {
+    constexpr int OUTS = 32 / G;  // outputs per warp
+    const int lane = threadIdx.x & 31, g = lane / OUTS;
+    const long long total = (long long)M * N;
+    const long long i = ((blockIdx.x * (long long)blockDim.x + threadIdx.x) >> 5) * OUTS + lane % OUTS;
+    const bool valid = i < total;  // every lane takes part in the shuffles
+    const float* p = partial + (valid ? i : 0);
+    unsigned u[V];
+    int lo = 255, hi = 0;
+    unsigned special = 0;
+#pragma unroll
+    for (int j = 0; j < V; ++j) {
+        const int z = g + j * G;
+        u[j] = valid && z < slices ? __float_as_uint(p[z * total]) : 0u;
+        const int f = (u[j] >> 23) & 0xff;
+        special |= f == 0xff;
+        if (u[j] << 1) { lo = min(lo, max(f, 1)); hi = max(hi, max(f, 1)); }
+    }
+#pragma unroll
+    for (int d = OUTS; d < 32; d *= 2) {
+        lo = min(lo, __shfl_xor_sync(0xffffffffu, lo, d));
+        hi = max(hi, __shfl_xor_sync(0xffffffffu, hi, d));
+        special |= __shfl_xor_sync(0xffffffffu, special, d);
+    }
+    const bool exact = !special && hi - lo <= 29 - (32 - __clz(slices - 1));
+    long long x = 0;
+    if (exact) {
+#pragma unroll
+        for (int j = 0; j < V; ++j) {  // zeros have no significand bits; their shift is clamped at 0
+            const int f = (u[j] >> 23) & 0xff;
+            const long long v = (long long)((u[j] & 0x7fffffu) | (f ? 0x800000u : 0u)) << max(max(f, 1) - lo, 0);
+            x += u[j] >> 31 ? -v : v;
+        }
+    }
+#pragma unroll
+    for (int d = OUTS; d < 32; d *= 2) x += __shfl_xor_sync(0xffffffffu, x, d);
+    if (!valid || g != 0) return;
+    float result = 0.0f;
+    if (!exact) {
+        result = split_sum_fp64(p, total, slices);
+    } else if (x != 0) {
+        const unsigned bits = __float_as_uint(__ll2float_rn(x));
+        const int e = (int)((bits >> 23) & 0xff) + lo - 150;
+        result = e >= 1 && e <= 254 ? __uint_as_float(bits + ((unsigned)(lo - 150) << 23))
+                                    : split_sum_fp64(p, total, slices);
+    }
+    C[(i / N) * ldc + i % N] = result;
+}
+#define MF_SPLIT_EXACT(G, V) extern "C" __global__ void __launch_bounds__(128) gemm_split_exact_g##G##v##V( \
+    const float* partial, float* C, int slices, int M, int N, int ldc) { split_exact<G, V>(partial, C, slices, M, N, ldc); }
+MF_SPLIT_EXACT(1, 4) MF_SPLIT_EXACT(1, 8) MF_SPLIT_EXACT(1, 16) MF_SPLIT_EXACT(1, 32)
+MF_SPLIT_EXACT(2, 8) MF_SPLIT_EXACT(2, 16)
+)CUDA"  // MSVC caps one string literal at 16 KB; adjacent literals are concatenated
+R"CUDA(
+// ---- Multi-stage TN variant of the register GEMM (sm_80+ cp.async) --------------------------------
+// With A stored K x M and B stored K x N (the weight-gradient GEMMs), every row of a BK x BM or BK x BN
+// tile is contiguous, so cp.async copies the tiles from global to shared memory without registers or a
+// transpose. STAGES - 1 tiles are in flight while one is consumed: register double buffering keeps a
+// single tile in flight, which leaves short split-K slices waiting on memory latency. A copy with
+// source size 0 zero-fills the rows past k_end and columns past M or N, so the shared tiles, the k
+// order of the FMAs and the results equal gemm_register's bit for bit. Needs the float4 conditions
+// (VEC); without cp.async (before sm_80) it is gemm_register.
+#if __CUDA_ARCH__ >= 800
+__device__ __forceinline__ void cp_async16(void* smem, const void* gmem, int bytes) {
+    const unsigned dst = static_cast<unsigned>(__cvta_generic_to_shared(smem));
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" :: "r"(dst), "l"(gmem), "r"(bytes));
+}
+__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
+template <int N> __device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group %0;\n" :: "n"(N)); }
+#endif
+
+template <int BM, int BN, int BK, int TM, int TN, int STAGES>
+__device__ __forceinline__ void gemm_async_tn(const float* __restrict__ A, const float* __restrict__ B,
+                                              float* __restrict__ C, int M, int N, int K, int lda, int ldb,
+                                              int ldc, int k_chunk, long long c_stride) {
+#if __CUDA_ARCH__ < 800
+    gemm_register<BM, BN, BK, TM, TN, 0, 1, true, false, true>(A, B, C, M, N, K, lda, ldb, ldc, k_chunk, c_stride);
+#else
+    constexpr int QM = TM / 4, QN = TN / 4, TX = BN / TN, TY = BM / TM, THREADS = TX * TY;
+    constexpr int A_VECS = BM * BK / 4, B_VECS = BK * BN / 4;
+    constexpr int A_PER = (A_VECS + THREADS - 1) / THREADS, B_PER = (B_VECS + THREADS - 1) / THREADS;
+    static_assert(STAGES >= 2 && STAGES * BK * (BM + BN) * 4 <= 48 * 1024, "static shared memory is 48 KB");
+    __shared__ __align__(16) float As[STAGES][BK][BM];
+    __shared__ __align__(16) float Bs[STAGES][BK][BN];
+    const int tid = threadIdx.x, tx = tid % TX, ty = tid / TX;
+    const int row0 = blockIdx.y * BM, col0 = blockIdx.x * BN;
+    const int k_begin = blockIdx.z * k_chunk, k_end = min(K, k_begin + k_chunk);
+    C += blockIdx.z * c_stride;
+    auto issue = [&](int stage, int k0) {
+#pragma unroll
+        for (int p = 0; p < A_PER; ++p) {
+            const int v = tid + p * THREADS;
+            if (A_VECS % THREADS != 0 && v >= A_VECS) break;
+            const int r = v / (BM / 4), c = (v % (BM / 4)) * 4, k = k0 + r, m = row0 + c;
+            const bool ok = k < k_end && m < M;
+            cp_async16(&As[stage][r][c], ok ? A + (long long)k * lda + m : A, ok ? 16 : 0);
+        }
+#pragma unroll
+        for (int p = 0; p < B_PER; ++p) {
+            const int v = tid + p * THREADS;
+            if (B_VECS % THREADS != 0 && v >= B_VECS) break;
+            const int r = v / (BN / 4), c = (v % (BN / 4)) * 4, k = k0 + r, n = col0 + c;
+            const bool ok = k < k_end && n < N;
+            cp_async16(&Bs[stage][r][c], ok ? B + (long long)k * ldb + n : B, ok ? 16 : 0);
+        }
+    };
+    float acc[TM][TN];
+#pragma unroll
+    for (int i = 0; i < TM; ++i)
+#pragma unroll
+        for (int j = 0; j < TN; ++j) acc[i][j] = 0.f;
+    const int tiles = k_end > k_begin ? (k_end - k_begin + BK - 1) / BK : 0;
+#pragma unroll
+    for (int s = 0; s < STAGES - 1; ++s) {
+        if (s < tiles) issue(s, k_begin + s * BK);
+        cp_async_commit();  // empty groups keep the count uniform
+    }
+    int buf = 0, put = STAGES - 1;
+    for (int t = 0; t < tiles; ++t) {
+        cp_async_wait<STAGES - 2>();  // this thread's copies of tile t have landed ...
+        __syncthreads();              // ... everyone's, and tile t - 1 (buffer put) is consumed
+        if (t + STAGES - 1 < tiles) issue(put, k_begin + (t + STAGES - 1) * BK);
+        cp_async_commit();
+        put = put + 1 == STAGES ? 0 : put + 1;
+#pragma unroll
+        for (int k = 0; k < BK; ++k) {
+            float a[TM], b[TN];
+#pragma unroll
+            for (int q = 0; q < QM; ++q) {
+                const float4 v = *reinterpret_cast<const float4*>(&As[buf][k][q * (BM / QM) + ty * 4]);
+                a[q * 4] = v.x; a[q * 4 + 1] = v.y; a[q * 4 + 2] = v.z; a[q * 4 + 3] = v.w;
+            }
+#pragma unroll
+            for (int q = 0; q < QN; ++q) {
+                const float4 v = *reinterpret_cast<const float4*>(&Bs[buf][k][q * (BN / QN) + tx * 4]);
+                b[q * 4] = v.x; b[q * 4 + 1] = v.y; b[q * 4 + 2] = v.z; b[q * 4 + 3] = v.w;
+            }
+#pragma unroll
+            for (int i = 0; i < TM; ++i)
+#pragma unroll
+                for (int j = 0; j < TN; ++j) acc[i][j] = fmaf(a[i], b[j], acc[i][j]);  // Accum<0>
+        }
+        buf = buf + 1 == STAGES ? 0 : buf + 1;
+    }
+#pragma unroll
+    for (int i = 0; i < TM; ++i) {
+        const int r = row0 + (i / 4) * (BM / QM) + ty * 4 + i % 4;
+        if (r >= M) continue;
+#pragma unroll
+        for (int q = 0; q < QN; ++q) {
+            const int c = col0 + q * (BN / QN) + tx * 4;
+            float* dst = C + (long long)r * ldc + c;
+            if (c + 3 < N) {
+                *reinterpret_cast<float4*>(dst) = make_float4(acc[i][q * 4], acc[i][q * 4 + 1], acc[i][q * 4 + 2],
+                                                              acc[i][q * 4 + 3]);
+            } else {
+                if (c < N) dst[0] = acc[i][q * 4];
+                if (c + 1 < N) dst[1] = acc[i][q * 4 + 1];
+                if (c + 2 < N) dst[2] = acc[i][q * 4 + 2];
+            }
+        }
+    }
+#endif
+}
+
+// Tiles listed with STAGES > 0 run their TN float4 kernel through gemm_async_tn; every other layout
+// and alignment of such a tile is the plain register kernel.
+template <int BM, int BN, int BK, int TM, int TN, int ST, bool TA, bool TB, bool VEC>
+__device__ __forceinline__ void gemm_engine(const float* a, const float* b, float* c, int M, int N, int K, int lda,
+                                            int ldb, int ldc, int k_chunk, long long c_stride) {
+    if constexpr (ST > 0 && TA && !TB && VEC)
+        gemm_async_tn<BM, BN, BK, TM, TN, ST>(a, b, c, M, N, K, lda, ldb, ldc, k_chunk, c_stride);
+    else
+        gemm_register<BM, BN, BK, TM, TN, 0, 1, TA, TB, VEC>(a, b, c, M, N, K, lda, ldb, ldc, k_chunk, c_stride);
+}
+#define MF_GEMM(S, BM, BN, TM, TN, BK, ST, T, TA, TB, V) \
     extern "C" __global__ void __launch_bounds__((BM/TM)*(BN/TN)) \
     gemm_register_##S##_##T##_v##V(const float* a, const float* b, float* c, int M, int N, int K, int lda, \
                                     int ldb, int ldc, int k_chunk, long long c_stride) { \
-    gemm_register<BM, BN, BK, TM, TN, 0, 1, TA, TB, V != 0>(a, b, c, M, N, K, lda, ldb, ldc, k_chunk, c_stride); }
-#define MF_GEMM_SHAPE(S, BM, BN, TM, TN, BK) \
-    MF_GEMM(S, BM, BN, TM, TN, BK, nn, false, false, 0) MF_GEMM(S, BM, BN, TM, TN, BK, nn, false, false, 1) \
-    MF_GEMM(S, BM, BN, TM, TN, BK, nt, false, true, 0) MF_GEMM(S, BM, BN, TM, TN, BK, nt, false, true, 1) \
-    MF_GEMM(S, BM, BN, TM, TN, BK, tn, true, false, 0) MF_GEMM(S, BM, BN, TM, TN, BK, tn, true, false, 1)
+    gemm_engine<BM, BN, BK, TM, TN, ST, TA, TB, V != 0>(a, b, c, M, N, K, lda, ldb, ldc, k_chunk, c_stride); }
+#define MF_GEMM_SHAPE(S, BM, BN, TM, TN, BK, ST) \
+    MF_GEMM(S, BM, BN, TM, TN, BK, ST, nn, false, false, 0) MF_GEMM(S, BM, BN, TM, TN, BK, ST, nn, false, false, 1) \
+    MF_GEMM(S, BM, BN, TM, TN, BK, ST, nt, false, true, 0) MF_GEMM(S, BM, BN, TM, TN, BK, ST, nt, false, true, 1) \
+    MF_GEMM(S, BM, BN, TM, TN, BK, ST, tn, true, false, 0) MF_GEMM(S, BM, BN, TM, TN, BK, ST, tn, true, false, 1)
 )CUDA"
-#define MF_TILE(S, BM, BN, TM, TN, BK) "MF_GEMM_SHAPE(" #S "," #BM "," #BN "," #TM "," #TN "," #BK ")\n"
+#define MF_TILE(S, BM, BN, TM, TN, BK, ST) "MF_GEMM_SHAPE(" #S "," #BM "," #BN "," #TM "," #TN "," #BK "," #ST ")\n"
 #include "gemm_tiles.inc"
 #undef MF_TILE
 R"CUDA(
@@ -715,8 +922,10 @@ Kernel kernels[] = {
     {"matmul_shared_t32_a0", nullptr}, {"matmul_shared_t32_a1", nullptr}, {"matmul_shared_t32_a2", nullptr},
     {"matmul_register_a1_v0", nullptr}, {"matmul_register_a1_v1", nullptr},  // (accumulate - 1) * 2 + vec
     {"matmul_register_a2_v0", nullptr}, {"matmul_register_a2_v1", nullptr},
-    {"gemm_split_reduce", nullptr}, {"gemm_split_reduce_parallel", nullptr},
-#define MF_TILE(S, BM, BN, TM, TN, BK)                                                                 \
+    {"gemm_split_reduce", nullptr}, {"gemm_split_reduce_parallel", nullptr}, {"gemm_split_pair", nullptr},
+    {"gemm_split_exact_g1v4", nullptr}, {"gemm_split_exact_g1v8", nullptr}, {"gemm_split_exact_g1v16", nullptr},
+    {"gemm_split_exact_g1v32", nullptr}, {"gemm_split_exact_g2v8", nullptr}, {"gemm_split_exact_g2v16", nullptr},
+#define MF_TILE(S, BM, BN, TM, TN, BK, ST)                                                             \
     {"gemm_register_" #S "_nn_v0", nullptr}, {"gemm_register_" #S "_nn_v1", nullptr}, \
     {"gemm_register_" #S "_nt_v0", nullptr}, {"gemm_register_" #S "_nt_v1", nullptr}, \
     {"gemm_register_" #S "_tn_v0", nullptr}, {"gemm_register_" #S "_tn_v1", nullptr},
@@ -727,8 +936,15 @@ enum KernelId : int {
     K_IM2COL = 0, K_COL2IM, K_EPILOGUE, K_GRAD_ROWS, K_REDUCE, K_ADD_BIAS, K_POOL_FWD, K_POOL_BWD,
     K_MATMUL_NAIVE, K_MATMUL_TILED16 = K_MATMUL_NAIVE + 3, K_MATMUL_TILED32 = K_MATMUL_TILED16 + 3,
     K_MATMUL_SHARED16 = K_MATMUL_TILED32 + 3, K_MATMUL_SHARED32 = K_MATMUL_SHARED16 + 3,
-    K_MATMUL_REGISTER = K_MATMUL_SHARED32 + 3, K_SPLIT_REDUCE = K_MATMUL_REGISTER + 4, K_SPLIT_PARALLEL, K_GEMM_REGISTER,
+    K_MATMUL_REGISTER = K_MATMUL_SHARED32 + 3, K_SPLIT_REDUCE = K_MATMUL_REGISTER + 4, K_SPLIT_PARALLEL, K_SPLIT_PAIR,
+    K_SPLIT_EXACT, K_GEMM_REGISTER = K_SPLIT_EXACT + 6,
 };
+
+// Lanes per output and slices per lane of the gemm_split_exact kernels, in kernel order.
+struct SplitExact {
+    int lanes, slots;
+};
+constexpr SplitExact SPLIT_EXACT[] = {{1, 4}, {1, 8}, {1, 16}, {1, 32}, {2, 8}, {2, 16}};
 
 // ---------------------------------------------------------------------------------------------
 // Error reporting.
@@ -1037,10 +1253,10 @@ int gemm(CUstream stream, int trans_a, int trans_b, int m, int n, int k,
 // fewer of the computed outputs fall outside C.
 enum GemmEngine : int { ENGINE_CUBLAS = 0, ENGINE_REGISTER = 1 };
 struct GemmShape {
-    int bm, bn, tm, tn, bk;
+    int bm, bn, tm, tn, bk, stages;  // stages > 0: the TN float4 kernel is the cp.async pipeline
 };
 constexpr GemmShape GEMM_SHAPES[] = {
-#define MF_TILE(S, BM, BN, TM, TN, BK) {BM, BN, TM, TN, BK},
+#define MF_TILE(S, BM, BN, TM, TN, BK, ST) {BM, BN, TM, TN, BK, ST},
 #include "gemm_tiles.inc"
 #undef MF_TILE
 };
@@ -1079,6 +1295,30 @@ GemmPlan gemm_plan(int M, int N, int K) {
 std::int64_t gemm_workspace_floats(int M, int N, int K) {
     const GemmPlan plan = gemm_plan(M, N, K);
     return plan.slices > 1 ? static_cast<std::int64_t>(plan.slices) * M * N : 0;
+}
+
+// Sum of the split-K partials (slices x M x N) into C. Small outputs over 48 or more slices spread the
+// FP64 sum over eight warps (another fixed order). Otherwise the result is that of gemm_split_reduce,
+// computed in FP32 for two slices and as an exact integer sum for 3-32 slices (see the kernels);
+// reference launches gemm_split_reduce itself, for tests.
+int split_reduce(CUdeviceptr partial, CUdeviceptr c, int slices, int M, int N, int ldc, bool reference,
+                 CUstream stream, int line) {
+    void* args[] = {&partial, &c, &slices, &M, &N, &ldc};
+    const std::int64_t outputs = static_cast<std::int64_t>(M) * N;
+    if (outputs <= 32768 && slices >= 48)
+        return launch(K_SPLIT_PARALLEL, blocks_for(outputs, 32), 1, 1, 256, 1, stream, args, line);
+    if (!reference && slices == 2)
+        return launch(K_SPLIT_PAIR, blocks_for(outputs, 128), 1, 1, 128, 1, stream, args, line);
+    if (!reference && slices >= 3 && slices <= 32) {
+        // Two lanes per output paid off only for small outputs over many slices (128 x 64 over 11
+        // slices among the ResNet18 dW GEMMs); otherwise one lane holds every slice of its output.
+        const int lanes = outputs <= 12288 && slices > 8 ? 2 : 1;
+        int id = 0;
+        while (SPLIT_EXACT[id].lanes != lanes || SPLIT_EXACT[id].lanes * SPLIT_EXACT[id].slots < slices) ++id;
+        const std::int64_t threads = (outputs * lanes + 31) / 32 * 32;
+        return launch(K_SPLIT_EXACT + id, blocks_for(threads, 128), 1, 1, 128, 1, stream, args, line);
+    }
+    return launch(K_SPLIT_REDUCE, blocks_for(outputs, 256), 1, 1, 256, 1, stream, args, line);
 }
 
 // Row-major C(M x N) = op(A) op(B): A is stored K x M when trans_a, else M x K; B is stored N x K
@@ -1122,10 +1362,7 @@ int gemm_rows(int engine, CUstream stream, bool trans_a, bool trans_b, int M, in
                       (tile.bm/tile.tm)*(tile.bn/tile.tn), 1, stream, args, line));
     }
     if (!split) return MF_OK;
-    void* args[] = {&workspace, &c, &plan.slices, &M, &N, &ldc};
-    if (static_cast<std::int64_t>(M)*N <= 32768 && plan.slices >= 48)
-        return launch(K_SPLIT_PARALLEL, blocks_for(static_cast<std::int64_t>(M)*N,32), 1, 1, 256, 1, stream, args, line);
-    return launch(K_SPLIT_REDUCE, blocks_for(static_cast<std::int64_t>(M) * N, 256), 1, 1, 256, 1, stream, args, line);
+    return split_reduce(workspace, c, plan.slices, M, N, ldc, false, stream, line);
 }
 
 struct ConvDims {
@@ -1386,6 +1623,15 @@ MF_API int mf_gemm_tile_info(int index, int* values) {
     return MF_OK;
 }
 
+// Pipeline stages of a tile's TN float4 kernel (0: register double buffering), or -1 for an unknown tile.
+MF_API int mf_gemm_tile_stages(int index) {
+    if (index < 0 || index >= NUM_GEMM_SHAPES) {
+        fail(MF_ERR_ARG, __LINE__, "unknown register tile");
+        return -1;
+    }
+    return GEMM_SHAPES[index].stages;
+}
+
 MF_API int mf_gemm_plan(int M, int N, int K, int* shape, int* slices) {
     MF_TRY(check_ready());
     MF_REQUIRE(M > 0 && N > 0 && K > 0, "GEMM dimensions must be positive");
@@ -1394,6 +1640,18 @@ MF_API int mf_gemm_plan(int M, int N, int K, int* shape, int* slices) {
     *shape = plan.shape;
     *slices = plan.slices;
     return MF_OK;
+}
+
+// Sums split-K partials (slices x M x N floats, contiguous) into C (row stride ldc) with the reduction
+// that mf_gemm launches after a split; reference != 0 launches the FP64 loop the engine used before.
+MF_API int mf_split_reduce(std::uint64_t partial, std::uint64_t c, int slices, int M, int N, int ldc,
+                           int reference, std::uint64_t stream_ptr) {
+    MF_TRY(check_ready());
+    MF_REQUIRE(partial && c, "the split-K reduction requires partial and output buffers");
+    MF_REQUIRE(slices >= 2 && M > 0 && N > 0 && ldc >= N, "the split-K reduction needs two or more slices and ldc >= N");
+    MF_REQUIRE(fits_index(static_cast<std::int64_t>(slices) * M * N) && fits_index(static_cast<std::int64_t>(M - 1) * ldc + N),
+               "split-K buffers exceed the int32 indexing limit");
+    return split_reduce(partial, c, slices, M, N, ldc, reference != 0, reinterpret_cast<CUstream>(stream_ptr), __LINE__);
 }
 
 // Floats of split-K workspace that the register engine of mf_gemm uses for C(M,N) with inner size

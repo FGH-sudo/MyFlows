@@ -127,6 +127,8 @@ def _configure(lib):
     lib.mf_gemm_tile_count.restype = i32
     lib.mf_gemm_tile_info.argtypes = [i32, ctypes.POINTER(i32)]
     lib.mf_gemm_tile_info.restype = i32
+    lib.mf_gemm_tile_stages.argtypes = [i32]
+    lib.mf_gemm_tile_stages.restype = i32
     lib.mf_pool_forward.argtypes = [u64] * 3 + [i32] * 10 + [u64]
     lib.mf_pool_forward.restype = i32
     lib.mf_pool_backward.argtypes = [u64] * 3 + [i32] * 10 + [u64]
@@ -139,6 +141,8 @@ def _configure(lib):
     lib.mf_gemm_workspace.restype = i64
     lib.mf_gemm_plan.argtypes = [i32] * 3 + [ctypes.POINTER(i32)] * 2
     lib.mf_gemm_plan.restype = i32
+    lib.mf_split_reduce.argtypes = [u64, u64] + [i32] * 5 + [u64]
+    lib.mf_split_reduce.restype = i32
     return lib
 
 
@@ -272,14 +276,21 @@ def _engine(engine):
 
 @lru_cache(maxsize=1)
 def tile_catalog():
-    """Compiled tile names, launch geometry and reduction width in native kernel order."""
+    """Compiled tile names, launch geometry and reduction width in native kernel order.
+
+    A name ending in ``/s<stages>`` is a tile whose TN float4 kernel is the cp.async pipeline with that
+    many stages; its other layouts, and its results, are those of the tile without the suffix.
+    """
     lib = _library()
     result = {}
     for index in range(lib.mf_gemm_tile_count()):
         values = (ctypes.c_int * 5)()
         _check(lib.mf_gemm_tile_info(_i32(index), values),lib)
         bm,bn,tm,tn,bk = values
-        name = GEMM_TILES[index] if index < len(GEMM_TILES) else f"{bm}x{bn}/{tm}x{tn}/k{bk}"
+        stages = lib.mf_gemm_tile_stages(_i32(index))
+        if stages < 0:
+            raise _error(2, lib)
+        name = GEMM_TILES[index] if index < len(GEMM_TILES) else f"{bm}x{bn}/{tm}x{tn}/k{bk}" + (f"/s{stages}" if stages else "")
         result[name] = (index, bm,bn,tm,tn,bk)
     return result
 
@@ -568,6 +579,27 @@ def gemm_plan(m, n, k, *, layout=None):
     shape, slices = ctypes.c_int(), ctypes.c_int()
     _check(lib.mf_gemm_plan(_i32(m), _i32(n), _i32(k), ctypes.byref(shape), ctypes.byref(slices)), lib)
     return GEMM_TILES[shape.value], slices.value
+
+
+def split_reduce(partials, *, reference=False):
+    """Sum split-K partials (slices x M x N float32) the way the register engine finishes a split GEMM.
+
+    ``reference=True`` runs the FP64 loop the engine used before the FP32 and exact integer
+    reductions; both return the same bits.
+    """
+    cp = _lazy_cupy()
+    partials = _array(partials, "partials")
+    if partials.ndim != 3 or partials.shape[0] < 2:
+        raise ValueError("partials must be a (slices >= 2, M, N) float32 array")
+    slices, m, n = (int(v) for v in partials.shape)
+    if min(m, n) <= 0:
+        raise ValueError("partials must hold at least one output")
+    _guard_index(partials=partials.size)
+    out = cp.empty((m, n), dtype=cp.float32)
+    lib = _library()
+    _check(lib.mf_split_reduce(_u64(partials.data.ptr), _u64(out.data.ptr), _i32(slices), _i32(m), _i32(n), _i32(n),
+                               _i32(bool(reference)), _u64(cp.cuda.get_current_stream().ptr)), lib)
+    return out
 
 
 def gemm(a, b, bias=None, *, trans_a=False, trans_b=False, engine="register", out=None, plan=None):

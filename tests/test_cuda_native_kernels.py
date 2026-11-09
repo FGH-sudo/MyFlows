@@ -345,6 +345,126 @@ class NativeGemmEngineTests(unittest.TestCase):
             native.gemm(a.astype(xp.float64), xp.zeros((3, 2), xp.float32))
 
 
+def _adversarial_partials(slices, count, rng):
+    """(slices, count) float32 split-K partials: typical values, exponent spans at and past the exact
+    integer window, signed zeros, subnormals, overflow, cancellation, ties, NaN payloads and infinities."""
+    shape = (slices, count)
+    window = 29 - int(np.ceil(np.log2(slices)))
+    sign = lambda: rng.choice([-1.0, 1.0], size=shape)
+    blocks = [rng.standard_normal(shape) * 1e-3]
+    for spread in (window, window + 1):
+        offsets = rng.integers(0, spread + 1, size=shape)
+        offsets[0], offsets[-1] = 0, spread
+        blocks.append(sign() * (1 + rng.random(shape)) * np.exp2(rng.integers(-30, 30, size=(1, count)) - offsets))
+    zeros = rng.standard_normal(shape)
+    zeros[rng.random(shape) < 0.6] = 0.0
+    zeros[:, : count // 4] = 0.0
+    zeros = np.where(zeros == 0.0, np.where(rng.random(shape) < 0.5, 0.0, -0.0), zeros)
+    blocks.append(zeros)
+    tiny = float(np.finfo(np.float32).tiny)
+    blocks.append(rng.standard_normal(shape) * tiny * rng.choice([1e-6, 1e-3, 1.0, 4.0], size=shape))
+    blocks.append(sign() * float(np.finfo(np.float32).max) * rng.uniform(0.3, 1.0, size=shape))
+    cancel = rng.standard_normal(shape)
+    cancel[1] = -cancel[0]
+    blocks.append(cancel)
+    ties = np.zeros(shape)
+    ties[0] = 1.0 + 2.0 ** -23 * rng.integers(0, 2, size=count)
+    ties[1] = 2.0 ** -24 * rng.choice([1.0, -1.0, 3.0], size=count)
+    blocks.append(ties)
+    blocks = [b.astype(np.float32) for b in blocks]
+    blocks.append(rng.integers(0, 2 ** 32, size=shape, dtype=np.uint64).astype(np.uint32).view(np.float32))
+    special = rng.standard_normal(shape).astype(np.float32)
+    hit = rng.random(shape) < 0.05
+    special[hit] = rng.choice(np.array([np.inf, -np.inf, np.nan], np.float32), size=int(hit.sum()))
+    blocks.append(special)
+    pool = np.concatenate(blocks, axis=1)
+    return np.ascontiguousarray(pool[:, rng.permutation(pool.shape[1])[:count]])
+
+
+@unittest.skipUnless(cuda_available(), "CUDA is required")
+class NativeSplitReduceTests(unittest.TestCase):
+    """The split-K reductions return the bits of the FP64 loop (FP32 for 2 slices, exact integers for 3-32)."""
+
+    def setUp(self):
+        set_device("cuda")
+
+    def tearDown(self):
+        set_device("cpu")
+
+    def test_reductions_match_the_fp64_loop_bit_for_bit(self):
+        rng = np.random.default_rng(31)
+        # 7 x 13 leaves a partial warp; 64 x 128 over 9+ slices takes two lanes per output.
+        for slices in (2, 3, 4, 5, 8, 9, 11, 16, 17, 32, 33):
+            for m, n in ((7, 13), (64, 128), (96, 512)):
+                host = _adversarial_partials(slices, m * n, rng).reshape(slices, m, n)
+                with self.subTest(slices=slices, shape=(m, n)):
+                    partials = xp.asarray(host)
+                    got = xp.asnumpy(native.split_reduce(partials)).view(np.uint32)
+                    reference = xp.asnumpy(native.split_reduce(partials, reference=True))
+                    np.testing.assert_array_equal(got, reference.view(np.uint32))
+                    # The FP64 loop itself: IEEE subnormals, signed zeros and overflow as in NumPy.
+                    with np.errstate(all="ignore"):
+                        expected = np.zeros((m, n))
+                        for part in host:
+                            expected = expected + part.astype(np.float64)
+                        expected = expected.astype(np.float32)
+                    nan = np.isnan(reference)
+                    np.testing.assert_array_equal(nan, np.isnan(expected))
+                    np.testing.assert_array_equal(reference.view(np.uint32)[~nan], expected.view(np.uint32)[~nan])
+
+    def test_split_gemms_equal_the_fp64_reduction_of_their_chunks(self):
+        rng = np.random.default_rng(32)
+        catalog = native.tile_catalog()
+        cases = (("TN", 128, 64, 2560, "32x64/4x4/k16", 11), ("TN", 256, 1152, 2560, "64x128/8x8/k16", 2),
+                 ("TN", 256, 128, 2560, "128x64", 6), ("NN", 36, 20, 3000, "128x128", 5),
+                 ("NT", 40, 24, 999, "64x64/8x4/k16", 3))
+        for layout, m, n, k, tile, requested in cases:
+            with self.subTest(layout=layout, shape=(m, n, k), plan=(tile, requested)):
+                ta, tb = layout == "TN", layout == "NT"
+                a = xp.asarray(rng.standard_normal((k, m) if ta else (m, k)).astype(np.float32))
+                b = xp.asarray(rng.standard_normal((n, k) if tb else (k, n)).astype(np.float32))
+                bk = catalog[tile][-1]
+                chunk = min(k, ((k + requested - 1) // requested + bk - 1) // bk * bk)
+                parts = []
+                for lo in range(0, k, chunk):
+                    hi = min(k, lo + chunk)
+                    a_part = a[lo:hi] if ta else a[:, lo:hi]
+                    b_part = b[:, lo:hi] if tb else b[lo:hi]
+                    parts.append(native.gemm(a_part, b_part, trans_a=ta, trans_b=tb, plan=(tile, 1)))
+                self.assertEqual(len(parts), native._slices(k, requested, bk))
+                expected = native.split_reduce(xp.stack(parts), reference=True)
+                got = native.gemm(a, b, trans_a=ta, trans_b=tb, plan=(tile, requested))
+                self.assertEqual(xp.asnumpy(got).tobytes(), xp.asnumpy(expected).tobytes())
+
+    def test_cp_async_tiles_equal_register_chunks_bit_for_bit(self):
+        # Aligned TN operands (float4 path) whose M, N and K leave partial tiles; K = 100 over 7 slices
+        # gives chunks of one BK tile, shorter than the pipeline.
+        rng = np.random.default_rng(33)
+        staged = [tile for tile in native.tile_catalog() if "/s" in tile]
+        self.assertTrue(staged)
+        for m, n, k in ((68, 36, 100), (132, 260, 1000), (64, 64, 640)):
+            a = xp.asarray(rng.standard_normal((k, m)).astype(np.float32))
+            b = xp.asarray(rng.standard_normal((k, n)).astype(np.float32))
+            for tile in staged:
+                bk = native.tile_catalog()[tile][-1]
+                for requested in (1, 3, 7):
+                    with self.subTest(shape=(m, n, k), tile=tile, requested=requested):
+                        chunk = min(k, ((k + requested - 1) // requested + bk - 1) // bk * bk)
+                        parts = [native.gemm(a[lo:lo + chunk], b[lo:lo + chunk], trans_a=True, plan=("128x128", 1))
+                                 for lo in range(0, k, chunk)]
+                        expected = parts[0] if len(parts) == 1 else native.split_reduce(xp.stack(parts), reference=True)
+                        got = native.gemm(a, b, trans_a=True, plan=(tile, requested))
+                        self.assertEqual(xp.asnumpy(got).tobytes(), xp.asnumpy(expected).tobytes())
+
+    def test_invalid_partials_raise(self):
+        with self.assertRaises(ValueError):
+            native.split_reduce(xp.zeros((1, 4, 4), xp.float32))
+        with self.assertRaises(ValueError):
+            native.split_reduce(xp.zeros((4, 4), xp.float32))
+        with self.assertRaises(TypeError):
+            native.split_reduce(xp.zeros((2, 4, 4), xp.float64))
+
+
 @unittest.skipUnless(cuda_available(), "CUDA is required")
 class NativeLinearTests(unittest.TestCase):
     """Linear/Dense on the native backends: forward, dX, dW and db against FP64."""
