@@ -2,6 +2,7 @@ import numpy as np
 
 from ..core.device import xp
 from ..core.node import GradientOp
+from .basic import _reduce_to
 from .fused import softmax_cross_entropy, softmax_cross_entropy_grad
 
 class PerceptionLoss(GradientOp):
@@ -29,8 +30,8 @@ class PerceptionLoss(GradientOp):
         if not self.y_pred.requires_grad:
             return
         grad_signal = xp.where(self.y_true_val * self.y_pred_val < 0, -self.y_true_val, 0)
-        n = max(int(self.y_true_val.size), 1)
-        self.y_pred.accumulate_grad(self.grad * (grad_signal / n), owned=True)
+        n = max(int(grad_signal.size), 1)
+        self.y_pred.accumulate_grad(_reduce_to(self.grad * (grad_signal / n), self.y_pred_val.shape), owned=True)
 
 
 class LogLoss(GradientOp):
@@ -57,13 +58,12 @@ class LogLoss(GradientOp):
         
         # 梯度公式说明: grad = -y_true / (1 + e^x)
        
-        exp_x = xp.exp(xp.clip(self.x, -500, 500)) 
-        grad_x = -1.0 / (1.0 + exp_x)
+        grad_x = -xp.exp(-xp.logaddexp(0, self.x))
         
         # 最终梯度
         final_grad = (self.grad * grad_x * self.y_true.value) / N
         
-        self.y_pred.accumulate_grad(final_grad, owned=True)
+        self.y_pred.accumulate_grad(_reduce_to(final_grad, self.y_pred.value.shape), owned=True)
 
 
 class CrossEntropy(GradientOp):
@@ -84,7 +84,7 @@ class CrossEntropy(GradientOp):
         self.value, self.probs, self._labels, self._targets = softmax_cross_entropy(logits_val, y_true_val)
 
     def backward(self):
-        # 计算 Loss 对 Logits 的梯度：(P - Y) / N；self.grad 由 Graph.backward 传来，为 1.0
+        # 归一化标签为 (P - Y) / N；一般类别权重为 (P * sum(Y) - Y) / N。
         if not self.logits.requires_grad:
             return
         final_grad = softmax_cross_entropy_grad(self.probs, self._labels, self._targets)
@@ -108,6 +108,7 @@ class MSELoss(GradientOp):
         y_pred, y_true = self.parents
         if not y_pred.requires_grad:
             return
-        n = max(y_pred.value.size, 1)
-        g = 2.0 * (y_pred.value - y_true.value) / n
-        y_pred.accumulate_grad(self.grad * g, owned=True)
+        diff = self.y_pred_val - self.y_true_val
+        n = max(diff.size, 1)
+        g = self.grad * (2.0 * diff / n)
+        y_pred.accumulate_grad(_reduce_to(g, y_pred.value.shape), owned=True)

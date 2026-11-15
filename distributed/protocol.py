@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import struct
 
 import numpy as np
@@ -44,7 +45,7 @@ def schema_hash(arrays_or_schema):
 
 
 def _as_fp32(value, name="tensor"):
-    array = np.ascontiguousarray(value)
+    array = np.asarray(value, order="C")
     if array.dtype != np.float32:
         array = array.astype(np.float32, copy=False)
     if not np.isfinite(array).all():
@@ -85,16 +86,19 @@ def encode_tensors(arrays):
 
 def decode_tensors(items, schema):
     expected = {entry["name"]: entry for entry in schema}
+    if len(expected) != len(schema):
+        raise ValueError("duplicate tensor names in schema")
     # gRPC keeps tensor payloads as protobuf bytes.  Accepting a name->array
     # mapping lets that path avoid materializing every FP32 element as a
     # Python float before reconstructing the NumPy array.
     if isinstance(items, dict):
         if set(items) != set(expected):
             raise ValueError("tensor names differ from schema")
-        iterable = ((name, {"name": name, "shape": expected[name]["shape"],
+        iterable = ((name, {"name": name, "shape": list(np.shape(value)),
                             "dtype": expected[name]["dtype"], "data": value})
                     for name, value in items.items())
     elif isinstance(items, list):
+        _check_tensor_names(items)
         if {item.get("name") for item in items} != set(expected):
             raise ValueError("tensor names differ from schema")
         iterable = ((item["name"], item) for item in items)
@@ -105,14 +109,14 @@ def decode_tensors(items, schema):
         spec = expected[name]
         array = np.asarray(item.get("data"), dtype=np.float32)
         shape = tuple(spec["shape"])
-        if int(array.size) != int(np.prod(shape)) or list(item.get("shape", [])) != list(shape):
+        if int(array.size) != math.prod(shape) or list(item.get("shape", [])) != list(shape):
             raise ValueError(f"invalid shape for {name}")
         if item.get("dtype") not in ("float32", "float32", spec["dtype"]):
             raise ValueError(f"invalid dtype for {name}")
         array = array.reshape(shape)
         if not np.isfinite(array).all():
             raise ValueError(f"non-finite array {name}")
-        array = np.ascontiguousarray(array)
+        array = np.asarray(array, order="C")
         # A protobuf bytes field is exposed through a read-only NumPy view;
         # model parameters and optimizer buffers must be writable after
         # initialization.
@@ -185,10 +189,19 @@ def digest_state(parameters, optimizer_state=None, step=None):
     return hashlib.sha256((digest + extra).encode()).hexdigest()
 
 
+def _check_tensor_names(items):
+    if any(not isinstance(item, dict) or not isinstance(item.get("name"), str) for item in items):
+        raise ValueError("tensor entries must be objects with string names")
+    names = [item["name"] for item in items]
+    if len(names) != len(set(names)):
+        raise ValueError("duplicate tensor names")
+
+
 def tensor_mapping(items):
     """Name -> FP32 array of a message's tensors: a gRPC mapping or the Socket JSON item list."""
     if isinstance(items, dict):
         return {name: np.array(value, dtype=np.float32) for name, value in items.items()}
+    _check_tensor_names(items or [])
     return {item["name"]: np.asarray(item["data"], dtype=np.float32).reshape(item["shape"])
             for item in items or []}
 

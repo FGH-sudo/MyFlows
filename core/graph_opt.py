@@ -283,7 +283,7 @@ def fuse_linear_ops(target_node: Node) -> tuple[Node, int]:
         x, w = mm.parents
 
         # 构造融合节点并替换 Add（mm 可能成为孤儿节点，允许其自然被剪枝）
-        lin = Linear(x, w, bias, name=f"{node.name}_fused")
+        lin = Linear(x, w, bias, name=f"{node.name}_fused", bias_first=mm is right)
         if node is root:
             root = lin
         replace_node(node, lin)

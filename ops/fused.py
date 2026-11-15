@@ -434,9 +434,16 @@ def softmax_cross_entropy(logits, target):
     ``target`` holds class indices (shape (N,) or (N, 1)) or per-class targets (N, C). Exactly one
     of ``labels``/``targets`` is returned (the other is None) for use by the backward pass.
     """
+    if logits.ndim != 2 or min(logits.shape) < 1:
+        raise ValueError("logits must have nonempty shape (N, C)")
     n, c = logits.shape
     labels = targets = None
     if target.ndim == 1 or (target.ndim == 2 and target.shape[1] == 1 and c != 1):
+        if target.dtype.kind not in "biu":
+            module = np if isinstance(target, np.ndarray) else _lazy_cupy()
+            if target.dtype.kind != "f" or not bool(module.all(
+                    module.isfinite(target) & (target == module.floor(target)) & (target >= 0) & (target < c))):
+                raise ValueError("class indices must be finite integers within [0, C)")
         labels = target.reshape(-1).astype(np.int64)
         if labels.shape[0] != n:
             raise ValueError("labels must provide one class index per row")
@@ -475,7 +482,7 @@ def softmax_cross_entropy(logits, target):
 
 
 def softmax_cross_entropy_grad(probs, labels, targets):
-    """d(mean loss)/d logits = (probs - target) / N."""
+    """d(mean loss)/d logits; per-class target weights need not sum to one."""
     n = probs.shape[0]
     module = np if isinstance(probs, np.ndarray) else _lazy_cupy()
     if labels is not None:
@@ -483,7 +490,7 @@ def softmax_cross_entropy_grad(probs, labels, targets):
         # Clipped so that an invalid label (already reported as a NaN loss) cannot write out of bounds.
         grad[module.arange(n), module.clip(labels, 0, probs.shape[1] - 1)] -= 1
     else:
-        grad = probs - targets
+        grad = probs * targets.sum(axis=1, keepdims=True) - targets
     grad /= n
     return grad
 

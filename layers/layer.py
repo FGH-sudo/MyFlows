@@ -394,7 +394,7 @@ class Dropout(Layer):
     def __init__(self, p=0.5, seed=None, name=None):
         super().__init__(name=name)
         self.p = float(p)
-        if self.p < 0.0 or self.p >= 1.0:
+        if not 0.0 <= self.p < 1.0:
             raise ValueError("dropout p must be in [0, 1)")
         self.seed = seed
         self.training = True

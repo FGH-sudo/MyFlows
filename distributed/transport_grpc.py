@@ -6,6 +6,7 @@ from concurrent import futures
 import threading
 import time
 import hashlib
+import math
 
 import grpc
 import numpy as np
@@ -34,7 +35,7 @@ _PS_METHODS = {
 
 
 def _array_to_blob(name, array):
-    arr = np.ascontiguousarray(array, dtype="<f4")
+    arr = np.asarray(array, dtype="<f4", order="C")
     return common_pb2.TensorBlob(name=name, shape=list(arr.shape), dtype="float32", data=arr.tobytes())
 
 
@@ -51,27 +52,26 @@ def encoded_to_blobs(items):
 
 
 def blobs_to_encoded(blobs, *, as_arrays=False):
-    if as_arrays:
-        arrays = {}
-        for blob in blobs:
-            array = np.frombuffer(blob.data, dtype="<f4")
-            expected = int(np.prod(blob.shape) or 0)
-            if int(array.size) != expected:
-                raise ValueError(f"protobuf tensor length mismatch for {blob.name}")
-            arrays[blob.name] = array.reshape(tuple(blob.shape))
-        return arrays
-    items = []
+    arrays, items, seen = {}, [], set()
     for blob in blobs:
+        if blob.name in seen:
+            raise ValueError(f"duplicate protobuf tensor name: {blob.name}")
+        seen.add(blob.name)
+        if blob.dtype != "float32" or any(d < 0 for d in blob.shape):
+            raise ValueError(f"invalid protobuf tensor dtype or shape for {blob.name}")
         array = np.frombuffer(blob.data, dtype="<f4")
-        if int(array.size) != int(np.prod(blob.shape) or 0):
+        if int(array.size) != math.prod(blob.shape):
             raise ValueError(f"protobuf tensor length mismatch for {blob.name}")
+        if as_arrays:
+            arrays[blob.name] = array.reshape(tuple(blob.shape))
+            continue
         items.append({
             "name": blob.name,
             "shape": list(blob.shape),
             "dtype": "float32",
             "data": np.ascontiguousarray(array).reshape(blob.shape).reshape(-1).tolist(),
         })
-    return items
+    return arrays if as_arrays else items
 
 
 def dict_to_ps_request(message):

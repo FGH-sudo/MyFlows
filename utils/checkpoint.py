@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import re
 from pathlib import Path
@@ -9,6 +10,8 @@ from ..core.device import asnumpy, xp
 
 
 _CHECKPOINT_VERSION = 1
+_OPTIMIZER_STATES = ("v", "m", "s", "acc_gradient")
+_OPTIMIZER_SCALARS = ("learning_rate", "momentum", "beta", "beta_1", "beta_2", "eps", "t", "acc_no")
 
 
 def _safe_name(name):
@@ -143,7 +146,7 @@ def _collect_optimizer_arrays(optimizer, param_key_by_id):
     if optimizer is None:
         return arrays, {"class": None, "scalars": {}, "states": state_meta}
 
-    for state_name in ("v", "m", "s", "acc_gradient"):
+    for state_name in _OPTIMIZER_STATES:
         state = getattr(optimizer, state_name, None)
         if not isinstance(state, dict):
             continue
@@ -158,16 +161,7 @@ def _collect_optimizer_arrays(optimizer, param_key_by_id):
         state_meta[state_name] = entries
 
     scalars = {}
-    for attr in (
-        "learning_rate",
-        "momentum",
-        "beta",
-        "beta_1",
-        "beta_2",
-        "eps",
-        "t",
-        "acc_no",
-    ):
+    for attr in _OPTIMIZER_SCALARS:
         if not hasattr(optimizer, attr):
             continue
         value = _json_scalar(getattr(optimizer, attr))
@@ -296,54 +290,91 @@ def load_checkpoint(layers, optimizer=None, filepath="checkpoint"):
     if len(saved_buffers) != len(live_buffers):
         raise ValueError(f"buffer 数量不匹配: checkpoint={len(saved_buffers)}, model={len(live_buffers)}")
 
+    epoch = int(metadata.get("epoch", -1))
+    score_value = _read_checkpoint_score(metadata)
+    score_value = 0.0 if score_value is None else float(score_value)
+    if not math.isfinite(score_value):
+        raise ValueError("checkpoint score must be finite")
+    saved_key_to_var = {saved["key"]: _param_by_live_record(layers, live)
+                        for saved, live in zip(saved_params, live_params)}
+    model_keys = [s["key"] for s in (*saved_params, *saved_buffers)]
+    if len(set(model_keys)) != len(model_keys):
+        raise ValueError("duplicate checkpoint model keys")
+    opt_meta = metadata.get("optimizer", {})
     if optimizer is not None:
         from ..train.param_groups import ParameterGroups
 
-        mapping = {saved["key"]: _param_by_live_record(layers, live) for saved, live in zip(saved_params, live_params)}
-        opt_meta = metadata.get("optimizer", {})
-        ParameterGroups.restore(opt_meta.get("param_groups", []), mapping)
+        if opt_meta.get("class") not in (None, optimizer.__class__.__name__):
+            raise ValueError("checkpoint optimizer class does not match the live optimizer")
+        ParameterGroups.restore(opt_meta.get("param_groups", []), saved_key_to_var)
         if opt_meta.get("loss_scaler") is not None:
             from ..train.loss_scaling import DynamicLossScaler
             DynamicLossScaler.from_state(opt_meta["loss_scaler"])
         for key, step in opt_meta.get("parameter_steps", {}).items():
-            if key not in mapping or type(step) is not int or step < 0:
+            if key not in saved_key_to_var or type(step) is not int or step < 0:
                 raise ValueError("invalid optimizer per-parameter step")
+        for attr, value in opt_meta.get("scalars", {}).items():
+            if attr not in _OPTIMIZER_SCALARS or not hasattr(optimizer, attr):
+                raise ValueError(f"invalid optimizer scalar: {attr}")
+            if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+                raise ValueError(f"invalid optimizer scalar: {attr}")
+            if attr in ("t", "acc_no") and type(value) is not int:
+                raise ValueError(f"optimizer {attr} must be a nonnegative integer")
+            if attr in ("momentum", "beta", "beta_1", "beta_2") and value >= 1:
+                raise ValueError(f"optimizer {attr} must be less than one")
 
-    saved_key_to_var = {}
-    with np.load(npz_path, allow_pickle=False) as data:
+    # Validate every referenced array before replacing any live weight or optimizer state.
+    # Host staging avoids an extra full model allocation on the GPU during rollbacks.
+    live_layer_list = collect_layers(layers)
+    arrays = {}
+    with np.load(npz_path, allow_pickle=False) as archive:
+        def stage(key, shape, dtype):
+            if key in arrays:
+                raise ValueError(f"duplicate checkpoint array reference: {key}")
+            if key not in archive:
+                raise ValueError(f"checkpoint array missing: {key}")
+            value = np.asarray(archive[key])
+            if value.shape != tuple(shape) or value.dtype.kind not in "biuf":
+                raise ValueError(f"invalid checkpoint shape or dtype: {key}")
+            with np.errstate(over="ignore", invalid="ignore"):
+                value = value.astype(dtype, copy=False)
+            if not np.isfinite(value).all():
+                raise ValueError(f"non-finite checkpoint array: {key}")
+            arrays[key] = value
+
         for saved, live in zip(saved_params, live_params):
-            value = np.asarray(data[saved["key"]])
-            expected_shape = tuple(live["shape"])
-            if value.shape != expected_shape:
-                raise ValueError(
-                    f"参数形状不匹配 {saved['key']}: checkpoint={value.shape}, model={expected_shape}"
-                )
-            live_var = _param_by_live_record(layers, live)
-            # 按模型参数当前的 dtype 恢复：旧的 float64 断点载入 float32 模型时不会把模型变回 float64
-            live_dtype = getattr(live_var.value, "dtype", None)
-            live_var.value = value.astype(live_dtype) if live_dtype is not None else value.copy()
-            saved_key_to_var[saved["key"]] = live_var
+            var = saved_key_to_var[saved["key"]]
+            stage(saved["key"], live["shape"], var.value.dtype)
+        for saved, live in zip(saved_buffers, live_buffers):
+            current = getattr(live_layer_list[live["layer_index"]], live["name"])
+            stage(saved["key"], current.shape, current.dtype)
+        if optimizer is not None:
+            state_keys = {}
+            for state_name, entries in opt_meta.get("states", {}).items():
+                if state_name not in _OPTIMIZER_STATES or not hasattr(optimizer, state_name):
+                    raise ValueError(f"invalid optimizer state: {state_name}")
+                seen = set()
+                for entry in entries:
+                    key = entry["param_key"]
+                    if key not in saved_key_to_var or key in seen:
+                        raise ValueError(f"unknown or duplicate optimizer parameter: {key}")
+                    seen.add(key)
+                    var = saved_key_to_var[key]
+                    stage(entry["array_key"], var.value.shape, var.value.dtype)
+                state_keys[state_name] = seen
+            if optimizer.__class__.__name__ == "Adam" and state_keys.get("v", set()) != state_keys.get("s", set()):
+                raise ValueError("Adam first and second moments cover different parameters")
 
-        if len(saved_buffers) == len(live_buffers):
-            live_layer_list = collect_layers(layers)
-            for saved, live in zip(saved_buffers, live_buffers):
-                value = np.asarray(data[saved["key"]])
-                layer = live_layer_list[live["layer_index"]]
-                current = getattr(layer, live["name"])
-                if current.shape != value.shape:
-                    raise ValueError(
-                        f"buffer 形状不匹配 {saved['key']}: checkpoint={value.shape}, model={current.shape}"
-                    )
-                arr = xp.asarray(value, dtype=current.dtype)
-                current[...] = arr
+    for key, var in saved_key_to_var.items():
+        var.value = arrays[key]
+    for saved, live in zip(saved_buffers, live_buffers):
+        current = getattr(live_layer_list[live["layer_index"]], live["name"])
+        current[...] = xp.asarray(arrays[saved["key"]], dtype=current.dtype)
+    _restore_optimizer(optimizer, opt_meta, arrays, saved_key_to_var)
 
-        _restore_optimizer(optimizer, metadata.get("optimizer", {}), data, saved_key_to_var)
-
-    epoch = int(metadata.get("epoch", -1))
-    score_value = _read_checkpoint_score(metadata)
     if optimizer is not None:
         print(f"--- 已成功加载断点，准备从 Epoch {epoch + 1} 继续训练 ---")
-    return epoch, 0.0 if score_value is None else float(score_value)
+    return epoch, score_value
 
 
 def _param_by_live_record(layers, live_record):

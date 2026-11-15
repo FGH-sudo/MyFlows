@@ -12,7 +12,7 @@ from ..core.node import GradientOp
 class Dropout_Op(GradientOp):
     def __init__(self, x, p: float = 0.5, training: bool = True, seed: int | None = None, name=None):
         self.p = float(p)
-        if self.p < 0.0 or self.p >= 1.0:
+        if not 0.0 <= self.p < 1.0:
             raise ValueError("dropout p must be in [0, 1)")
         self.training = bool(training)
         self.seed = seed

@@ -1,4 +1,5 @@
 import re
+import string
 
 import numpy as np
 
@@ -18,6 +19,10 @@ def export_onnx(graph, filepath, input_nodes=None, output_names=None, opset=13):
         from onnx import TensorProto, helper, numpy_helper
     except ImportError as exc:
         raise ImportError("导出 ONNX 需要先安装可选依赖: pip install onnx") from exc
+
+    for node in graph.sorted_nodes:
+        if node.__class__.__name__ == "BatchNorm2d_Op" and node.training:
+            raise ValueError("export batchnorm in evaluation mode")
 
     if any(getattr(node, "value", None) is None for node in graph.sorted_nodes):
         graph.forward()
@@ -60,6 +65,28 @@ def export_onnx(graph, filepath, input_nodes=None, output_names=None, opset=13):
             arr = arr.astype(np.float32, copy=False)
         initializers.append(numpy_helper.from_array(arr, name=name))
 
+    def reshape(name, shape, suffix):
+        shape_name, output = f"{suffix}_shape", f"{suffix}_reshaped"
+        add_initializer(shape_name, np.asarray(shape, dtype=np.int64))
+        nodes.append(helper.make_node("Reshape", [name, shape_name], [output], name=f"{suffix}_reshape"))
+        return output
+
+    def dot(parent_names, a, b, output, name):
+        # NumPy dot contracts one axis; ONNX MatMul broadcasts leading axes instead.
+        if a.ndim == 0 or b.ndim == 0:
+            nodes.append(helper.make_node("Mul", parent_names, [output], name=name))
+        elif b.ndim <= 2:
+            nodes.append(helper.make_node("MatMul", parent_names, [output], name=name))
+        else:
+            count = a.ndim + b.ndim - 1
+            if count > len(string.ascii_letters):
+                raise ValueError("dot has too many dimensions for ONNX Einsum")
+            axes = string.ascii_letters[:count]
+            left, right = axes[:a.ndim], axes[a.ndim:]
+            right = right[:-1] + left[-1] + right[-1]
+            equation = f"{left},{right}->{left[:-1]}{right[:-2]}{right[-1]}"
+            nodes.append(helper.make_node("Einsum", parent_names, [output], name=name, equation=equation))
+
     for node in graph.sorted_nodes:
         name = tensor_name(node)
         if isinstance(node, Variable):
@@ -77,10 +104,24 @@ def export_onnx(graph, filepath, input_nodes=None, output_names=None, opset=13):
         attrs = {}
 
         if op_type == "Linear":
-            nodes.append(helper.make_node("Gemm", parent_names, [out_name], name=name))
+            a, b, bias = (p.value for p in node.parents)
+            if a.ndim == b.ndim == 2 and bias.ndim <= 2:
+                nodes.append(helper.make_node("Gemm", parent_names, [out_name], name=name))
+            else:
+                product = f"{name}_dot"
+                dot(parent_names[:2], a, b, product, f"{name}_dot")
+                bias_name = parent_names[2]
+                if node._dot_broadcast_shape != node._dot_shape:
+                    product = reshape(product, node._dot_broadcast_shape, f"{name}_product")
+                if node._bias_broadcast_shape != bias.shape:
+                    bias_name = reshape(bias_name, node._bias_broadcast_shape, f"{name}_bias")
+                nodes.append(helper.make_node("Add", [product, bias_name], [out_name], name=name))
         elif op_type == "MatMul":
-            nodes.append(helper.make_node("MatMul", parent_names, [out_name], name=name))
+            dot(parent_names, *(p.value for p in node.parents), out_name, name)
         elif op_type == "Add":
+            a, b = (p.value for p in node.parents)
+            if a is not None and b is not None and a.ndim == 4 and b.ndim == 1:
+                parent_names[1] = reshape(parent_names[1], (1, b.shape[0], 1, 1), f"{name}_bias")
             nodes.append(helper.make_node("Add", parent_names, [out_name], name=name))
         elif op_type == "ReLU":
             nodes.append(helper.make_node("Relu", parent_names, [out_name], name=name))

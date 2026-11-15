@@ -40,6 +40,11 @@ def normalize_config(**kwargs):
     config.setdefault("device", "cpu")
     config.setdefault("optimizer", "mbgd")
     config.setdefault("learning_rate", 0.01)
+    config["learning_rate"] = float(config["learning_rate"])
+    if not np.isfinite(config["learning_rate"]) or config["learning_rate"] <= 0:
+        raise ValueError("learning_rate must be finite and positive")
+    if config["optimizer"] not in ("mbgd", "adam"):
+        raise ValueError("optimizer must be mbgd or adam")
     config.setdefault("seed", 0)
     config.setdefault("steps", 20)
     config.setdefault("epochs", 1)

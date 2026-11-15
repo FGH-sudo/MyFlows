@@ -119,26 +119,25 @@ class MultiprocessDataLoader:
       index_q.put(None)
 
     workers = []
-    for _ in range(self.num_workers):
-      p = ctx.Process(
-          target=_worker_loop,
-          args=(
-              index_q,
-              out_q,
-              self.dataset,
-              self.load_fn,
-              self.transform_fn,
-              stop_event,
-          ),
-      )
-      p.daemon = True
-      p.start()
-      workers.append(p)
-
     finished_workers = 0
     pending = {}
     next_batch = 0
     try:
+      for _ in range(self.num_workers):
+        p = ctx.Process(
+            target=_worker_loop,
+            args=(
+                index_q,
+                out_q,
+                self.dataset,
+                self.load_fn,
+                self.transform_fn,
+                stop_event,
+            ),
+        )
+        p.daemon = True
+        p.start()
+        workers.append(p)
       while finished_workers < self.num_workers:
         try:
           batch = out_q.get(timeout=0.5)
