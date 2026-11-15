@@ -1,4 +1,6 @@
 # TensorBoard 训练可视化（SummaryWriter 需 torch）
 tensorboard>=2.14.0
-torch>=2.0.0
-torchvision>=0.15.0
+torch>=2.13.0
+torchvision>=0.28.0
+setuptools>=84.1.0
+filelock>=4.2.1
