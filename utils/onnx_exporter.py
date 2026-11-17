@@ -165,6 +165,25 @@ def export_onnx(graph, filepath, input_nodes=None, output_names=None, opset=13):
                 strides=list(node.stride),
                 pads=list(node.padding) * 2,
             ))
+        elif op_type == "AdaptiveAvgPool2d_Op":
+            from ..ops.pooling import adaptive_bins
+
+            h, w = node.parents[0].value.shape[-2:]
+            oh, ow = node.output_size
+            if (h, w) == (oh, ow):
+                nodes.append(helper.make_node("Identity", parent_names, [out_name], name=name))
+            else:
+                # Adaptive bins can overlap and need not be equally sized; fixed AveragePool is not equivalent.
+                ph, pw = np.zeros((oh, h), np.float32), np.zeros((w, ow), np.float32)
+                for i, (start, end) in enumerate(adaptive_bins(h, oh)):
+                    ph[i, start:end] = 1. / (end - start)
+                for i, (start, end) in enumerate(adaptive_bins(w, ow)):
+                    pw[start:end, i] = 1. / (end - start)
+                left, right, pooled = f"{name}_ph", f"{name}_pw", f"{name}_rows"
+                add_initializer(left, ph)
+                add_initializer(right, pw)
+                nodes.append(helper.make_node("MatMul", [left, parent_names[0]], [pooled], name=f"{name}_height"))
+                nodes.append(helper.make_node("MatMul", [pooled, right], [out_name], name=name))
         elif op_type == "ChannelNormalize_Op":
             mean, std, centered = f"{name}_mean", f"{name}_std", f"{name}_centered"
             add_initializer(mean, np.asarray(node.mean, np.float32).reshape(1, -1, 1, 1))

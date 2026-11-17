@@ -63,6 +63,42 @@ class CheckpointScoreMetadataTest(unittest.TestCase):
             self.assertEqual(best_loss, 0.125)
 
 
+class AdaptivePoolExportTest(unittest.TestCase):
+    def test_adaptive_pool_export_matches_rectangular_bin_means(self):
+        import importlib.util
+        import math
+
+        if not all(importlib.util.find_spec(m) for m in ("onnx", "onnxruntime")):
+            self.skipTest("ONNX and ONNX Runtime are optional")
+        import onnxruntime as ort
+
+        from MyFlows.core.device import asnumpy, xp
+        from MyFlows.ops.pooling import AdaptiveAvgPool2d_Op
+
+        rng = np.random.default_rng(39)
+        for shape, target in (((2, 3, 7, 11), (3, 4)), ((1, 2, 2, 3), (5, 4)), ((1, 2, 3, 4), (3, 4))):
+            with self.subTest(shape=shape, target=target), tempfile.TemporaryDirectory() as tmp:
+                x = Variable(xp.asarray(rng.normal(size=shape).astype(np.float32)), name="image")
+                y = AdaptiveAvgPool2d_Op(x, target)
+                graph = Graph(y)
+                graph.forward()
+                path = Path(tmp) / "pool.onnx"
+                export_onnx(graph, path, input_nodes=[x], output_names=["pooled"])
+                session = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+                sample = rng.normal(size=shape).astype(np.float32)
+                expected = np.empty((*shape[:2], *target), np.float32)
+                for i in range(target[0]):
+                    for j in range(target[1]):
+                        patch = sample[:, :, math.floor(i*shape[2]/target[0]):math.ceil((i+1)*shape[2]/target[0]),
+                                       math.floor(j*shape[3]/target[1]):math.ceil((j+1)*shape[3]/target[1])]
+                        expected[:, :, i, j] = patch.mean(axis=(2, 3))
+                actual = session.run(None, {session.get_inputs()[0].name: sample})[0]
+                x.value = xp.asarray(sample)
+                graph.forward()
+                np.testing.assert_allclose(actual, expected, rtol=2e-6, atol=2e-6)
+                np.testing.assert_allclose(actual, asnumpy(y.value), rtol=2e-6, atol=2e-6)
+
+
 class TrainingStateBestCheckpointTest(unittest.TestCase):
     def test_resume_restores_the_best_at_the_snapshot_not_a_later_best(self):
         layer = Dense(3, 2, name="dense")
