@@ -15,16 +15,62 @@ from MyFlows.ops.basic import Add
 
 
 class GraphOptTest(unittest.TestCase):
+    def test_deep_graph_can_run_with_and_without_optimizations(self):
+        depth = sys.getrecursionlimit() + 25
+        start = Variable(np.array(0.0))
+        increment = Variable(np.array(1.0))
+        result = start
+        for _ in range(depth):
+            result = Add(result, increment)
+        for optimize in (False, True):
+            with self.subTest(optimize=optimize):
+                graph = Graph(result, optimize=optimize, fold_constants=True)
+                self.assertEqual(len(graph.nodes), depth + 2)
+                graph.forward()
+                graph.backward()
+                self.assertEqual(float(result.value), depth)
+                self.assertEqual(float(start.grad), 1.)
+                self.assertEqual(float(increment.grad), depth)
+
+    def test_graph_rejects_a_cycle_before_execution(self):
+        value = Variable(np.array(1.0))
+        first = Add(value, value, name="first")
+        last = Add(first, value)
+        first.parents[0] = last
+        for optimize in (False, True):
+            with self.subTest(optimize=optimize), self.assertRaisesRegex(ValueError, "cycle in computation graph"):
+                Graph(last, optimize=optimize, fold_constants=True)
+
     def test_constant_fold_add_chain(self):
         a = Variable(np.array(1.0), constant=True)
         b = Variable(np.array(2.0), constant=True)
         c = Variable(np.array(3.0), constant=True)
+        self.assertFalse(a.requires_grad)
         s = Add(Add(a, b), c)
         g = Graph(s, optimize=True, fold_constants=True)
         self.assertEqual(g._opt_stats["constant_folds"], 2)
         self.assertEqual(len(g.sorted_nodes), 1)
+        self.assertFalse(g.target_node.requires_grad)
         g.forward()
         self.assertAlmostEqual(float(g.target_node.value), 6.0)
+
+        x = Variable(np.array(4.0), trainable=True)
+        folded_plus_x = Add(Add(a, b), x)
+        g2 = Graph(folded_plus_x, optimize=True, fold_constants=True)
+        self.assertEqual(g2._opt_stats["constant_folds"], 1)
+        folded_leaf = next(p for p in g2.target_node.parents if p is not x)
+        self.assertFalse(folded_leaf.requires_grad)
+        g2.forward()
+        g2.backward()
+        self.assertIsNone(folded_leaf.grad)
+        self.assertEqual(float(x.grad), 1.0)
+
+    def test_parameter_requires_grad_cannot_contradict_trainable(self):
+        param = Variable(np.array(1.0), trainable=True)
+        with self.assertRaisesRegex(ValueError, "trainable"):
+            param.requires_grad = False
+        with self.assertRaisesRegex(ValueError, "trainable"):
+            Variable(np.array(1.0), trainable=True, requires_grad=False)
 
     def test_conv2d_fused_bias_single_op(self):
         from MyFlows.layers.layer import Conv2D

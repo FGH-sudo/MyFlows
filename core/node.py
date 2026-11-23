@@ -89,14 +89,19 @@ class GradientOp(Node):
 
 
 class Variable(Node):
-    def __init__(self, value=None, trainable=False, name=None, constant=False, requires_grad=True):
+    def __init__(self, value=None, trainable=False, name=None, constant=False, requires_grad=None):
         self._is_parameter = False
         super().__init__(trainable=trainable, name=name)
         self.value = value
         #: 若为 True，表示运行期不参与训练更新，且可被图优化折叠（常量折叠）
         self.constant = bool(constant)
         #: 为 False 时（如输入图像、标签）算子可以跳过对它的梯度计算；可训练参数始终需要梯度
-        self.requires_grad = requires_grad
+        if self._is_parameter:
+            if requires_grad is not None and bool(requires_grad) != self._trainable:
+                raise ValueError("use trainable to freeze or unfreeze a parameter")
+            self._leaf_requires_grad = self._trainable
+        else:
+            self._leaf_requires_grad = (not self.constant) if requires_grad is None else bool(requires_grad)
 
     @property
     def trainable(self):
@@ -114,6 +119,8 @@ class Variable(Node):
 
     @requires_grad.setter
     def requires_grad(self, value):
+        if self._is_parameter and bool(value) != self._trainable:
+            raise ValueError("use trainable to freeze or unfreeze a parameter")
         self._leaf_requires_grad = bool(value)
 
     def forward(self): 

@@ -253,8 +253,11 @@ class AlexNet(Layer):
         return self.forward_head(self._last_transfer_features)
 
     def train(self, mode=True):
-        for layer in self.dropouts:
-            layer.train(mode)
+        seen = set()
+        for layer in (*self.dropouts, *self.sub_layers):
+            if id(layer) not in seen and hasattr(layer, "train"):
+                seen.add(id(layer))
+                layer.train(mode)
 
     def eval(self):
         self.train(False)

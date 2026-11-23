@@ -25,7 +25,15 @@ def export_onnx(graph, filepath, input_nodes=None, output_names=None, opset=13):
             raise ValueError("export batchnorm in evaluation mode")
 
     if any(getattr(node, "value", None) is None for node in graph.sorted_nodes):
-        graph.forward()
+        bn_groups = getattr(graph, "_bn_groups", None)
+        restore_materialize = bool(bn_groups) and not getattr(graph, "_materialize_values", False)
+        if restore_materialize:
+            graph.materialize_intermediates(True)
+        try:
+            graph.forward()
+        finally:
+            if restore_materialize:
+                graph.materialize_intermediates(False)
 
     input_nodes = None if input_nodes is None else set(input_nodes)
     tensor_names = {}
@@ -125,6 +133,11 @@ def export_onnx(graph, filepath, input_nodes=None, output_names=None, opset=13):
             nodes.append(helper.make_node("Add", parent_names, [out_name], name=name))
         elif op_type == "ReLU":
             nodes.append(helper.make_node("Relu", parent_names, [out_name], name=name))
+        elif op_type == "ReLU6":
+            min_name, max_name = f"{name}_min", f"{name}_max"
+            add_initializer(min_name, np.array(0.0, dtype=np.float32))
+            add_initializer(max_name, np.array(6.0, dtype=np.float32))
+            nodes.append(helper.make_node("Clip", [parent_names[0], min_name, max_name], [out_name], name=name))
         elif op_type == "LeakyReLU":
             attrs["alpha"] = float(getattr(node, "alpha", 0.01))
             nodes.append(helper.make_node("LeakyRelu", parent_names, [out_name], name=name, **attrs))

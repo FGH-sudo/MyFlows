@@ -25,6 +25,9 @@ class NativeCublasConvolutionTests(unittest.TestCase):
             ("P0", (1, 3, 16, 16), (8, 3, 3, 3), (1, 1), (1, 1)),
             ("P1", (4, 16, 32, 32), (32, 16, 3, 3), (1, 1), (1, 1)),
             ("P2", (1, 3, 120, 160), (8, 3, 7, 7), (2, 2), (3, 3)),
+            # 35 channels, 119 pixels: both axes of the 3x3 transpose end in a partial warp tile.
+            ("odd", (2, 35, 7, 17), (5, 35, 3, 3), (1, 1), (1, 1)),
+            ("one_pixel", (2, 5, 1, 1), (3, 5, 3, 3), (1, 1), (1, 1)),
         )
         for case, backend in ((case, backend) for case in cases
                               for backend in ("cuda_native_register", "cuda_native_cublas")):

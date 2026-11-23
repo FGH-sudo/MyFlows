@@ -105,3 +105,35 @@ class LoRATest(unittest.TestCase):
             self.assertEqual(len(session.get_inputs()), 1)
             (output,) = session.run(None, {session.get_inputs()[0].name: x.value})
             np.testing.assert_allclose(output, expected, atol=3e-5, rtol=2e-5)
+
+    def test_resnet34_lora_attach_backward_and_merge_updates_downsample_and_sub_layers(self):
+        model = ms.ResNet34(
+            3,
+            2,
+            base_width=16,
+            stem="cifar",
+            initializer=ms.make_initializer("kaiming_normal", seed=9),
+        )
+        x = ms.Variable(self.rng.uniform(size=(1, 3, 32, 32)).astype(np.float32), requires_grad=False)
+        model.eval()
+        base = self.evaluate(ms.Graph(model(x)))
+        info = attach_resnet_lora(model, 4, seed=10)
+        self.assertEqual(len(info["targets"]), 8)
+        self.assertEqual(sum(p.trainable for p in model.params), 16)
+        self.assertIs(model.layer4[0].downsample[0], model.layer4[0].downsample_conv)
+        self.assertIn(model.transfer_head, model.sub_layers)
+
+        graph = ms.Graph(model(x))
+        self.assertEqual(self.evaluate(graph).tobytes(), base.tobytes())
+        graph.backward()
+        self.assertGreater(sum(float(np.linalg.norm(p.grad)) for p in model.params if p.trainable), 0.0)
+
+        for p in model.params:
+            if p.trainable and p.name.endswith("_B"):
+                p.value[...] = self.rng.normal(scale=0.002, size=p.value.shape)
+        expected = self.evaluate(graph)
+        merge_resnet_lora(model)
+        self.assertIs(model.layer4[0].downsample[0], model.layer4[0].downsample_conv)
+        self.assertFalse(any(isinstance(layer, LoRADense) for layer in model.sub_layers))
+        merged = self.evaluate(ms.Graph(model(x)))
+        np.testing.assert_allclose(merged, expected, atol=3e-5, rtol=2e-5)

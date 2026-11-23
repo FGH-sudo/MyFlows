@@ -4,8 +4,10 @@
 import sys
 import tempfile
 import json
+import os
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 PROJECT_PARENT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_PARENT))
@@ -14,7 +16,7 @@ import numpy as np
 
 from MyFlows import Dense, Variable, Graph, save_checkpoint, load_checkpoint, export_onnx
 from MyFlows.layers.resnet import BatchNorm2d
-from MyFlows.utils.checkpoint import (TrainingStateError, load_training_state, read_checkpoint_metadata,
+from MyFlows.utils.checkpoint import (TrainingStateError, list_training_states, load_training_state, read_checkpoint_metadata,
                                       save_training_state, verify_training_state)
 
 
@@ -132,6 +134,114 @@ class TrainingStateBestCheckpointTest(unittest.TestCase):
             state = save_training_state(tmp, [], None, 1, {"best_loss": 0.25})
             with self.assertRaisesRegex(TrainingStateError, "历史最佳模型"):
                 load_training_state(state, [], None, best_filepath=Path(tmp) / "best")
+
+
+class TrainingStatePublicationTest(unittest.TestCase):
+    def test_retrying_a_step_keeps_the_previous_snapshot_if_publication_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            original = save_training_state(directory, [], None, 4, {"epoch": 1})
+            before = (directory / "latest.json").read_bytes()
+            replace = os.replace
+
+            def fail_on_publication(source, target):
+                if Path(source).name.startswith(".staging-"):
+                    raise OSError("simulated publication failure")
+                return replace(source, target)
+
+            with patch("MyFlows.utils.checkpoint.os.replace", side_effect=fail_on_publication):
+                with self.assertRaisesRegex(OSError, "publication failure"):
+                    save_training_state(directory, [], None, 4, {"epoch": 2})
+            self.assertEqual((directory / "latest.json").read_bytes(), before)
+            self.assertEqual(verify_training_state(original)["step"], 4)
+
+            updated = save_training_state(directory, [], None, 4, {"epoch": 2})
+            self.assertNotEqual(updated, original)
+            self.assertEqual(list_training_states(directory)[0]["path"], updated)
+            self.assertEqual(json.loads((directory / "latest.json").read_bytes())["state"], updated.name)
+            (updated / "checkpoint.npz").write_bytes(b"corrupt")
+            self.assertEqual(list_training_states(directory)[0]["path"], original)
+
+    def test_concurrent_publications_of_the_same_step_have_distinct_valid_paths(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        with tempfile.TemporaryDirectory() as tmp, ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(save_training_state, tmp, [], None, 7, {"epoch": 1})
+            second = pool.submit(save_training_state, tmp, [], None, 7, {"epoch": 2})
+            paths = {first.result(timeout=15), second.result(timeout=15)}
+            self.assertEqual(len(paths), 2)
+            self.assertTrue(all(verify_training_state(path)["step"] == 7 for path in paths))
+            latest = json.loads((Path(tmp) / "latest.json").read_bytes())
+            self.assertEqual(list_training_states(tmp)[0]["path"].name, latest["state"])
+
+    def test_repeated_step_zero_prunes_older_revisions_and_keeps_newest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            paths = [save_training_state(directory, [], None, 0, {"epoch": i}, keep=2) for i in range(4)]
+            step_dirs = [p for p in directory.iterdir() if p.is_dir() and p.name.startswith("step-")]
+            self.assertEqual(len(step_dirs), 2)
+            self.assertEqual(set(step_dirs), set(paths[-2:]))
+            states = list_training_states(directory)
+            self.assertEqual(len(states), 1)
+            self.assertEqual(states[0]["path"], paths[-1])
+            self.assertEqual(states[0]["state"]["epoch"], 3)
+
+    def test_saving_smaller_step_after_rollback_keeps_base_and_prunes_discarded_future(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            for step in (0, 10, 20, 30):
+                save_training_state(directory, [], None, step, {"epoch": 0, "global_step": step}, keep=3)
+            save_training_state(directory, [], None, 15, {"epoch": 0, "global_step": 15}, keep=2)
+            self.assertEqual([s["step"] for s in list_training_states(directory)], [0, 10, 15])
+
+
+class OnnxModelsExportTest(unittest.TestCase):
+    def _skip_without_onnx(self):
+        import importlib.util
+
+        if not (importlib.util.find_spec("onnx") and importlib.util.find_spec("onnxruntime")):
+            self.skipTest("onnx and onnxruntime are required")
+
+    def test_mobilenet_v2_exports_with_relu6_and_matches_ort(self):
+        self._skip_without_onnx()
+        import onnxruntime as ort
+        from MyFlows.layers.mobilenet import MobileNetV2
+        from MyFlows.utils.initializers import make_initializer
+
+        model = MobileNetV2(output_dim=4, dropout=0.0, initializer=make_initializer("kaiming_normal", seed=3))
+        model.eval()
+        rng = np.random.default_rng(11)
+        x = Variable(rng.normal(size=(1, 3, 64, 64)).astype(np.float32), name="input", requires_grad=False)
+        graph = Graph(model(x), optimize=False)
+        graph.forward()
+        expected = graph.target_node.value.copy()
+        with tempfile.TemporaryDirectory() as tmp:
+            onnx_path = Path(tmp) / "mobilenet_v2.onnx"
+            export_onnx(graph, onnx_path, input_nodes=[x], output_names=["output"])
+            session = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
+            (got,) = session.run(None, {session.get_inputs()[0].name: x.value})
+            np.testing.assert_allclose(got, expected, rtol=1e-4, atol=1e-5)
+
+    def test_optimized_resnet18_exports_and_matches_ort(self):
+        self._skip_without_onnx()
+        import onnxruntime as ort
+        from MyFlows import ResNet18
+        from MyFlows.utils.initializers import make_initializer
+
+        model = ResNet18(in_channels=3, output_dim=2, stem="cifar", base_width=8,
+                         initializer=make_initializer("kaiming_normal", seed=5))
+        model.eval()
+        rng = np.random.default_rng(12)
+        x = Variable(rng.normal(size=(1, 3, 32, 32)).astype(np.float32), name="input", requires_grad=False)
+        graph = Graph(model(x), optimize=True)
+        graph.forward()
+        expected = graph.target_node.value.copy()
+        with tempfile.TemporaryDirectory() as tmp:
+            onnx_path = Path(tmp) / "resnet18_opt.onnx"
+            export_onnx(graph, onnx_path, input_nodes=[x], output_names=["output"])
+            session = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
+            (got,) = session.run(None, {session.get_inputs()[0].name: x.value})
+            np.testing.assert_allclose(got, expected, rtol=1e-4, atol=1e-5)
 
 
 def test_batchnorm_buffers_checkpoint_roundtrip():

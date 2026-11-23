@@ -30,6 +30,8 @@ class TorchBasicBlock(nn.Module):
         return self.relu(out + identity)
 
 class TorchResNet18(nn.Module):
+    stage_blocks = (2, 2, 2, 2)
+
     def __init__(self, num_classes=1000):
         super().__init__()
         self.conv1 = nn.Conv2d(3, 64, 7, 2, 3, bias=False)
@@ -37,8 +39,9 @@ class TorchResNet18(nn.Module):
         self.relu = nn.ReLU(inplace=True)
         self.maxpool = nn.MaxPool2d(3, 2, 1)
         inplanes, layers = 64, []
-        for planes, stride in ((64, 1), (128, 2), (256, 2), (512, 2)):
-            layers.append(nn.Sequential(TorchBasicBlock(inplanes, planes, stride), TorchBasicBlock(planes, planes)))
+        for count, (planes, stride) in zip(self.stage_blocks, ((64, 1), (128, 2), (256, 2), (512, 2))):
+            layers.append(nn.Sequential(TorchBasicBlock(inplanes, planes, stride),
+                                        *(TorchBasicBlock(planes, planes) for _ in range(count - 1))))
             inplanes = planes
         self.layer1, self.layer2, self.layer3, self.layer4 = layers
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
@@ -48,6 +51,10 @@ class TorchResNet18(nn.Module):
         x = self.maxpool(self.relu(self.bn1(self.conv1(x))))
         x = self.layer4(self.layer3(self.layer2(self.layer1(x))))
         return self.fc(torch.flatten(self.avgpool(x), 1))
+
+class TorchResNet34(TorchResNet18):
+    stage_blocks = (3, 4, 6, 3)
+
 
 def _conv_bn_relu6(inp, oup, kernel=3, stride=1, groups=1):
     return nn.Sequential(nn.Conv2d(inp, oup, kernel, stride, (kernel - 1) // 2, groups=groups, bias=False),
@@ -100,4 +107,4 @@ class TorchAlexNet(nn.Module):
     def forward(self, x):
         return self.classifier(torch.flatten(self.avgpool(self.features(x)), 1))
 
-TORCH_MODELS = {"resnet18": TorchResNet18, "mobilenet_v2": TorchMobileNetV2, "alexnet": TorchAlexNet}
+TORCH_MODELS = {"resnet18": TorchResNet18, "resnet34": TorchResNet34, "mobilenet_v2": TorchMobileNetV2, "alexnet": TorchAlexNet}

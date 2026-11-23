@@ -207,6 +207,7 @@ Library cublas_module = nullptr;
 CUmodule cuda_module = nullptr;
 CUcontext init_context = nullptr;
 cublasHandle_t cublas_handle = nullptr;
+std::mutex cublas_mutex;
 std::mutex init_mutex;
 bool initialized = false;
 bool debug_sync = false;
@@ -225,22 +226,22 @@ extern "C" __global__ void im2col_forward(
     const float* x, float* cols,
     int N, int CI, int H, int W, int KH, int KW,
     int OH, int OW, int SH, int SW, int PH, int PW) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int features = CI * KH * KW;
-    int rows = N * OH * OW;
+    const long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    const long long features = (long long)CI * KH * KW;
+    const long long rows = (long long)N * OH * OW;
     if (idx >= rows * features) return;
-    int feature = idx % features;
-    int row = idx / features;
-    int kw = feature % KW;
-    int kh = (feature / KW) % KH;
-    int ic = feature / (KH * KW);
-    int ow = row % OW;
-    int oh = (row / OW) % OH;
-    int n = row / (OH * OW);
-    int ih = oh * SH - PH + kh;
-    int iw = ow * SW - PW + kw;
+    const long long feature = idx % features;
+    const long long row = idx / features;
+    const int kw = (int)(feature % KW);
+    const int kh = (int)((feature / KW) % KH);
+    const int ic = (int)(feature / ((long long)KH * KW));
+    const int ow = (int)(row % OW);
+    const int oh = (int)((row / OW) % OH);
+    const int n = (int)(row / ((long long)OH * OW));
+    const int ih = oh * SH - PH + kh;
+    const int iw = ow * SW - PW + kw;
     cols[idx] = (ih >= 0 && ih < H && iw >= 0 && iw < W)
-        ? x[((n * CI + ic) * H + ih) * W + iw]
+        ? x[(((long long)n * CI + ic) * H + ih) * W + iw]
         : 0.0f;
 }
 
@@ -248,26 +249,80 @@ extern "C" __global__ void col2im_backward(
     const float* grad_cols, float* dx,
     int N, int CI, int H, int W, int KH, int KW,
     int OH, int OW, int SH, int SW, int PH, int PW) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= N * CI * H * W) return;
-    int iw = idx % W;
-    int ih = (idx / W) % H;
-    int ic = (idx / (W * H)) % CI;
-    int n = idx / (W * H * CI);
+    const long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    const long long total = (long long)N * CI * H * W;
+    if (idx >= total) return;
+    const int iw = (int)(idx % W);
+    const int ih = (int)((idx / W) % H);
+    const int ic = (int)((idx / ((long long)W * H)) % CI);
+    const int n = (int)(idx / ((long long)W * H * CI));
     float sum = 0.0f;
-    int oh0 = max(0, (ih + PH - KH + SH) / SH);
-    int oh1 = min(OH - 1, (ih + PH) / SH);
-    int ow0 = max(0, (iw + PW - KW + SW) / SW);
-    int ow1 = min(OW - 1, (iw + PW) / SW);
+    const int oh0 = max(0, (ih + PH - KH + SH) / SH);
+    const int oh1 = min(OH - 1, (ih + PH) / SH);
+    const int ow0 = max(0, (iw + PW - KW + SW) / SW);
+    const int ow1 = min(OW - 1, (iw + PW) / SW);
     for (int oh = oh0; oh <= oh1; ++oh)
         for (int ow = ow0; ow <= ow1; ++ow) {
-            int kh = ih + PH - oh * SH;
-            int kw = iw + PW - ow * SW;
-            int row = (n * OH + oh) * OW + ow;
-            int feature = (ic * KH + kh) * KW + kw;
-            sum += grad_cols[row * (CI * KH * KW) + feature];
+            const int kh = ih + PH - oh * SH;
+            const int kw = iw + PW - ow * SW;
+            const long long row = ((long long)n * OH + oh) * OW + ow;
+            const long long feature = ((long long)ic * KH + kh) * KW + kw;
+            sum += grad_cols[row * ((long long)CI * KH * KW) + feature];
         }
     dx[idx] = sum;
+}
+
+// The stride-one, same-padded 3x3 convolutions inside a BasicBlock dominate the patch traffic.
+// Transpose a tile from contiguous NCHW pixels to contiguous (channel, tap) columns.
+extern "C" __global__ void im2col_3x3_same(const float* x, float* cols, int C, int H, int W) {
+    __shared__ float tile[MF_TILE][MF_TILE + 1];
+    const int hw = H * W, features = C * 9;
+    const int p0 = blockIdx.x * MF_TILE, f0 = blockIdx.y * MF_TILE;
+    const int p = p0 + threadIdx.x, h = p / W, w = p % W;
+    const float* image = x + (long long)blockIdx.z * C * hw;
+    float* rows = cols + (long long)blockIdx.z * hw * features;
+    for (int j = threadIdx.y; j < MF_TILE; j += MF_ROWS) {
+        const int f = f0 + j, ih = h + (f % 9) / 3 - 1, iw = w + f % 3 - 1;
+        if (p < hw && f < features)
+            tile[j][threadIdx.x] = ((unsigned)ih < H && (unsigned)iw < W)
+                ? image[((f / 9) * H + ih) * W + iw] : 0.0f;
+    }
+    __syncthreads();
+    const int f = f0 + threadIdx.x;
+    for (int j = threadIdx.y; j < MF_TILE; j += MF_ROWS) {
+        if (p0 + j < hw && f < features)
+            rows[(long long)(p0 + j) * features + f] = tile[threadIdx.x][j];
+    }
+}
+
+// Neighboring lanes gather from the same patch rows across channels. Transpose the sums
+// before writing dx so the stores also run along the contiguous axis of NCHW.
+extern "C" __global__ void col2im_3x3_same(const float* cols, float* dx, int C, int H, int W) {
+    __shared__ float tile[MF_TILE][MF_TILE + 1];
+    const int hw = H * W, c0 = blockIdx.y * MF_TILE, p0 = blockIdx.x * MF_TILE;
+    const int c = c0 + threadIdx.x;
+    const float* rows = cols + (long long)blockIdx.z * hw * C * 9;
+    float* image = dx + (long long)blockIdx.z * C * hw;
+    for (int j = threadIdx.y; j < MF_TILE; j += MF_ROWS) {
+        const int p = p0 + j, h = p / W, w = p % W;
+        if (p >= hw || c >= C) continue;
+        float sum = 0.0f;
+        // Same row-major traversal of contributing output pixels as col2im_backward.
+        #pragma unroll
+        for (int r = -1; r <= 1; ++r) {
+            #pragma unroll
+            for (int s = -1; s <= 1; ++s)
+                if ((unsigned)(h + r) < H && (unsigned)(w + s) < W)
+                    sum += rows[((long long)(p + r * W + s) * C + c) * 9 + 4 - r * 3 - s];
+        }
+        tile[threadIdx.x][j] = sum;
+    }
+    __syncthreads();
+    const int p = p0 + threadIdx.x;
+    for (int j = threadIdx.y; j < MF_TILE; j += MF_ROWS) {
+        if (p < hw && c0 + j < C)
+            image[(long long)(c0 + j) * hw + p] = tile[j][threadIdx.x];
+    }
 }
 
 // GEMM rows are NHWC (N*OHW, CO). One pass writes the NCHW output with the bias and the fused
@@ -352,42 +407,46 @@ extern "C" __global__ void reduce_partials_f64(const double* partial, float* out
 }
 
 extern "C" __global__ void add_bias(float* rows, const float* bias, int M, int N) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= M * N) return;
+    const long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (long long)M * N) return;
     rows[idx] += bias[idx % N];
 }
 
 extern "C" __global__ void maxpool2d_forward_native(
     const float* x, float* y, int* argmax,
     int N, int C, int H, int W, int OH, int OW, int KH, int KW, int SH, int SW) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= N * C * OH * OW) return;
-    int ow = idx % OW, oh = (idx / OW) % OH, nc = idx / (OW * OH);
-    int first = (nc * H + oh * SH) * W + ow * SW;
-    int best = first;
+    const long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (long long)N * C * OH * OW) return;
+    const int ow = (int)(idx % OW);
+    const int oh = (int)((idx / OW) % OH);
+    const int nc = (int)(idx / ((long long)OW * OH));
+    const long long first = ((long long)nc * H + (long long)oh * SH) * W + (long long)ow * SW;
+    long long best = first;
     float value = x[first];
     for (int kh = 0; kh < KH; ++kh)
         for (int kw = 0; kw < KW; ++kw) {
-            int at = first + kh * W + kw;
+            const long long at = first + (long long)kh * W + kw;
             if (x[at] > value || isnan(x[at])) { value = x[at]; best = at; }
         }
     y[idx] = value;
-    argmax[idx] = best;
+    argmax[idx] = (int)best;
 }
 
 extern "C" __global__ void maxpool2d_backward_native(
     const float* dy, const int* argmax, float* dx,
     int N, int C, int H, int W, int OH, int OW, int KH, int KW, int SH, int SW) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= N * C * H * W) return;
-    int iw = idx % W, ih = (idx / W) % H, nc = idx / (W * H);
-    int oh0 = max(0, (ih - KH + SH) / SH), oh1 = min(OH - 1, ih / SH);
-    int ow0 = max(0, (iw - KW + SW) / SW), ow1 = min(OW - 1, iw / SW);
+    const long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (long long)N * C * H * W) return;
+    const int iw = (int)(idx % W);
+    const int ih = (int)((idx / W) % H);
+    const int nc = (int)(idx / ((long long)W * H));
+    const int oh0 = max(0, (ih - KH + SH) / SH), oh1 = min(OH - 1, ih / SH);
+    const int ow0 = max(0, (iw - KW + SW) / SW), ow1 = min(OW - 1, iw / SW);
     float sum = 0.0f;
     for (int oh = oh0; oh <= oh1; ++oh)
         for (int ow = ow0; ow <= ow1; ++ow) {
-            int out = (nc * OH + oh) * OW + ow;
-            if (argmax[out] == idx) sum += dy[out];
+            const long long out = ((long long)nc * OH + oh) * OW + ow;
+            if (argmax[out] == (int)idx) sum += dy[out];
         }
     dx[idx] = sum;
 }
@@ -449,9 +508,9 @@ __device__ __forceinline__ float dot_global(const float* a, const float* b, int 
 // Basic version: one thread per output element on a 1-D grid, operands read from global memory.
 template <int ACC>
 __device__ __forceinline__ void matmul_naive(const float* A, const float* B, float* C, int M, int N, int K) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= M * N) return;
-    const int row = idx / N, col = idx % N;
+    const long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (long long)M * N) return;
+    const int row = (int)(idx / N), col = (int)(idx % N);
     C[idx] = dot_global<32, ACC>(A + (long long)row * K, B + col, N, K);
 }
 
@@ -925,6 +984,7 @@ Kernel kernels[] = {
     {"gemm_split_reduce", nullptr}, {"gemm_split_reduce_parallel", nullptr}, {"gemm_split_pair", nullptr},
     {"gemm_split_exact_g1v4", nullptr}, {"gemm_split_exact_g1v8", nullptr}, {"gemm_split_exact_g1v16", nullptr},
     {"gemm_split_exact_g1v32", nullptr}, {"gemm_split_exact_g2v8", nullptr}, {"gemm_split_exact_g2v16", nullptr},
+    {"im2col_3x3_same", nullptr}, {"col2im_3x3_same", nullptr},
 #define MF_TILE(S, BM, BN, TM, TN, BK, ST)                                                             \
     {"gemm_register_" #S "_nn_v0", nullptr}, {"gemm_register_" #S "_nn_v1", nullptr}, \
     {"gemm_register_" #S "_nt_v0", nullptr}, {"gemm_register_" #S "_nt_v1", nullptr}, \
@@ -937,7 +997,7 @@ enum KernelId : int {
     K_MATMUL_NAIVE, K_MATMUL_TILED16 = K_MATMUL_NAIVE + 3, K_MATMUL_TILED32 = K_MATMUL_TILED16 + 3,
     K_MATMUL_SHARED16 = K_MATMUL_TILED32 + 3, K_MATMUL_SHARED32 = K_MATMUL_SHARED16 + 3,
     K_MATMUL_REGISTER = K_MATMUL_SHARED32 + 3, K_SPLIT_REDUCE = K_MATMUL_REGISTER + 4, K_SPLIT_PARALLEL, K_SPLIT_PAIR,
-    K_SPLIT_EXACT, K_GEMM_REGISTER = K_SPLIT_EXACT + 6,
+    K_SPLIT_EXACT, K_IM2COL_3X3 = K_SPLIT_EXACT + 6, K_COL2IM_3X3, K_GEMM_REGISTER,
 };
 
 // Lanes per output and slices per lane of the gemm_split_exact kernels, in kernel order.
@@ -1230,15 +1290,19 @@ int check_ready() {
 // Row-major C(m x n) = op(A) op(B) expressed through cuBLAS' column-major convention by the caller.
 int gemm(CUstream stream, int trans_a, int trans_b, int m, int n, int k,
          CUdeviceptr a, int lda, CUdeviceptr b, int ldb, CUdeviceptr c, int ldc, int line) {
-    const cublasStatus_t bound = api.cublasSetStream(cublas_handle, stream);
-    if (bound != CUBLAS_STATUS_SUCCESS)
-        return fail(MF_ERR_CUBLAS, line, "cublasSetStream: " + cublas_error_text(bound));
-    const float alpha = 1.0f;
-    const float beta = 0.0f;
-    const cublasStatus_t status = api.cublasSgemm(
-        cublas_handle, trans_a, trans_b, m, n, k, &alpha,
-        reinterpret_cast<const float*>(a), lda, reinterpret_cast<const float*>(b), ldb, &beta,
-        reinterpret_cast<float*>(c), ldc);
+    cublasStatus_t status;
+    {
+        std::lock_guard<std::mutex> lock(cublas_mutex);
+        const cublasStatus_t bound = api.cublasSetStream(cublas_handle, stream);
+        if (bound != CUBLAS_STATUS_SUCCESS)
+            return fail(MF_ERR_CUBLAS, line, "cublasSetStream: " + cublas_error_text(bound));
+        const float alpha = 1.0f;
+        const float beta = 0.0f;
+        status = api.cublasSgemm(
+            cublas_handle, trans_a, trans_b, m, n, k, &alpha,
+            reinterpret_cast<const float*>(a), lda, reinterpret_cast<const float*>(b), ldb, &beta,
+            reinterpret_cast<float*>(c), ldc);
+    }
     if (status != CUBLAS_STATUS_SUCCESS)
         return fail(MF_ERR_CUBLAS, line, "cublasSgemm: " + cublas_error_text(status));
     if (debug_sync) {
@@ -1369,7 +1433,16 @@ struct ConvDims {
     int N, CI, H, W, CO, KH, KW, OH, OW, SH, SW, PH, PW;
 };
 
+bool same_3x3(const ConvDims& d) {
+    return d.KH == 3 && d.KW == 3 && d.SH == 1 && d.SW == 1 && d.PH == 1 && d.PW == 1;
+}
+
 int launch_im2col(std::uint64_t x, std::uint64_t cols, ConvDims d, CUstream stream) {
+    if (same_3x3(d) && blocks_for(d.CI * 9, 32) <= GRID_YZ_LIMIT && static_cast<unsigned>(d.N) <= GRID_YZ_LIMIT) {
+        void* args[] = {&x, &cols, &d.CI, &d.H, &d.W};
+        return launch(K_IM2COL_3X3, blocks_for(d.H * d.W, 32), blocks_for(d.CI * 9, 32), d.N,
+                      32, 8, stream, args, __LINE__);
+    }
     void* args[] = {&x, &cols, &d.N, &d.CI, &d.H, &d.W, &d.KH, &d.KW, &d.OH, &d.OW,
                     &d.SH, &d.SW, &d.PH, &d.PW};
     std::int64_t elements = static_cast<std::int64_t>(d.N) * d.OH * d.OW * d.CI * d.KH * d.KW;
@@ -1515,6 +1588,11 @@ MF_API int mf_conv_backward_plans(
     } else {
         MF_TRY(gemm_rows(input_engine, stream, false, false, M, K, CO, dyT, CO, weight, K, grad_cols, K, workspace,
                          workspace_floats, __LINE__));
+    }
+    if (same_3x3(d) && blocks_for(CI, 32) <= GRID_YZ_LIMIT && static_cast<unsigned>(N) <= GRID_YZ_LIMIT) {
+        void* args[] = {&grad_cols, &dx, &CI, &H, &W};
+        return launch(K_COL2IM_3X3, blocks_for(H * W, 32), blocks_for(CI, 32), N,
+                      32, 8, stream, args, __LINE__);
     }
     void* args[] = {&grad_cols, &dx, &N, &CI, &H, &W, &KH, &KW, &OH, &OW, &SH, &SW, &PH, &PW};
     return launch(K_COL2IM, blocks_for(static_cast<std::int64_t>(N) * CI * H * W, 256), 1, 1, 256, 1, stream, args, __LINE__);

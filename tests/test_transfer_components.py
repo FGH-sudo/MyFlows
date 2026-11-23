@@ -102,3 +102,23 @@ class TransferComponentsTest(unittest.TestCase):
         flat = [p for group in groups for p in group["params"]]
         self.assertEqual(len(flat), len(set(flat)))
         self.assertEqual(set(flat), set(model.params))
+
+    def test_alexnet_eval_propagates_to_transfer_adapter_and_head(self):
+        from MyFlows.layers.layer import Dropout
+        from MyFlows.layers.resnet import BatchNorm2d
+
+        manager = TransferLearningManager.build("alexnet", 3, freeze_stages=5, head="mlp", head_hidden=(4,),
+                                               feature_adapter={"projection": 8, "batch_norm": True},
+                                               initializer=ms.make_initializer("kaiming_normal", seed=6),
+                                               head_dropout=0.5)
+        model = manager.model
+        adapter_bn = next(layer for layer in model.transfer_adapter.sub_layers if isinstance(layer, BatchNorm2d))
+        head_dropout = next(layer for layer in model.transfer_head.sub_layers if isinstance(layer, Dropout))
+        model.train(True)
+        self.assertTrue(adapter_bn.training)
+        self.assertTrue(head_dropout.training)
+        model.eval()
+        self.assertFalse(adapter_bn.training)
+        self.assertFalse(head_dropout.training)
+        for d in model.dropouts:
+            self.assertFalse(d.training)

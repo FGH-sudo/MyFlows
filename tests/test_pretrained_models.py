@@ -208,6 +208,10 @@ class ArchitectureMatchesTorchvisionTest(_DeviceCase):
         self.assertEqual(report["loaded"], 102)  # 20 卷积 + 20 个 BN × 4 + fc；torch 另存的 20 个 num_batches_tracked 按策略忽略
         self.assertEqual(report["ignored"]["keys"], 20)
 
+    def test_resnet34(self):
+        report = self._compare("resnet34", 48)
+        self.assertEqual((report["loaded"], report["ignored"]["keys"]), (182, 36))
+
     def test_mobilenet_v2(self):
         report = self._compare("mobilenet_v2", 64)
         self.assertEqual(report["ignored"]["keys"], 52)

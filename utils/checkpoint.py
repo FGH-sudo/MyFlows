@@ -2,6 +2,8 @@ import json
 import math
 import os
 import re
+import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
@@ -200,7 +202,7 @@ def save_checkpoint(layers, optimizer=None, epoch=0, acc=None, filepath="checkpo
 
     ``training`` 是可选的 JSON 字典（如训练进度），原样写入元数据，由 ``read_checkpoint_metadata`` 读回。
     ``compress=False`` 写不压缩的 NPZ（频繁保存的 TrainingState 用：浮点权重几乎压不小，压缩只是费时）。
-    两个文件先写临时文件再替换：保存中途被结束时，原有断点仍然完整。
+    JSON 与 NPZ 分别通过临时文件替换。需要成组发布时使用 ``save_training_state``。
     """
     json_path, npz_path = resolve_checkpoint_paths(filepath)
     json_path.parent.mkdir(parents=True, exist_ok=True)
@@ -239,7 +241,7 @@ def save_checkpoint(layers, optimizer=None, epoch=0, acc=None, filepath="checkpo
     if training is not None:
         metadata["training"] = training
 
-    # 数组先落盘、元数据后落盘：替换到一半时，旧元数据仍指向同名、同形状的数组
+    # Publish the arrays before the metadata that references them.
     npz_tmp = npz_path.with_name(npz_path.name + ".tmp")
     with npz_tmp.open("wb") as f:
         (np.savez_compressed if compress else np.savez)(f, **arrays)
@@ -418,7 +420,7 @@ def _restore_optimizer(optimizer, optimizer_meta, data, saved_key_to_var):
 # ---- TrainingState: transactional, checksummed snapshots for exact resume and rollback -----------------
 
 TRAINING_STATE_VERSION = 1
-_STATE_DIR = re.compile(r"^step-(\d{9})$")
+_STATE_DIR = re.compile(r"step-(\d{9,})(?:-(\d+))?")
 _STATE_FILES = ("checkpoint.json", "checkpoint.npz")
 
 
@@ -458,49 +460,110 @@ def _copy_checkpoint(source, target):
     _replace_json(json_path, metadata)
 
 
+def _state_directories(directory):
+    if not directory.is_dir():
+        return []
+    entries = []
+    for path in directory.iterdir():
+        match = _STATE_DIR.fullmatch(path.name)
+        if match and path.is_dir():
+            step, revision = match.groups()
+            entries.append((int(step), int(revision or 0), path))
+    return sorted(entries, reverse=True)
+
+
+@contextmanager
+def _state_publication_lock(directory, timeout_s=30.0):
+    deadline = time.monotonic() + float(timeout_s)
+    with (directory / ".publish.lock").open("a+b") as handle:
+        if os.name == "nt":
+            import msvcrt
+
+            while True:
+                handle.seek(0)
+                try:
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    if time.monotonic() > deadline:
+                        raise TimeoutError(f"timed out waiting for {directory / '.publish.lock'}") from None
+                    time.sleep(0.05)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if os.name == "nt":
+                import msvcrt
+
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 def save_training_state(directory, layers, optimizer, step, state, *, keep=3, best_filepath=None):
-    """Write one TrainingState under ``directory/step-<step>/`` as a transaction.
+    """Publish an immutable TrainingState under ``directory/step-<step>/`` (optionally with a revision suffix).
 
     The weights, BN buffers and optimizer state go through :func:`save_checkpoint` (``state`` becomes its
     ``training`` metadata: RNG states, data cursor, early-stopping state, config fingerprint, ...). Everything
     is written into a staging directory first; ``manifest.json`` with the SHA-256 of every file is written
     last, the directory is renamed into place, and only then ``latest.json`` points at it. A crash at any
-    point leaves either the previous states untouched or a staging directory that readers ignore.
-    The newest ``keep`` states are kept (older ones are deleted) plus the step-0 state, the initial weights
-    every rollback can fall back to; returns the state directory. ``best_filepath`` snapshots the historical
+    point leaves previous states available. Repeating a step publishes a new revision alongside its predecessors.
+    The newest ``keep`` steps, the published step and step 0 are retained. Returns the state directory.
+    ``best_filepath`` snapshots the historical
     best checkpoint as well, so a later improvement cannot change the best model of an older state.
     """
     import shutil
-    import time
     import uuid
 
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
-    name = f"step-{int(step):09d}"
+    step = int(step)
+    if step < 0:
+        raise ValueError("TrainingState step must be nonnegative")
+    name = f"step-{step:09d}"
     staging = directory / f".staging-{name}-{uuid.uuid4().hex[:8]}"
     staging.mkdir()
     try:
         epoch = int(state.get("epoch", 0)) if isinstance(state, dict) else 0
         save_checkpoint(layers, optimizer, epoch, filepath=str(staging / "checkpoint"), compress=False,
-                        training={**state, "state_version": TRAINING_STATE_VERSION, "step": int(step)})
+                        training={**state, "state_version": TRAINING_STATE_VERSION, "step": step})
         names = list(_STATE_FILES)
         if best_filepath is not None:
             _copy_checkpoint(best_filepath, staging / "best")
             names.extend(("best.json", "best.npz"))
         files = {f: {"sha256": _sha256(staging / f), "bytes": (staging / f).stat().st_size} for f in names}
         _replace_json(staging / "manifest.json", {"format": "MyFlows TrainingState", "version": TRAINING_STATE_VERSION,
-                                                  "step": int(step), "created_unix_s": time.time(), "files": files})
-        final = directory / name
-        if final.exists():
-            shutil.rmtree(final)
-        os.replace(staging, final)
+                                                  "step": step, "created_unix_s": time.time(), "files": files})
+        with _state_publication_lock(directory):
+            entries = _state_directories(directory)
+            revision = 1 + max((version for saved_step, version, _ in entries if saved_step == step), default=-1)
+            final = directory / (f"{name}-{revision}" if revision else name)
+            os.replace(staging, final)
+            _replace_json(directory / "latest.json", {"state": final.name, "step": step})
+            current = _state_directories(directory)
+            if keep:
+                eligible = sorted({s for s, _, p in current if s != 0 and s <= step and (p / "manifest.json").is_file()})
+                retained = {0, step, *eligible[-keep:]}
+            else:
+                retained = None
+            kept_revisions = {}
+            for old_step, _, path in current:
+                if not (path / "manifest.json").is_file():
+                    continue
+                seen = kept_revisions.get(old_step, 0)
+                if (retained is None or old_step in retained) and seen < 2:
+                    kept_revisions[old_step] = seen + 1
+                else:
+                    shutil.rmtree(path, ignore_errors=True)
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)
         raise
-    _replace_json(directory / "latest.json", {"state": name, "step": int(step)})
-    states = [s for s in list_training_states(directory, verify=False) if s["step"] != 0]
-    for old in states[:-keep] if keep and len(states) > keep else []:
-        shutil.rmtree(old["path"], ignore_errors=True)
     return final
 
 
@@ -535,18 +598,14 @@ def verify_training_state(path):
 
 
 def list_training_states(directory, *, verify=True):
-    """Complete TrainingStates under ``directory``, oldest first: ``[{path, step, state}]``.
+    """Newest complete TrainingState per step, oldest step first: ``[{path, step, state}]``.
 
     ``state`` is the training metadata (read from ``checkpoint.json``); with ``verify`` the checksums are
     checked and broken states are skipped.
     """
-    directory = Path(directory)
-    out = []
-    if not directory.is_dir():
-        return out
-    for entry in sorted(directory.iterdir()):
-        m = _STATE_DIR.match(entry.name)
-        if not m or not entry.is_dir() or not (entry / "manifest.json").exists():
+    out = {}
+    for step, _, entry in _state_directories(Path(directory)):
+        if step in out or not (entry / "manifest.json").is_file():
             continue
         try:
             if verify:
@@ -555,8 +614,8 @@ def list_training_states(directory, *, verify=True):
         except (TrainingStateError, OSError, ValueError):
             continue
         if meta is not None:
-            out.append({"path": entry, "step": int(m.group(1)), "state": meta.get("training") or {}})
-    return sorted(out, key=lambda s: s["step"])
+            out[step] = {"path": entry, "step": step, "state": meta.get("training") or {}}
+    return list(reversed(out.values()))
 
 
 def load_training_state(path, layers, optimizer, *, best_filepath=None):

@@ -18,12 +18,14 @@ ms.use_cuda()  # 或 ms.set_device("cpu")
 | `core/` | 设备、`Tensor` / `Variable` / `Node`、`Graph`、图优化 |
 | `ops/` | 基础算子、激活、卷积（im2col+GEMM）、BN、Dropout、损失 |
 | `ops/cuda_native/` | 原生 C/C++ 调度自写 Conv/Pool CUDA kernel，GEMM 用寄存器分块 kernel 或 cuBLAS（`native.gemm`）；第 19 讲矩阵乘 kernel（`native.matmul`） |
-| `distributed/` | CPU 同步 PS，server/worker/launcher、消息校验与计时 |
+| `distributed/` | 单机同步 Parameter Server（Socket JSON / gRPC）与 Ring AllReduce（gRPC）、状态校验与故障注入 |
+| `monitoring/` | NVML 优先、nvidia-smi 兜底的 GPU 资源采样与 JSONL 记录 |
+| `transfer/` | 预训练权重导入、Adapter / Regression Head、分层冻结与 ResNet LoRA 微调 |
 | `examples/stage1_cnn.py` | 固定 32 样本 FP32 CNN 训练示例 |
-| `layers/` | Dense / Conv / Pool / Dropout、`ResNet18` |
+| `layers/` | Dense / Conv / Pool / AdaptiveAvgPool / Dropout、`ResNet18` / `ResNet34` / `AlexNet` / `MobileNetV2` |
 | `train/` | 优化器（MBGD / Momentum / AdaGrad / RMSProp / Adam）、L1/L2 正则 |
 | `data/` | `MultiprocessDataLoader` 生产者-消费者流水线 |
-| `utils/` | checkpoint、ONNX、指标、增强、可视化、Grad-CAM、量化、初始化、模型检查 |
+| `utils/` | checkpoint（含 `TrainingState` 原子发布）、ONNX、指标、增强、可视化、Grad-CAM、量化、初始化、模型检查 |
 | `tests/` | `unittest` 测试套件 |
 
 ## 主要能力
@@ -31,14 +33,14 @@ ms.use_cuda()  # 或 ms.set_device("cpu")
 - **动态图**：`ms.Graph(logits)` 自动拓扑排序，支持 `forward()` / `backward()`
 - **设备**：`set_device` / `use_cuda` / `cuda_available`；Windows 下可复用本机 CUDA DLL
 - **数值**：层参数默认 float32（`ms.set_default_dtype(np.float64)` 可切换）；BN 统计量、bias 梯度、交叉熵、MSE 等规约在 FP64 中累加后舍入一次；BN / 交叉熵 / Adam 在 GPU 上是融合 kernel；Adam 为标准实现（零初始化矩估计 + 偏差修正）
-- **CNN**：Conv2D（含分组 / 深度 / 空洞 / 转置）、MaxPool、BN、GlobalAvgPool；默认卷积为 im2col + GEMM，可显式选用阶段一直接 CUDA C 或阶段二 CUDA im2col/col2im 实验后端
-- **模型**：当前训练和评估主线使用 `ResNet18`，回归头使用 `output_dim`（DonkeyCar 为 2）
+- **CNN**：Conv2D（含分组 / 深度 / 空洞 / 转置）、MaxPool、AdaptiveAvgPool、BN、ReLU6、GlobalAvgPool；默认卷积为 im2col + GEMM，可显式选用阶段一直接 CUDA C 或阶段二 CUDA im2col/col2im 实验后端
+- **模型与迁移**：主线使用 `ResNet18` / `ResNet34`（支持可选 `stem` / `base_width`），并提供 `AlexNet` / `MobileNetV2`、可配置回归头与预训练 / 冻结 / LoRA 微调能力
 - **训练周边**：Dropout、权重正则、Xavier / Kaiming 等初始化、早停与诊断由父仓库训练脚本编排
-- **图优化**：常量折叠、Linear 融合、Conv+ReLU、推理态 Conv+BN 折叠（`Graph(optimize=True)`）
-- **序列化**：JSON + NPZ checkpoint；`export_onnx` 导出部署图
-- **可视化**：TensorBoard logger、训练 dashboard / observers、PNG 曲线（`utils/viz.py`）
+- **图优化**：常量折叠、Linear 融合、Conv+ReLU、推理态 Conv+BN 折叠（`Graph(optimize=True)`，兼容 ONNX 导出）
+- **序列化**：JSON + NPZ checkpoint、`TrainingState` 原子发布与滚动修订清理；`export_onnx` 导出部署图（支持 `ReLU6` 与 `AdaptiveAvgPool2d`）
+- **可视化与监控**：TensorBoard logger（含指标与资源曲线）、训练 dashboard / observers、PNG 曲线（`utils/viz.py`）与 `monitoring` GPU 采样
 - **指标与增强**：回归 / 分类指标、`DonkeyRegressionEvaluator`；RandomCrop / Rotation / ColorJitter / MixUp / CutMix
-- **解释与量化**：Grad-CAM；ONNX 动态 / 静态 INT8（评测闭环在父仓库 `scripts/`）
+- **解释与量化**：Grad-CAM；ONNX 动态 / 静态 INT8（闭环评测与服务部署在父仓库 `apps/` / `scripts/`）
 
 ## 安装
 

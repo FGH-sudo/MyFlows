@@ -18,18 +18,25 @@ from .device import xp
 from .node import Node, Variable
 
 
-def _topo_sort(target_node: Node):
-    visited, order = set(), []
-
-    def dfs(node):
-        if node in visited:
-            return
-        visited.add(node)
-        for p in getattr(node, "parents", []):
-            dfs(p)
-        order.append(node)
-
-    dfs(target_node)
+def topological_order(target_node: Node) -> list[Node]:
+    """Visit parents before consumers, preserving parent order without recursive calls."""
+    order = []
+    complete = set()
+    active = {target_node}
+    stack = [(target_node, iter(target_node.parents))]
+    while stack:
+        node, parents = stack[-1]
+        parent = next(parents, None)
+        if parent is None:
+            stack.pop()
+            active.remove(node)
+            complete.add(node)
+            order.append(node)
+        elif parent not in complete:
+            if parent in active:
+                raise ValueError(f"cycle in computation graph at {parent.name!r}")
+            active.add(parent)
+            stack.append((parent, iter(parent.parents)))
     return order
 
 
@@ -38,8 +45,6 @@ def _add_values(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     if a.ndim == 4 and b.ndim == 1:
         b_broadcast_shape = (1, b.shape[0], 1, 1)
         return a + b.reshape(b_broadcast_shape)
-    a_broadcast_shape = (1,) * (max(a.ndim, b.ndim) - a.ndim) + a.shape
-    b_broadcast_shape = (1,) * (max(a.ndim, b.ndim) - b.ndim) + b.shape
     return a + b
 
 
@@ -62,7 +67,7 @@ def fold_constant_adds(target_node: Node) -> tuple[Node, int]:
     将 ``Add(常量 Variable, 常量 Variable)`` 折叠为单个 ``Variable(constant=True)``。
 
     仅处理两父节点均为带 ``constant=True`` 的 ``Variable`` 的 ``Add``；其它图结构不变。
-    多轮直到无变化，以便折叠链式 Add。
+    按拓扑顺序替换，后续 Add 可以直接使用前面的折叠结果。
 
     若根节点被替换，返回新的根节点引用，避免调用方仍持有已脱离图的旧节点。
     返回 ``(current_root, fold_count)``。
@@ -71,34 +76,21 @@ def fold_constant_adds(target_node: Node) -> tuple[Node, int]:
 
     current_root = target_node
     total_folded = 0
-    while True:
-        folded = 0
-        sorted_nodes = _topo_sort(current_root)
-        for node in list(sorted_nodes):
-            if not isinstance(node, Add):
-                continue
-            if len(node.parents) != 2:
-                continue
-            a, b = node.parents
-            if not isinstance(a, Variable) or not isinstance(b, Variable):
-                continue
-            if not getattr(a, "constant", False) or not getattr(b, "constant", False):
-                continue
+    for node in topological_order(target_node):
+        if not isinstance(node, Add) or len(node.parents) != 2:
+            continue
+        a, b = node.parents
+        if not isinstance(a, Variable) or not isinstance(b, Variable):
+            continue
+        if not a.constant or not b.constant:
+            continue
 
-            val = _add_values(xp.asarray(a.value), xp.asarray(b.value))
-            new_v = Variable(
-                val,
-                trainable=False,
-                name=f"{node.name}_folded",
-                constant=True,
-            )
-            if node is current_root:
-                current_root = new_v
-            replace_node(node, new_v)
-            folded += 1
-        total_folded += folded
-        if folded == 0:
-            break
+        val = _add_values(xp.asarray(a.value), xp.asarray(b.value))
+        new_v = Variable(val, trainable=False, name=f"{node.name}_folded", constant=True, requires_grad=False)
+        if node is current_root:
+            current_root = new_v
+        replace_node(node, new_v)
+        total_folded += 1
     return current_root, total_folded
 
 
@@ -168,7 +160,7 @@ def fold_bn_into_conv(target_node: Node) -> tuple[Node, int]:
 
     folded = 0
     root = target_node
-    for node in list(_topo_sort(root)):
+    for node in topological_order(root):
         if not isinstance(node, BatchNorm2d_Op):
             continue
         if bool(getattr(node, "training", True)):
@@ -263,8 +255,7 @@ def fuse_linear_ops(target_node: Node) -> tuple[Node, int]:
 
     fused = 0
     root = target_node
-    sorted_nodes = _topo_sort(root)
-    for node in list(sorted_nodes):
+    for node in topological_order(root):
         if not isinstance(node, Add) or len(node.parents) != 2:
             continue
         left, right = node.parents
@@ -306,9 +297,7 @@ def fuse_conv_activation_ops(target_node: Node) -> tuple[Node, int]:
 
     fused = 0
     root = target_node
-    sorted_nodes = _topo_sort(root)
-
-    for node in list(sorted_nodes):
+    for node in topological_order(root):
         if len(node.parents) != 1:
             continue
         parent = node.parents[0]

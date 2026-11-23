@@ -249,6 +249,35 @@ class LossGradientTest(unittest.TestCase):
             with self.assertRaises(ValueError, msg=shape):
                 softmax_cross_entropy(np.zeros(shape), np.zeros(shape[0], dtype=np.int64))
 
+    def test_cross_entropy_grad_masks_out_of_range_integer_labels_with_nan(self):
+        from MyFlows.core.device import asnumpy, cuda_available, get_device, set_device, xp
+
+        probs = np.array([[0.2, 0.5, 0.3], [0.1, 0.2, 0.7], [0.6, 0.3, 0.1]], dtype=np.float32)
+        labels = np.array([1, -1, 3], dtype=np.int64)
+        grad = softmax_cross_entropy_grad(probs, labels, None)
+        np.testing.assert_allclose(grad[0], np.array([0.2, -0.5, 0.3], dtype=np.float32) / 3.0, rtol=1e-6, atol=1e-6)
+        self.assertTrue(np.isnan(grad[1]).all())
+        self.assertTrue(np.isnan(grad[2]).all())
+
+        if cuda_available():
+            prev = get_device()
+            set_device("cuda")
+            try:
+                logits = Variable(xp.asarray([[0.2, 0.5, -0.1], [-0.3, 0.4, 0.2], [0.1, -0.2, 0.3]], dtype=np.float32),
+                                  trainable=True)
+                bad_labels = Variable(xp.asarray([1, -1, 3], dtype=np.int64), requires_grad=False)
+                op = CrossEntropy(logits, bad_labels)
+                g = Graph(op)
+                g.forward()
+                g.backward()
+                self.assertTrue(np.isnan(float(asnumpy(op.value))))
+                g_arr = asnumpy(logits.grad)
+                self.assertTrue(np.isfinite(g_arr[0]).all())
+                self.assertTrue(np.isnan(g_arr[1]).all())
+                self.assertTrue(np.isnan(g_arr[2]).all())
+            finally:
+                set_device(prev)
+
     def test_dropout_probability_must_be_a_number_in_range(self):
         x = Variable(np.ones((2, 2)))
         for p in (float("nan"), -0.1, 1.0, 1.5):

@@ -4,7 +4,7 @@
   - BatchNorm2d:         2D 批归一化层
   - GlobalAvgPool2d:     全局平均池化层
   - BasicBlock:          ResNet 基础残差块
-  - ResNet18:            18 层 ResNet 模型（支持 ImageNet / CIFAR 两种 stem）
+  - ResNet18 / ResNet34: 支持 ImageNet / CIFAR 两种 stem 的 BasicBlock 网络
 
 设计说明:
   - 保持与 MyFlows 其它层一致的动态图风格: 每次 forward 构建一次子图。
@@ -196,8 +196,8 @@ class BasicBlock(Layer):
         return items
 
 
-class ResNet18(Layer):
-    """ResNet-18 模型。
+class _BasicBlockResNet(Layer):
+    """使用 BasicBlock 的四阶段 ResNet。
 
     参数:
       in_channels: 输入图像通道数(RGB 为 3)
@@ -206,7 +206,7 @@ class ResNet18(Layer):
                    'cifar'    使用 3x3/s=1 卷积, 不做 maxpool
       base_width:  各 stage 的基础通道数, 默认 64
       dropout_seed: dropout 掩码的随机种子；None 用全局随机源
-      compat:      'myflows'（默认，旧 checkpoint 的结构）或 'torchvision'：与 torchvision.models.resnet18
+      compat:      'myflows'（默认，旧 checkpoint 的结构）或 'torchvision'：与 torchvision 对应深度的模型
                    逐层一致（imagenet stem、maxpool padding=1、卷积无偏置、BN 无偏 running_var），可载入官方权重
       input_norm:  None 或 'imagenet'：在图内先按 ImageNet 均值/标准差归一化 [0, 1] 的 RGB 输入
     """
@@ -244,11 +244,10 @@ class ResNet18(Layer):
                                     backend=self.conv_backend)
         self.stem_bn = BatchNorm2d(widths[0], unbiased_running_var=unbiased)
 
-        # 4 个 stage, 每个 2 个 BasicBlock
-        self.layer1 = self._make_stage(widths[0], widths[0], num_blocks=2, stride=1, initializer=initializer)
-        self.layer2 = self._make_stage(widths[0], widths[1], num_blocks=2, stride=2, initializer=initializer)
-        self.layer3 = self._make_stage(widths[1], widths[2], num_blocks=2, stride=2, initializer=initializer)
-        self.layer4 = self._make_stage(widths[2], widths[3], num_blocks=2, stride=2, initializer=initializer)
+        self.layer1 = self._make_stage(widths[0], widths[0], self.stage_blocks[0], stride=1, initializer=initializer)
+        self.layer2 = self._make_stage(widths[0], widths[1], self.stage_blocks[1], stride=2, initializer=initializer)
+        self.layer3 = self._make_stage(widths[1], widths[2], self.stage_blocks[2], stride=2, initializer=initializer)
+        self.layer4 = self._make_stage(widths[2], widths[3], self.stage_blocks[3], stride=2, initializer=initializer)
 
         self.avgpool = GlobalAvgPool2d()
         self.dropout = Dropout(float(dropout), seed=dropout_seed, name="resnet_dropout") if float(dropout or 0.0) > 0.0 else None
@@ -340,13 +339,12 @@ class ResNet18(Layer):
         self.train(False)
 
     # --- 预训练权重与分阶段冻结（MyFlows.utils.pretrained） ---
-    arch = "resnet18"
     head_keys = ("fc.weight", "fc.bias")
 
     def torchvision_tensors(self):
         """[(torchvision 名称, 目标, 类型)]；类型 'param_t' 表示载入时转置 [out,in] -> [in,out]。"""
         if self.compat != "torchvision":
-            raise ValueError("torchvision weights need ResNet18(compat='torchvision')")
+            raise ValueError("torchvision weights need compat='torchvision'")
         items = conv_tensors("conv1", self.stem_conv) + bn_tensors("bn1", self.stem_bn)
         for stage_index, stage in enumerate([self.layer1, self.layer2, self.layer3, self.layer4], start=1):
             for block_index, block in enumerate(stage):
@@ -358,3 +356,20 @@ class ResNet18(Layer):
         """可冻结的阶段，按输入到输出排列；任务头（fc）不在其中。"""
         return [("stem", [self.stem_conv, self.stem_bn]), ("layer1", self.layer1), ("layer2", self.layer2),
                 ("layer3", self.layer3), ("layer4", self.layer4)]
+
+
+class ResNet18(_BasicBlockResNet):
+    """18-layer BasicBlock ResNet."""
+
+    arch = "resnet18"
+    stage_blocks = (2, 2, 2, 2)
+
+
+class ResNet34(_BasicBlockResNet):
+    """34-layer BasicBlock ResNet."""
+
+    arch = "resnet34"
+    stage_blocks = (3, 4, 6, 3)
+
+
+BASIC_RESNETS = {model.arch: model for model in (ResNet18, ResNet34)}

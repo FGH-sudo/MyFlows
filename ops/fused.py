@@ -487,8 +487,11 @@ def softmax_cross_entropy_grad(probs, labels, targets):
     module = np if isinstance(probs, np.ndarray) else _lazy_cupy()
     if labels is not None:
         grad = probs.copy()
-        # Clipped so that an invalid label (already reported as a NaN loss) cannot write out of bounds.
+        valid = (labels >= 0) & (labels < probs.shape[1])
+        # Clipped so that an invalid label (already reported as a NaN loss) cannot write out of bounds,
+        # then masked to NaN so invalid GPU labels never produce finite wrong gradients.
         grad[module.arange(n), module.clip(labels, 0, probs.shape[1] - 1)] -= 1
+        grad = module.where(valid[:, None], grad, module.asarray(np.nan, dtype=grad.dtype))
     else:
         grad = probs * targets.sum(axis=1, keepdims=True) - targets
     grad /= n

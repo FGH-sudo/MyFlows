@@ -6,7 +6,7 @@ import numpy as np
 from ..core.device import xp
 from ..core.node import GradientOp, Variable
 from ..layers.layer import Conv2D, Dense, Layer
-from ..layers.resnet import BatchNorm2d
+from ..layers.resnet import BASIC_RESNETS, BatchNorm2d
 from ..ops.basic import Linear
 from ..ops.convolution import Conv2D_Op
 from ..utils.checkpoint import collect_layers
@@ -136,8 +136,8 @@ class LoRAConv2d(Layer):
 
 def attach_resnet_lora(model, rank, *, alpha=None, seed=0):
     """Freeze the source network, then attach adapters to layer4 convolutions and the output head."""
-    if model.arch != "resnet18" or hasattr(model, "transfer_head"):
-        raise ValueError("this LoRA placement expects a ResNet18 with its original linear head")
+    if getattr(model, "arch", None) not in BASIC_RESNETS or hasattr(model, "transfer_head"):
+        raise ValueError("this LoRA placement expects a ResNet18 or ResNet34 with its original linear head")
     for p in model.params:
         p.trainable = False
     for layer in collect_layers([model]):
@@ -155,6 +155,8 @@ def attach_resnet_lora(model, rank, *, alpha=None, seed=0):
                 base, rank, alpha=alpha, seed=None if seed is None else seed + len(swaps), name=name
             )
             setattr(block, attr, wrapped)
+            if attr == "downsample_conv" and block.downsample is not None:
+                block.downsample = (wrapped, block.downsample_bn)
             block.sub_layers = [wrapped if layer is base else layer for layer in block.sub_layers]
             model.sub_layers = [wrapped if layer is base else layer for layer in model.sub_layers]
             block.params.extend((wrapped.A, wrapped.B))
@@ -170,6 +172,7 @@ def attach_resnet_lora(model, rank, *, alpha=None, seed=0):
         name="fc",
         backend=getattr(model, "linear_backend", "auto"),
     )
+    model.sub_layers.append(model.transfer_head)
     model.params.extend((model.transfer_head.A, model.transfer_head.B))
     model._lora_swaps = swaps
     targets.append("fc")
@@ -188,12 +191,15 @@ def merge_resnet_lora(model):
     for block, attr, wrapped in model._lora_swaps:
         base = wrapped.merge()
         setattr(block, attr, base)
+        if attr == "downsample_conv" and block.downsample is not None:
+            block.downsample = (base, block.downsample_bn)
         block.sub_layers = [base if layer is wrapped else layer for layer in block.sub_layers]
         model.sub_layers = [base if layer is wrapped else layer for layer in model.sub_layers]
         factors.update((wrapped.A, wrapped.B))
         block.params = [p for p in block.params if p not in factors]
     head = model.transfer_head.merge()
     factors.update((head.A, head.B))
+    model.sub_layers = [layer for layer in model.sub_layers if layer is not model.transfer_head]
     model.params = [p for p in model.params if p not in factors]
     del model._lora_swaps, model.transfer_head
     return model
