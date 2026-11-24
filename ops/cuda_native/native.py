@@ -315,10 +315,28 @@ def _slices(k, requested, bk=16):
 
 
 @lru_cache(maxsize=8)
+def device_capabilities(device=None):
+    """Query CUDA compute capability, SM count, shared memory and cp.async support for ``device``."""
+    cp = _lazy_cupy()
+    dev = cp.cuda.runtime.getDevice() if device is None else int(device)
+    props = cp.cuda.runtime.getDeviceProperties(dev)
+    name = props["name"].decode() if isinstance(props["name"], bytes) else str(props["name"])
+    cc = (int(props["major"]), int(props["minor"]))
+    return {
+        "device": dev,
+        "name": name,
+        "cc": cc,
+        "sms": int(props["multiProcessorCount"]),
+        "shared_mem_per_block": int(props["sharedMemPerBlock"]),
+        "supports_cp_async": cc >= (8, 0),
+    }
+
+
+@lru_cache(maxsize=8)
 def _device_profile(device):
-    props = _lazy_cupy().cuda.runtime.getDeviceProperties(device)
-    if (props["major"],props["minor"],props["multiProcessorCount"],props["name"].decode()) == (
-            8,9,24,"NVIDIA GeForce RTX 4060 Laptop GPU"):
+    caps = device_capabilities(device)
+    if (caps["cc"][0], caps["cc"][1], caps["sms"], caps["name"]) == (
+            8, 9, 24, "NVIDIA GeForce RTX 4060 Laptop GPU"):
         from .ada_plans import PLANS
         return PLANS
     return {}

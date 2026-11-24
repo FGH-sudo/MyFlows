@@ -12,7 +12,7 @@ def _safe_name(name):
     return re.sub(r"[^0-9a-zA-Z_]+", "_", text).strip("_") or "unnamed"
 
 
-def export_onnx(graph, filepath, input_nodes=None, output_names=None, opset=13, metadata=None):
+def export_onnx(graph, filepath, input_nodes=None, output_names=None, opset=13, metadata=None, dynamic_batch=False):
     """将已构建的 ``Graph`` 导出为 ONNX。"""
     try:
         import onnx
@@ -43,6 +43,18 @@ def export_onnx(graph, filepath, input_nodes=None, output_names=None, opset=13, 
     outputs = []
     value_infos = []
 
+    trace_batch = None
+    if dynamic_batch:
+        for node in graph.sorted_nodes:
+            if isinstance(node, Variable):
+                is_input = (node in input_nodes if input_nodes is not None
+                            else not node._is_parameter and not node.constant)
+                if is_input and getattr(node, "value", None) is not None:
+                    arr = np.asarray(asnumpy(node.value))
+                    if arr.ndim >= 1:
+                        trace_batch = int(arr.shape[0])
+                    break
+
     def tensor_name(node):
         if node not in tensor_names:
             tensor_names[node] = f"{_safe_name(getattr(node, 'name', node.__class__.__name__))}_{len(tensor_names)}"
@@ -65,7 +77,10 @@ def export_onnx(graph, filepath, input_nodes=None, output_names=None, opset=13, 
         value = _onnx_numpy(value)
         if np.issubdtype(value.dtype, np.floating):
             value = value.astype(np.float32, copy=False)
-        return helper.make_tensor_value_info(name, tensor_dtype(value), list(value.shape))
+        dims = list(value.shape)
+        if dynamic_batch and trace_batch is not None and dims and dims[0] == trace_batch:
+            dims[0] = "batch"
+        return helper.make_tensor_value_info(name, tensor_dtype(value), dims)
 
     def add_initializer(name, value):
         arr = _onnx_numpy(value)
@@ -73,7 +88,10 @@ def export_onnx(graph, filepath, input_nodes=None, output_names=None, opset=13, 
             arr = arr.astype(np.float32, copy=False)
         initializers.append(numpy_helper.from_array(arr, name=name))
 
-    def reshape(name, shape, suffix):
+    def reshape(name, shape, suffix, *, allow_dynamic_batch=False):
+        shape = list(shape)
+        if allow_dynamic_batch and dynamic_batch and trace_batch is not None and shape and shape[0] == trace_batch and -1 not in shape:
+            shape[0] = -1
         shape_name, output = f"{suffix}_shape", f"{suffix}_reshaped"
         add_initializer(shape_name, np.asarray(shape, dtype=np.int64))
         nodes.append(helper.make_node("Reshape", [name, shape_name], [output], name=f"{suffix}_reshape"))
@@ -120,7 +138,7 @@ def export_onnx(graph, filepath, input_nodes=None, output_names=None, opset=13, 
                 dot(parent_names[:2], a, b, product, f"{name}_dot")
                 bias_name = parent_names[2]
                 if node._dot_broadcast_shape != node._dot_shape:
-                    product = reshape(product, node._dot_broadcast_shape, f"{name}_product")
+                    product = reshape(product, node._dot_broadcast_shape, f"{name}_product", allow_dynamic_batch=True)
                 if node._bias_broadcast_shape != bias.shape:
                     bias_name = reshape(bias_name, node._bias_broadcast_shape, f"{name}_bias")
                 nodes.append(helper.make_node("Add", [product, bias_name], [out_name], name=name))

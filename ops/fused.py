@@ -657,3 +657,212 @@ def global_norm(arrays):
         flat = np.asarray(a, dtype=np.float64).reshape(-1)
         total += float(np.dot(flat, flat))
     return float(np.sqrt(total))
+
+
+# ---------------------------------------------------------------------------------------------
+# Fused Depthwise Conv2D (NCHW, FP32): zero padded workspace, zero atomics, FP64 dW accumulation.
+# ---------------------------------------------------------------------------------------------
+_DEPTHWISE_SOURCE = r"""
+extern "C" __global__ void mf_depthwise_conv2d_forward(
+    const float* __restrict__ x,
+    const float* __restrict__ w,
+    float* __restrict__ y,
+    int N, int C, int H, int W,
+    int kH, int kW, int oH, int oW,
+    int sh, int sw, int ph, int pw, int dh, int dw)
+{
+    const long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    const long long total = (long long)N * C * oH * oW;
+    if (idx >= total) return;
+    const int ow = (int)(idx % oW);
+    long long tmp = idx / oW;
+    const int oh = (int)(tmp % oH);
+    tmp /= oH;
+    const int c = (int)(tmp % C);
+    const int n = (int)(tmp / C);
+
+    const long long x_base = ((long long)n * C + c) * H;
+    const int w_base = c * kH * kW;
+    float acc = 0.0f;
+    for (int ki = 0; ki < kH; ++ki) {
+        const int ih = oh * sh - ph + ki * dh;
+        if ((unsigned int)ih >= (unsigned int)H) continue;
+        const long long row_off = (x_base + ih) * W;
+        const int w_row = w_base + ki * kW;
+        for (int kj = 0; kj < kW; ++kj) {
+            const int iw = ow * sw - pw + kj * dw;
+            if ((unsigned int)iw < (unsigned int)W) {
+                acc += x[row_off + iw] * w[w_row + kj];
+            }
+        }
+    }
+    y[idx] = acc;
+}
+
+extern "C" __global__ void mf_depthwise_conv2d_backward_input(
+    const float* __restrict__ w,
+    const float* __restrict__ dy,
+    float* __restrict__ dx,
+    int N, int C, int H, int W,
+    int kH, int kW, int oH, int oW,
+    int sh, int sw, int ph, int pw, int dh, int dw)
+{
+    const long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    const long long total = (long long)N * C * H * W;
+    if (idx >= total) return;
+    const int iw = (int)(idx % W);
+    long long tmp = idx / W;
+    const int ih = (int)(tmp % H);
+    tmp /= H;
+    const int c = (int)(tmp % C);
+    const int n = (int)(tmp / C);
+
+    const long long dy_base = ((long long)n * C + c) * oH;
+    const int w_base = c * kH * kW;
+    float acc = 0.0f;
+    for (int ki = 0; ki < kH; ++ki) {
+        const int num_h = ih + ph - ki * dh;
+        if (num_h < 0 || (num_h % sh) != 0) continue;
+        const int oh = num_h / sh;
+        if (oh >= oH) continue;
+        const long long dy_row = (dy_base + oh) * oW;
+        const int w_row = w_base + ki * kW;
+        for (int kj = 0; kj < kW; ++kj) {
+            const int num_w = iw + pw - kj * dw;
+            if (num_w < 0 || (num_w % sw) != 0) continue;
+            const int ow = num_w / sw;
+            if (ow < oW) {
+                acc += dy[dy_row + ow] * w[w_row + kj];
+            }
+        }
+    }
+    dx[idx] = acc;
+}
+
+extern "C" __global__ void mf_depthwise_conv2d_backward_weight(
+    const float* __restrict__ x,
+    const float* __restrict__ dy,
+    float* __restrict__ dw,
+    int N, int C, int H, int W,
+    int kH, int kW, int oH, int oW,
+    int sh, int sw, int ph, int pw, int dh, int dw_dil)
+{
+    __shared__ double smem[256];
+    const int bid = blockIdx.x;
+    const int kj = bid % kW;
+    const int tmp = bid / kW;
+    const int ki = tmp % kH;
+    const int c = tmp / kH;
+    if (c >= C) return;
+
+    const long long n_spatial = (long long)N * oH * oW;
+    const long long hw_per_img = (long long)C * H * W;
+    const long long ohw_per_img = (long long)C * oH * oW;
+    const long long x_c_off = (long long)c * H * W;
+    const long long dy_c_off = (long long)c * oH * oW;
+    const int oHW = oH * oW;
+
+    double acc = 0.0;
+    for (long long j = threadIdx.x; j < n_spatial; j += blockDim.x) {
+        const int n = (int)(j / oHW);
+        const int rem = (int)(j % oHW);
+        const int oh = rem / oW;
+        const int ow = rem % oW;
+        const int ih = oh * sh - ph + ki * dh;
+        const int iw = ow * sw - pw + kj * dw_dil;
+        if ((unsigned int)ih < (unsigned int)H && (unsigned int)iw < (unsigned int)W) {
+            const long long x_at = (long long)n * hw_per_img + x_c_off + (long long)ih * W + iw;
+            const long long dy_at = (long long)n * ohw_per_img + dy_c_off + rem;
+            acc = fma((double)x[x_at], (double)dy[dy_at], acc);
+        }
+    }
+    smem[threadIdx.x] = acc;
+    __syncthreads();
+    for (int offset = blockDim.x >> 1; offset > 0; offset >>= 1) {
+        if (threadIdx.x < offset) {
+            smem[threadIdx.x] += smem[threadIdx.x + offset];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        dw[bid] = (float)smem[0];
+    }
+}
+"""
+
+
+@cache
+def _depthwise_kernel(name: str):
+    return _lazy_cupy().RawKernel(_DEPTHWISE_SOURCE, name, options=("--std=c++17",))
+
+
+def depthwise_conv2d_forward_cuda(x, kernel, stride, padding, dilation):
+    """Fused FP32 CUDA depthwise Conv2D forward without padded workspace allocation."""
+    cp = _lazy_cupy()
+    x = cp.ascontiguousarray(x, dtype=cp.float32)
+    kernel = cp.ascontiguousarray(kernel, dtype=cp.float32)
+    n, c, h, w = (int(v) for v in x.shape)
+    co, k_in, kh, kw = (int(v) for v in kernel.shape)
+    if co != c or k_in != 1:
+        raise ValueError(f"depthwise kernel must have shape ({c}, 1, kH, kW), got {kernel.shape}")
+    sh, sw = (int(v) for v in stride)
+    ph, pw = (int(v) for v in padding)
+    dh, dw = (int(v) for v in dilation)
+    eff_h = (kh - 1) * dh + 1
+    eff_w = (kw - 1) * dw + 1
+    oh = (h + 2 * ph - eff_h) // sh + 1
+    ow = (w + 2 * pw - eff_w) // sw + 1
+    y = cp.empty((n, c, oh, ow), dtype=cp.float32)
+    total = n * c * oh * ow
+    if total > 0:
+        blocks = (total + 255) // 256
+        _depthwise_kernel("mf_depthwise_conv2d_forward")(
+            (blocks,), (256,),
+            (x, kernel, y, np.int32(n), np.int32(c), np.int32(h), np.int32(w),
+             np.int32(kh), np.int32(kw), np.int32(oh), np.int32(ow),
+             np.int32(sh), np.int32(sw), np.int32(ph), np.int32(pw), np.int32(dh), np.int32(dw)),
+        )
+    return y
+
+
+def depthwise_conv2d_backward_cuda(
+    x, kernel, grad_y, input_shape, stride, padding, dilation, *, need_input_grad: bool, need_weight_grad: bool
+):
+    """Fused FP32 CUDA depthwise Conv2D backward (input grad + FP64-accumulated weight grad)."""
+    cp = _lazy_cupy()
+    n, c, h, w = (int(v) for v in input_shape)
+    co, k_in, kh, kw = (int(v) for v in kernel.shape)
+    if co != c or k_in != 1:
+        raise ValueError(f"depthwise kernel must have shape ({c}, 1, kH, kW), got {kernel.shape}")
+    grad_y = cp.ascontiguousarray(grad_y, dtype=cp.float32)
+    oh, ow = (int(v) for v in grad_y.shape[2:])
+    sh, sw = (int(v) for v in stride)
+    ph, pw = (int(v) for v in padding)
+    dh, dw = (int(v) for v in dilation)
+
+    grad_k = None
+    if need_weight_grad:
+        x_arr = cp.ascontiguousarray(x, dtype=cp.float32)
+        grad_k = cp.empty(kernel.shape, dtype=cp.float32)
+        if kernel.size > 0:
+            _depthwise_kernel("mf_depthwise_conv2d_backward_weight")(
+                (int(kernel.size),), (256,),
+                (x_arr, grad_y, grad_k, np.int32(n), np.int32(c), np.int32(h), np.int32(w),
+                 np.int32(kh), np.int32(kw), np.int32(oh), np.int32(ow),
+                 np.int32(sh), np.int32(sw), np.int32(ph), np.int32(pw), np.int32(dh), np.int32(dw)),
+            )
+
+    grad_x = None
+    if need_input_grad:
+        kernel_arr = cp.ascontiguousarray(kernel, dtype=cp.float32)
+        grad_x = cp.empty((n, c, h, w), dtype=cp.float32)
+        total = n * c * h * w
+        if total > 0:
+            blocks = (total + 255) // 256
+            _depthwise_kernel("mf_depthwise_conv2d_backward_input")(
+                (blocks,), (256,),
+                (kernel_arr, grad_y, grad_x, np.int32(n), np.int32(c), np.int32(h), np.int32(w),
+                 np.int32(kh), np.int32(kw), np.int32(oh), np.int32(ow),
+                 np.int32(sh), np.int32(sw), np.int32(ph), np.int32(pw), np.int32(dh), np.int32(dw)),
+            )
+    return grad_k, grad_x

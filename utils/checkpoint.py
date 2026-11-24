@@ -30,7 +30,7 @@ def _json_scalar(value):
 
 
 def _as_roots(layers):
-    if hasattr(layers, "params") or hasattr(layers, "sub_layers"):
+    if hasattr(layers, "params") or hasattr(layers, "sub_layers") or hasattr(layers, "_modules"):
         return [layers]
     return list(layers)
 
@@ -62,6 +62,22 @@ def resolve_checkpoint_paths(filepath):
     return path.with_suffix(".json"), path.with_suffix(".npz")
 
 
+def _iter_layer_buffers(layer):
+    seen = set()
+    for attr in ("running_mean", "running_var"):
+        value = getattr(layer, attr, None)
+        if value is not None and hasattr(value, "shape"):
+            seen.add(attr)
+            yield attr, value
+    for name, buf in getattr(layer, "_buffers", {}).items():
+        if buf is None or not getattr(buf, "persistent", True) or name in seen:
+            continue
+        arr = getattr(buf, "data", buf)
+        if arr is not None and hasattr(arr, "shape"):
+            seen.add(name)
+            yield name, arr
+
+
 def named_state(layers):
     """Parameters and BN running statistics of ``layers`` under their checkpoint keys.
 
@@ -76,9 +92,8 @@ def named_state(layers):
                 continue
             seen.add(id(param))
             params[f"param_{len(params):04d}_{_safe_name(getattr(param, 'name', None))}"] = param
-        for attr in ("running_mean", "running_var"):
-            if hasattr(getattr(layer, attr, None), "shape"):
-                buffers[f"buffer_{len(buffers):04d}_{_safe_name(getattr(layer, 'name', None))}_{attr}"] = (layer, attr)
+        for attr, _arr in _iter_layer_buffers(layer):
+            buffers[f"buffer_{len(buffers):04d}_{_safe_name(getattr(layer, 'name', None))}_{attr}"] = (layer, attr)
     return params, buffers
 
 
@@ -113,12 +128,7 @@ def _collect_model_arrays(layers):
                 "trainable": bool(getattr(param, "trainable", False)),
             })
 
-        for attr in ("running_mean", "running_var"):
-            if not hasattr(layer, attr):
-                continue
-            value = getattr(layer, attr)
-            if not hasattr(value, "shape"):
-                continue
+        for attr, value in _iter_layer_buffers(layer):
             key = f"buffer_{len(buffers):04d}_{_safe_name(layer_name)}_{attr}"
             arrays[key] = asnumpy(value)
             buffers.append({
@@ -349,6 +359,8 @@ def load_checkpoint(layers, optimizer=None, filepath="checkpoint"):
             stage(saved["key"], live["shape"], var.value.dtype)
         for saved, live in zip(saved_buffers, live_buffers):
             current = getattr(live_layer_list[live["layer_index"]], live["name"])
+            if hasattr(current, "data") and not hasattr(current, "__array__"):
+                current = current.data
             stage(saved["key"], current.shape, current.dtype)
         if optimizer is not None:
             state_keys = {}
@@ -371,6 +383,8 @@ def load_checkpoint(layers, optimizer=None, filepath="checkpoint"):
         var.value = arrays[key]
     for saved, live in zip(saved_buffers, live_buffers):
         current = getattr(live_layer_list[live["layer_index"]], live["name"])
+        if hasattr(current, "data") and not hasattr(current, "__array__"):
+            current = current.data
         current[...] = xp.asarray(arrays[saved["key"]], dtype=current.dtype)
     _restore_optimizer(optimizer, opt_meta, arrays, saved_key_to_var)
 

@@ -1,9 +1,12 @@
 from functools import cache
 import os
 
+import numpy as np
+
 from ..core.device import _lazy_cupy, xp, get_device
 from ..core.node import GradientOp
 from . import precision
+from .fused import depthwise_conv2d_backward_cuda, depthwise_conv2d_forward_cuda
 
 
 # 原生 CUDA 后端 -> GEMM 引擎：im2col/col2im、尾处理与池化都是项目自己的 kernel，卷积的三个 GEMM 用
@@ -42,11 +45,18 @@ def _depthwise_windows(shape, kernel_size, stride, padding, dilation):
 
 
 def depthwise_conv2d_forward(x, kernel, stride, padding, dilation):
-    """Depthwise convolution (groups == C_in == C_out): one strided multiply-add per kernel tap.
+    """Depthwise convolution (groups == C_in == C_out): fused CUDA kernel on FP32 GPU, tap loop otherwise.
 
-    The grouped im2col path runs one GEMM per channel (up to 960 in MobileNetV2); this one touches only
-    activation-sized arrays. Returns ``(y, x_padded)``.
+    Returns ``(y, saved_input)``. On FP32 CUDA, ``saved_input`` is ``x`` (zero padded workspace).
     """
+    if (
+        get_device() == "cuda"
+        and getattr(x, "dtype", None) == np.float32
+        and getattr(kernel, "dtype", None) == np.float32
+        and not isinstance(x, np.ndarray)
+        and not isinstance(kernel, np.ndarray)
+    ):
+        return depthwise_conv2d_forward_cuda(x, kernel, stride, padding, dilation), x
     ph, pw = padding
     x_pad = xp.pad(x, ((0, 0), (0, 0), (ph, ph), (pw, pw))) if ph or pw else x
     (out_h, out_w), taps = _depthwise_windows(x.shape, kernel.shape[2:], stride, padding, dilation)
@@ -58,7 +68,31 @@ def depthwise_conv2d_forward(x, kernel, stride, padding, dilation):
 
 def depthwise_conv2d_backward(x_pad, kernel, grad_y, input_shape, stride, padding, dilation, *, need_input_grad,
                               need_weight_grad=True):
-    """Kernel gradient (FP64 accumulation, like the other reductions) and, optionally, the input gradient."""
+    """Kernel gradient (FP64 accumulation) and, optionally, the input gradient."""
+    if (
+        get_device() == "cuda"
+        and getattr(kernel, "dtype", None) == np.float32
+        and getattr(grad_y, "dtype", None) == np.float32
+        and not isinstance(kernel, np.ndarray)
+        and not isinstance(grad_y, np.ndarray)
+        and (not need_weight_grad or (x_pad is not None and getattr(x_pad, "dtype", None) == np.float32 and not isinstance(x_pad, np.ndarray)))
+    ):
+        x_src = x_pad
+        if need_weight_grad and x_pad.shape != tuple(input_shape):
+            ph, pw = padding
+            h, w = input_shape[2:]
+            x_src = x_pad[:, :, ph:ph + h, pw:pw + w]
+        return depthwise_conv2d_backward_cuda(
+            x_src,
+            kernel,
+            grad_y,
+            input_shape,
+            stride,
+            padding,
+            dilation,
+            need_input_grad=need_input_grad,
+            need_weight_grad=need_weight_grad,
+        )
     _, taps = _depthwise_windows(input_shape, kernel.shape[2:], stride, padding, dilation)
     grad_k = xp.zeros(kernel.shape, dtype=kernel.dtype) if need_weight_grad else None
     n, c, h, w = input_shape

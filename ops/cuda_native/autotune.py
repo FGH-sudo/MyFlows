@@ -92,6 +92,7 @@ def _calibrate(layout, shape, identity):
     unsplit = sample()
     free, total = cp.cuda.runtime.memGetInfo()
     workspace_budget = max(0, int(free) - max(512 * 2**20, int(total) // 8))
+    supports_cp_async = tuple(identity["cc"]) >= (8, 0)
     rows = []
     for tile, geometry in native.tile_catalog().items():
         seen = set()
@@ -102,6 +103,11 @@ def _calibrate(layout, shape, identity):
                 continue
             seen.add(slices)
             bytes_needed = 4*m*n*slices if slices > 1 else 0
+            skip_reason = None
+            if "/s" in tile and not supports_cp_async:
+                skip_reason = "cp.async requires compute capability >= 8.0"
+            elif bytes_needed > workspace_budget:
+                skip_reason = "workspace exceeds available dedicated budget"
             rows.append(
                 {
                     "tile": tile,
@@ -109,9 +115,7 @@ def _calibrate(layout, shape, identity):
                     "slices": slices,
                     "workspace_bytes": bytes_needed,
                     "times_ms": [],
-                    "skip": "workspace exceeds available dedicated budget"
-                    if bytes_needed > workspace_budget
-                    else None,
+                    "skip": skip_reason,
                 }
             )
     order = [row for row in rows if not row["skip"]]

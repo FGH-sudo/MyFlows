@@ -7,6 +7,7 @@ import importlib
 # --- 核心组件 (core) ---
 # 导入 Node 和 Variable，并暴露在顶层命名空间 (ms.Node)
 from .core.node import Node, Variable
+from .core.module import Module, Parameter, Buffer
 # 导入 Tensor，并暴露在顶层命名空间 (ms.Tensor)
 from .core.tensor import Tensor
 # 导入 Graph，并暴露在顶层命名空间 (ms.Graph)
@@ -106,7 +107,7 @@ from .data.pipeline import MultiprocessDataLoader
 # 这也作为所有暴露给用户的 API 列表
 __all__ = [
     # Core
-    'Node', 'Variable', 'Tensor', 'Graph',
+    'Node', 'Variable', 'Module', 'Parameter', 'Buffer', 'Tensor', 'Graph',
     'set_device', 'get_device', 'use_cuda', 'cuda_available', 'to_device', 'configure_cuda_dll_path',
     'get_default_dtype', 'set_default_dtype',
     # Layers
