@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import math
 import random
 from abc import ABC, abstractmethod
 from typing import Any
@@ -201,6 +202,122 @@ def default_train_transforms(seed: int | None = None) -> ComposeTransform:
         RandomCrop(seed=seed),
         RandomRotation(seed=seed),
         ColorJitter(seed=seed),
+    ])
+
+
+class RandomHorizontalShift(Transform):
+    """几何一致的水平/轻微垂直平移，并按平移幅度补偿转向角（右移图像 -> 路标右移 -> 增加右转角）。"""
+
+    def __init__(
+        self,
+        max_shift_frac: float = 0.08,
+        steer_per_frac: float = 1.2,
+        max_vertical_frac: float = 0.04,
+        seed: int | None = None,
+    ) -> None:
+        max_shift_frac = float(max_shift_frac)
+        steer_per_frac = float(steer_per_frac)
+        max_vertical_frac = float(max_vertical_frac)
+        for name, val in (
+            ("max_shift_frac", max_shift_frac),
+            ("steer_per_frac", steer_per_frac),
+            ("max_vertical_frac", max_vertical_frac),
+        ):
+            if not math.isfinite(val) or val < 0.0:
+                raise ValueError(f"{name} 必须为有限非负数，收到 {val!r}")
+        self.max_shift_frac = max_shift_frac
+        self.steer_per_frac = steer_per_frac
+        self.max_vertical_frac = max_vertical_frac
+        self._rng = random.Random(seed)
+
+    def __call__(self, image: np.ndarray, label: Any = None) -> tuple[np.ndarray, Any]:
+        _require_cv2()
+        h, w = image.shape[:2]
+        frac_x = self._rng.uniform(-self.max_shift_frac, self.max_shift_frac)
+        frac_y = self._rng.uniform(-self.max_vertical_frac, self.max_vertical_frac)
+        dx = frac_x * float(w)
+        dy = frac_y * float(h)
+        m = np.array([[1.0, 0.0, dx], [0.0, 1.0, dy]], dtype=np.float32)
+        src = np.asarray(image, dtype=np.float32)
+        out = cv2.warpAffine(
+            src,
+            m,
+            (w, h),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REPLICATE,
+        )
+        out_label = label
+        delta = frac_x * self.steer_per_frac
+        if label is not None:
+            if isinstance(label, np.ndarray):
+                out_label = label.copy()
+                if out_label.ndim == 0:
+                    out_label = np.asarray(
+                        np.clip(float(out_label) + delta, -1.0, 1.0),
+                        dtype=label.dtype,
+                    )
+                else:
+                    flat = out_label.reshape(-1)
+                    if flat.size >= 1:
+                        flat[0] = np.clip(float(flat[0]) + delta, -1.0, 1.0)
+            elif isinstance(label, (list, tuple)):
+                out_vals = list(label)
+                if out_vals:
+                    out_vals[0] = float(np.clip(float(out_vals[0]) + delta, -1.0, 1.0))
+                out_label = tuple(out_vals) if isinstance(label, tuple) else out_vals
+            elif isinstance(label, (int, float, np.floating, np.integer)):
+                out_label = float(np.clip(float(label) + delta, -1.0, 1.0))
+        return _clip01(out), out_label
+
+
+class RandomShadow(Transform):
+    """沿随机半平面施加局部阴影遮暗，不改变控制标签。"""
+
+    def __init__(
+        self,
+        prob: float = 0.5,
+        min_alpha: float = 0.45,
+        max_alpha: float = 0.85,
+        seed: int | None = None,
+    ) -> None:
+        prob = float(prob)
+        min_alpha = float(min_alpha)
+        max_alpha = float(max_alpha)
+        if not math.isfinite(prob) or not (0.0 <= prob <= 1.0):
+            raise ValueError(f"prob 必须在 [0, 1] 内，收到 {prob!r}")
+        if not math.isfinite(min_alpha) or not math.isfinite(max_alpha) or not (0.0 < min_alpha <= max_alpha <= 1.0):
+            raise ValueError(f"min_alpha/max_alpha 需满足 0 < min_alpha <= max_alpha <= 1，收到 {(min_alpha, max_alpha)!r}")
+        self.prob = prob
+        self.min_alpha = min_alpha
+        self.max_alpha = max_alpha
+        self._rng = random.Random(seed)
+
+    def __call__(self, image: np.ndarray, label: Any = None) -> tuple[np.ndarray, Any]:
+        if self._rng.random() >= self.prob:
+            return _clip01(image), label
+        h, w = image.shape[:2]
+        x1 = self._rng.uniform(0.0, float(w))
+        x2 = self._rng.uniform(0.0, float(w))
+        side = self._rng.random() < 0.5
+        alpha = self._rng.uniform(self.min_alpha, self.max_alpha)
+        ys = np.arange(h, dtype=np.float32)[:, None]
+        xs = np.arange(w, dtype=np.float32)[None, :]
+        cross = (x2 - x1) * ys - float(h) * (xs - x1)
+        mask = (cross >= 0.0) if side else (cross < 0.0)
+        out = image.astype(np.float32, copy=True)
+        out[mask] *= float(alpha)
+        return _clip01(out), label
+
+
+def driving_train_transforms(seed: int | None = None) -> ComposeTransform:
+    """自动驾驶训练增强流水线（水平平移+转向补偿 + 随机阴影 + 色彩抖动）。"""
+    s0 = seed
+    s1 = None if seed is None else int(seed) + 101
+    s2 = None if seed is None else int(seed) + 202
+    return ComposeTransform([
+        RandomHorizontalShift(max_shift_frac=0.08, steer_per_frac=1.2, max_vertical_frac=0.04, seed=s0),
+        RandomShadow(prob=0.5, min_alpha=0.45, max_alpha=0.85, seed=s1),
+        ColorJitter(brightness=0.25, contrast=0.2, saturation=0.15, seed=s2),
     ])
 
 

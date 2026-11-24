@@ -1,3 +1,5 @@
+import math
+
 import numpy as np
 
 from ..core.device import xp
@@ -111,4 +113,108 @@ class MSELoss(GradientOp):
         diff = self.y_pred_val - self.y_true_val
         n = max(diff.size, 1)
         g = self.grad * (2.0 * diff / n)
+        y_pred.accumulate_grad(_reduce_to(g, y_pred.value.shape), owned=True)
+
+
+class HuberLoss(GradientOp):
+    """Smooth Huber (L1/L2) 回归损失，对极端异常标签更稳健。"""
+
+    def __init__(self, y_pred, y_true, delta: float = 1.0, name="HuberLoss"):
+        delta = float(delta)
+        if not math.isfinite(delta) or delta <= 0.0:
+            raise ValueError(f"HuberLoss delta 必须为有限正数，收到 {delta!r}")
+        super().__init__(y_pred, y_true, name=name)
+        self.delta = delta
+
+    def forward(self, y_pred_val, y_true_val):
+        self.y_pred_val = y_pred_val
+        self.y_true_val = y_true_val
+        diff = y_pred_val - y_true_val
+        abs_diff = xp.abs(diff)
+        d = self.delta
+        elem = xp.where(abs_diff <= d, 0.5 * diff * diff, d * (abs_diff - 0.5 * d))
+        self.value = xp.mean(elem, dtype=np.float64).astype(diff.dtype)
+
+    def backward(self):
+        y_pred, _y_true = self.parents
+        if not y_pred.requires_grad:
+            return
+        diff = self.y_pred_val - self.y_true_val
+        elem_grad = xp.clip(diff, -self.delta, self.delta)
+        n = max(int(diff.size), 1)
+        g = (self.grad * (elem_grad / n)).astype(diff.dtype, copy=False)
+        y_pred.accumulate_grad(_reduce_to(g, y_pred.value.shape), owned=True)
+
+
+class WeightedControlLoss(GradientOp):
+    """面向 [angle, throttle] 驾驶控制的加权回归损失（支持 MSE / Huber，及弯道与通道权重）。"""
+
+    def __init__(
+        self,
+        y_pred,
+        y_true,
+        *,
+        base: str = "mse",
+        delta: float = 0.2,
+        angle_weight: float = 1.0,
+        throttle_weight: float = 1.0,
+        turn_weight: float = 0.0,
+        name="WeightedControlLoss",
+    ):
+        if base not in ("mse", "huber"):
+            raise ValueError(f"base 只能是 'mse' 或 'huber'，收到 {base!r}")
+        delta = float(delta)
+        angle_weight = float(angle_weight)
+        throttle_weight = float(throttle_weight)
+        turn_weight = float(turn_weight)
+        if not math.isfinite(delta) or delta <= 0.0:
+            raise ValueError(f"delta 必须为有限正数，收到 {delta!r}")
+        for label_name, val in (
+            ("angle_weight", angle_weight),
+            ("throttle_weight", throttle_weight),
+            ("turn_weight", turn_weight),
+        ):
+            if not math.isfinite(val) or val < 0.0:
+                raise ValueError(f"{label_name} 必须为有限非负数，收到 {val!r}")
+        if angle_weight + throttle_weight <= 0.0:
+            raise ValueError("angle_weight 与 throttle_weight 不能同时为 0")
+        super().__init__(y_pred, y_true, name=name)
+        self.base = base
+        self.delta = delta
+        self.angle_weight = angle_weight
+        self.throttle_weight = throttle_weight
+        self.turn_weight = turn_weight
+
+    def forward(self, y_pred_val, y_true_val):
+        if y_pred_val.ndim < 1 or y_pred_val.shape[-1] != 2:
+            raise ValueError(f"WeightedControlLoss 需要最后一维为 2 ([angle, throttle])，收到 {y_pred_val.shape}")
+        if y_true_val.shape != y_pred_val.shape:
+            raise ValueError(f"y_true 形状 {y_true_val.shape} 与 y_pred 形状 {y_pred_val.shape} 不匹配")
+        self.y_pred_val = y_pred_val
+        self.y_true_val = y_true_val
+        diff = y_pred_val - y_true_val
+        if self.base == "mse":
+            elem = diff * diff
+        else:
+            abs_diff = xp.abs(diff)
+            d = self.delta
+            elem = xp.where(abs_diff <= d, 0.5 * diff * diff, d * (abs_diff - 0.5 * d))
+        w0 = (self.angle_weight * (1.0 + self.turn_weight * xp.abs(y_true_val[..., 0]))).astype(
+            diff.dtype, copy=False
+        )
+        w1 = xp.full_like(w0, self.throttle_weight, dtype=diff.dtype)
+        weights = xp.stack([w0, w1], axis=-1)
+        w_sum = xp.sum(weights, dtype=np.float64)
+        self._weights = weights
+        self._w_sum = w_sum
+        self.value = (xp.sum(weights * elem, dtype=np.float64) / w_sum).astype(diff.dtype)
+
+    def backward(self):
+        y_pred, _y_true = self.parents
+        if not y_pred.requires_grad:
+            return
+        diff = self.y_pred_val - self.y_true_val
+        delem = 2.0 * diff if self.base == "mse" else xp.clip(diff, -self.delta, self.delta)
+        inv_w_sum = (1.0 / self._w_sum).astype(diff.dtype)
+        g = (self.grad * (self._weights * delem * inv_w_sum)).astype(diff.dtype, copy=False)
         y_pred.accumulate_grad(_reduce_to(g, y_pred.value.shape), owned=True)

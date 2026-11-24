@@ -12,7 +12,7 @@ def _safe_name(name):
     return re.sub(r"[^0-9a-zA-Z_]+", "_", text).strip("_") or "unnamed"
 
 
-def export_onnx(graph, filepath, input_nodes=None, output_names=None, opset=13):
+def export_onnx(graph, filepath, input_nodes=None, output_names=None, opset=13, metadata=None):
     """将已构建的 ``Graph`` 导出为 ONNX。"""
     try:
         import onnx
@@ -254,6 +254,13 @@ def export_onnx(graph, filepath, input_nodes=None, output_names=None, opset=13):
         value_info=value_infos,
     )
     model = helper.make_model(model_graph, opset_imports=[helper.make_operatorsetid("", int(opset))])
+    if metadata:
+        for key, value in sorted(metadata.items()):
+            if value is None:
+                continue
+            prop = model.metadata_props.add()
+            prop.key = str(key)
+            prop.value = str(value)
     onnx.checker.check_model(model)
     onnx.save(model, filepath)
     return str(filepath)

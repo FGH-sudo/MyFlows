@@ -44,7 +44,7 @@ from .utils.serialization import save_checkpoint, load_checkpoint, export_onnx
 # 导入基本操作 
 from .ops.basic import Add, MatMul
 # 导入损失函数 
-from .ops.loss import PerceptionLoss, LogLoss, CrossEntropy, MSELoss
+from .ops.loss import PerceptionLoss, LogLoss, CrossEntropy, MSELoss, HuberLoss, WeightedControlLoss
 # 导入激活函数
 from .ops.activation import Logistic, Softmax, Tanh, ReLU, LeakyReLU
 # 导入卷积、池化、展平算子
@@ -64,6 +64,7 @@ from .ops.dropout import Dropout_Op
 # 导入优化器 (ms.Optimizer, ms.MBGD, ms.Momentum, ms.AdaGrad, ms.RMSProp, ms.Adam)
 from .train.opt import Optimizer, MBGD, Momentum, AdaGrad, RMSProp, Adam
 from .train.regularization import RegularizationConfig, apply_regularization
+from .train.scheduler import CosineWarmupScheduler
 
 # --- 工具 (utils) ---
 from .utils.metrics import (
@@ -91,9 +92,12 @@ from .utils.transforms import (
     CutMix,
     MixUp,
     RandomCrop,
+    RandomHorizontalShift,
     RandomRotation,
+    RandomShadow,
     augment_chw_batch,
     default_train_transforms,
+    driving_train_transforms,
 )
 from .data.pipeline import MultiprocessDataLoader
 
@@ -110,10 +114,13 @@ __all__ = [
     'BatchNorm2d', 'GlobalAvgPool2d', 'BasicBlock', 'ResNet18', 'ResNet34',
     'VGG11', 'VGG11Standard', 'VGG13', 'vgg_fc_input_dim',
     # Ops
-    'Add', 'MatMul', 'PerceptionLoss', 'LogLoss', 'CrossEntropy', 'MSELoss', 'Logistic', 'Softmax', 'Tanh', 'ReLU', 'LeakyReLU', 'Conv2D_Op', 'ConvTranspose2D_Op', 'Dropout_Op', 'MaxPool2d_Op', 'Flatten_Op', 'effective_kernel_size', 'im2col', 'col2im',
+    'Add', 'MatMul', 'PerceptionLoss', 'LogLoss', 'CrossEntropy', 'MSELoss', 'HuberLoss', 'WeightedControlLoss',
+    'Logistic', 'Softmax', 'Tanh', 'ReLU', 'LeakyReLU', 'Conv2D_Op', 'ConvTranspose2D_Op', 'Dropout_Op',
+    'MaxPool2d_Op', 'Flatten_Op', 'effective_kernel_size', 'im2col', 'col2im',
     'BatchNorm2d_Op', 'GlobalAvgPool2d_Op',
     # Train
     'Optimizer', 'MBGD', 'Momentum', 'AdaGrad', 'RMSProp', 'Adam', 'RegularizationConfig', 'apply_regularization',
+    'CosineWarmupScheduler',
     # Utils
     'mse', 'mae', 'rmse', 'r2_score', 'regression_metrics', 'multivariate_regression_metrics',
     'angle_sign_accuracy', 'accuracy', 'confusion_matrix', 'precision_recall_f1', 'classification_report',
@@ -122,7 +129,8 @@ __all__ = [
     'TensorBoardLogger', 'has_tensorboard_events',
     'make_initializer', 'model_summary', 'format_model_summary', 'inspect_graph', 'format_inspection_report',
     'ComposeTransform', 'RandomCrop', 'RandomRotation', 'ColorJitter', 'MixUp', 'CutMix',
-    'default_train_transforms', 'augment_chw_batch',
+    'RandomHorizontalShift', 'RandomShadow', 'default_train_transforms', 'driving_train_transforms',
+    'augment_chw_batch',
     'quantize_onnx_dynamic', 'quantize_onnx_static',
     'MultiprocessDataLoader',
 ]
