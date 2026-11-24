@@ -73,6 +73,30 @@ class ProtocolSchemaTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             pack_frame({"payload": "x" * 100}, max_bytes=8)
 
+    def test_recv_frame_from_buffer_consumes_bytearray_in_place(self):
+        messages = [{"protocol_version": PROTOCOL_VERSION, "type": "push", "n": i} for i in range(2)]
+        blob = pack_frame(messages[0]) + pack_frame(messages[1])
+        buf = bytearray(blob[:5])
+        buf_id = id(buf)
+        frame, out_buf = recv_frame_from_buffer(buf)
+        self.assertIsNone(frame)
+        self.assertIs(out_buf, buf)
+        self.assertEqual(id(out_buf), buf_id)
+        buf.extend(blob[5:])
+        first, out1 = recv_frame_from_buffer(buf)
+        self.assertIs(out1, buf)
+        self.assertEqual(unpack_frame(first), messages[0])
+        second, out2 = recv_frame_from_buffer(buf)
+        self.assertIs(out2, buf)
+        self.assertEqual(unpack_frame(second), messages[1])
+        self.assertEqual(len(buf), 0)
+        from_bytes, rem = recv_frame_from_buffer(blob)
+        self.assertEqual(unpack_frame(from_bytes), messages[0])
+        self.assertIsInstance(rem, bytearray)
+        oversized = struct.pack("!I", 64) + b"{}"
+        with self.assertRaises(ValueError):
+            recv_frame_from_buffer(bytearray(oversized), max_bytes=16)
+
     def test_weighted_mean_uses_sample_counts(self):
         g0 = {"w": np.ones((2, 2), np.float32)}
         g1 = {"w": np.full((2, 2), 3.0, np.float32)}

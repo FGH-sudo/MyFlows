@@ -428,10 +428,11 @@ class RingSync(RankSync):
         self._server = threading.Thread(
             target=serve_ring_grpc, args=(self.inbox, lambda message: {"status": STATUS_OK, "error": ""},
                                           port, self._server_stop),
-            kwargs={"host": spec["host"]}, daemon=True)
+            kwargs={"host": spec["host"], "max_bytes": spec["max_bytes"]}, daemon=True)
         self._server.start()
         right = spec["ring_ports"][(self.rank + 1) % self.world_size]
-        self.right = GrpcRingClient(spec["host"], right, timeout=spec["timeout"])
+        self.right = GrpcRingClient(spec["host"], right, timeout=spec["timeout"],
+                                    max_bytes=spec["max_bytes"])
         self.barrier = GrpcPsClient(spec["host"], spec["barrier_port"], timeout=spec["timeout"],
                                     max_bytes=spec["max_bytes"])
 

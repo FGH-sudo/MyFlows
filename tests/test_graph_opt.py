@@ -147,6 +147,39 @@ class GraphOptTest(unittest.TestCase):
         self.assertIsInstance(g.target_node, ConvTranspose2D_LeakyReLU_Op)
         self.assertAlmostEqual(g.target_node.alpha, 0.15)
 
+    def test_multi_consumer_matmul_and_conv_are_not_fused(self):
+        from MyFlows.core.graph_opt import apply_graph_optimizations
+        from MyFlows.layers.layer import Conv2D
+        from MyFlows.ops.activation import ReLU
+        from MyFlows.ops.basic import Add, MatMul
+
+        x_lin = Variable(np.array([[1.0, -2.0], [0.5, 1.5]]), trainable=True, name="x_lin")
+        w = Variable(np.array([[2.0, -1.0], [0.5, 3.0]]), trainable=True, name="w")
+        b1 = Variable(np.array([0.1, 0.2]), trainable=True, name="b1")
+        b2 = Variable(np.array([-0.3, 0.4]), trainable=True, name="b2")
+        mm = MatMul(x_lin, w)
+        y_lin = Add(Add(mm, b1), Add(mm, b2))
+        root_lin, stats_lin = apply_graph_optimizations(y_lin, fold_constants=False, fuse_linear=True, fuse_activations=False)
+        self.assertEqual(stats_lin["linear_fusions"], 0)
+        g_lin = Graph(root_lin)
+        g_lin.forward()
+        g_lin.backward()
+        np.testing.assert_allclose(y_lin.value, (x_lin.value @ w.value + b1.value) + (x_lin.value @ w.value + b2.value))
+        np.testing.assert_allclose(w.grad, 2.0 * (x_lin.value.T @ np.ones((2, 2))))
+
+        x_conv = Variable(np.random.default_rng(3).normal(size=(1, 2, 4, 4)), trainable=True, name="x_conv")
+        conv = Conv2D(2, 2, kernel_size=3, padding=1, name="c")
+        c = conv(x_conv)
+        y_conv = Add(ReLU(c), c)
+        g_ref = Graph(Add(ReLU(conv(Variable(x_conv.value.copy(), trainable=True))), conv(Variable(x_conv.value.copy(), trainable=True))))
+        root_conv, stats_conv = apply_graph_optimizations(y_conv, fold_constants=False, fuse_linear=False, fuse_activations=True)
+        self.assertEqual(stats_conv["conv_act_fusions"], 0)
+        g_opt = Graph(root_conv)
+        g_opt.forward()
+        g_opt.backward()
+        g_ref.forward()
+        np.testing.assert_allclose(root_conv.value, g_ref.target_node.value, atol=1e-6)
+
 
 if __name__ == "__main__":
     unittest.main()

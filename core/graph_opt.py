@@ -12,6 +12,8 @@
 
 from __future__ import annotations
 
+from collections import Counter
+
 import numpy as np
 
 from .device import xp
@@ -149,6 +151,14 @@ def _fold_bn_weights(conv_op, bn_op) -> None:
         new_bias.children.append(conv_op)
 
 
+def _detach_if_orphan(node: Node) -> None:
+    if node.children:
+        return
+    for p in list(node.parents):
+        while node in getattr(p, "children", []):
+            p.children.remove(node)
+
+
 def fold_bn_into_conv(target_node: Node) -> tuple[Node, int]:
     """
     推理态：将紧邻的 ``Conv2D_Op -> BatchNorm2d_Op(training=False)`` 折叠为单个 Conv。
@@ -160,7 +170,9 @@ def fold_bn_into_conv(target_node: Node) -> tuple[Node, int]:
 
     folded = 0
     root = target_node
-    for node in topological_order(root):
+    nodes = topological_order(root)
+    uses = Counter(p for n in nodes for p in n.parents)
+    for node in nodes:
         if not isinstance(node, BatchNorm2d_Op):
             continue
         if bool(getattr(node, "training", True)):
@@ -170,7 +182,7 @@ def fold_bn_into_conv(target_node: Node) -> tuple[Node, int]:
         conv = node.parents[0]
         # An activation cannot be moved across BN, and other consumers must keep
         # seeing the original convolution output.
-        if type(conv) is not Conv2D_Op or any(child is not node for child in conv.children):
+        if type(conv) is not Conv2D_Op or uses[conv] != 1 or any(child is not node for child in conv.children):
             continue
         if len(conv.parents) < 2:
             continue
@@ -211,12 +223,13 @@ def apply_graph_optimizations(
     root = target_node
     if fold_constants:
         root, stats["constant_folds"] = fold_constant_adds(root)
+    # Fold eval Conv->BN before Conv+Act fusion so Conv->BN->ReLU becomes Conv2D_ReLU_Op.
+    if fold_bn:
+        root, stats["bn_folds"] = fold_bn_into_conv(root)
     if fuse_linear:
         root, stats["linear_fusions"] = fuse_linear_ops(root)
     if fuse_activations:
         root, stats["conv_act_fusions"] = fuse_conv_activation_ops(root)
-    if fold_bn:
-        root, stats["bn_folds"] = fold_bn_into_conv(root)
     return root, stats
 
 
@@ -255,7 +268,9 @@ def fuse_linear_ops(target_node: Node) -> tuple[Node, int]:
 
     fused = 0
     root = target_node
-    for node in topological_order(root):
+    nodes = topological_order(root)
+    uses = Counter(p for n in nodes for p in n.parents)
+    for node in nodes:
         if not isinstance(node, Add) or len(node.parents) != 2:
             continue
         left, right = node.parents
@@ -269,15 +284,15 @@ def fuse_linear_ops(target_node: Node) -> tuple[Node, int]:
         else:
             continue
 
-        if len(mm.parents) != 2:
+        if len(mm.parents) != 2 or uses[mm] != 1 or any(child is not node for child in mm.children):
             continue
         x, w = mm.parents
 
-        # 构造融合节点并替换 Add（mm 可能成为孤儿节点，允许其自然被剪枝）
         lin = Linear(x, w, bias, name=f"{node.name}_fused", bias_first=mm is right)
         if node is root:
             root = lin
         replace_node(node, lin)
+        _detach_if_orphan(mm)
         fused += 1
 
     return root, fused
@@ -297,13 +312,17 @@ def fuse_conv_activation_ops(target_node: Node) -> tuple[Node, int]:
 
     fused = 0
     root = target_node
-    for node in topological_order(root):
+    nodes = topological_order(root)
+    uses = Counter(p for n in nodes for p in n.parents)
+    for node in nodes:
         if len(node.parents) != 1:
             continue
         parent = node.parents[0]
         is_relu = isinstance(node, ReLU)
         is_leaky = isinstance(node, LeakyReLU)
         if not (is_relu or is_leaky):
+            continue
+        if uses[parent] != 1 or any(child is not node for child in parent.children):
             continue
 
         # Conv2D(+bias) + activation
@@ -371,6 +390,7 @@ def fuse_conv_activation_ops(target_node: Node) -> tuple[Node, int]:
         if node is root:
             root = fused_node
         replace_node(node, fused_node)
+        _detach_if_orphan(parent)
         fused += 1
 
     return root, fused

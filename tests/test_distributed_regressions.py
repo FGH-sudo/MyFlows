@@ -1,10 +1,20 @@
 import unittest
 import uuid
 
+from unittest import mock
+
 import numpy as np
 
 from MyFlows.core.device import set_device
-from MyFlows.distributed.constants import PROTOCOL_VERSION, STATUS_DUP, STATUS_OK, STATUS_STALE, STATUS_WAITING
+from MyFlows.distributed.constants import (
+    PROTOCOL_VERSION,
+    STATUS_DUP,
+    STATUS_INVALID,
+    STATUS_OK,
+    STATUS_SCHEMA,
+    STATUS_STALE,
+    STATUS_WAITING,
+)
 from MyFlows.distributed.engine import PSEngine
 from MyFlows.distributed.launcher import run_training
 from MyFlows.distributed.protocol import encode_tensors, payload_hash
@@ -259,7 +269,7 @@ class PsCacheCleanupTest(unittest.TestCase):
         ))
         self.assertEqual(late["status"], STATUS_STALE)
 
-    def test_pull_retry_after_gc_returns_lightweight_status(self):
+    def test_pull_retry_after_gc_returns_stale_not_tensorless_ok(self):
         engine, params = _engine(n=1, shards=[32], size=16)
         self._init(engine, params)
         grads = {"w": np.ones((16,), np.float32)}
@@ -270,8 +280,74 @@ class PsCacheCleanupTest(unittest.TestCase):
         retry = engine.handle(_msg(
             engine, 0, "pull", request_id=pull_id, global_step=0, parameter_version=0,
         ))
-        self.assertEqual(retry["status"], STATUS_OK)
+        self.assertEqual(retry["status"], STATUS_STALE)
         self.assertFalse(retry.get("tensors"))
+        conflict = engine.handle(_msg(
+            engine, 0, "pull", request_id=pull_id, global_step=0, parameter_version=99,
+        ))
+        self.assertEqual(conflict["status"], STATUS_DUP)
+        upd_retry = engine.handle(_msg(
+            engine, 0, "update_applied", request_id="upd-0-0", global_step=0,
+            parameter_version=1, update_id=last["update_id"], optimizer_step=1, digest="same",
+        ))
+        self.assertEqual(upd_retry["status"], STATUS_OK)
+        self.assertTrue(upd_retry.get("round_ready"))
+
+    def test_push_requires_non_none_schema_and_payload_hash(self):
+        engine, params = _engine(n=1, shards=[32], size=4)
+        self._init(engine, params)
+        grads = {"w": np.ones((4,), np.float32)}
+        bad_schema = engine.handle(_msg(
+            engine, 0, "push", global_step=0, parameter_version=0,
+            n_samples=32, loss=0.5, tensors=encode_tensors(grads),
+            payload_hash=payload_hash(grads), schema_hash=None,
+        ))
+        self.assertEqual(bad_schema["status"], STATUS_SCHEMA)
+        bad_payload = engine.handle(_msg(
+            engine, 0, "push", global_step=0, parameter_version=0,
+            n_samples=32, loss=0.5, tensors=encode_tensors(grads),
+        ))
+        self.assertEqual(bad_payload["status"], STATUS_INVALID)
+
+    def test_grpc_clients_close_channels_on_retry_and_ring_respects_max_bytes(self):
+        from MyFlows.distributed import transport_grpc as tg
+
+        created_channels = []
+
+        def fake_insecure_channel(_target, options=None):
+            ch = mock.Mock(name="channel", options=options)
+            created_channels.append(ch)
+            return ch
+
+        with mock.patch.object(tg.grpc, "insecure_channel", side_effect=fake_insecure_channel), \
+             mock.patch.object(tg.grpc, "channel_ready_future") as ready_fut:
+            ready_fut.return_value.result.side_effect = RuntimeError("unreachable")
+            with self.assertRaises(ConnectionError):
+                tg.GrpcPsClient("127.0.0.1", 50001, timeout=0.12)
+            self.assertGreaterEqual(len(created_channels), 1)
+            for ch in created_channels:
+                ch.close.assert_called_once()
+
+            created_channels.clear()
+            ready_fut.return_value.result.side_effect = [RuntimeError("transient"), None]
+            ring_client = tg.GrpcRingClient("127.0.0.1", 50002, timeout=0.5, max_bytes=99_000_000)
+            self.assertEqual(len(created_channels), 2)
+            created_channels[0].close.assert_called_once()
+            created_channels[1].close.assert_not_called()
+            opts = dict(created_channels[1].options)
+            self.assertEqual(opts["grpc.max_send_message_length"], 99_000_000)
+            self.assertEqual(opts["grpc.max_receive_message_length"], 99_000_000)
+            ring_client.close()
+
+        stop_ev = mock.Mock()
+        stop_ev.is_set.return_value = True
+        server_mock = mock.Mock()
+        with mock.patch.object(tg.grpc, "server", return_value=server_mock) as srv_factory, \
+             mock.patch.object(tg.ring_pb2_grpc, "add_RingAllReduceServiceServicer_to_server"):
+            tg.serve_ring_grpc(tg.RingInbox(), lambda m: m, 50003, stop_ev, max_bytes=88_000_000)
+        srv_opts = dict(srv_factory.call_args.kwargs["options"])
+        self.assertEqual(srv_opts["grpc.max_send_message_length"], 88_000_000)
+        self.assertEqual(srv_opts["grpc.max_receive_message_length"], 88_000_000)
 
     def _waiting_then_commit(self, engine, params, retain_rounds=None):
         if retain_rounds is not None:

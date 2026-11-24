@@ -40,6 +40,24 @@ class InitializersRegularizationDropoutInspectorTest(unittest.TestCase):
         np.testing.assert_allclose(DummyOpt.acc_gradient[weight], [[0.15, -0.25]])
         np.testing.assert_allclose(DummyOpt.acc_gradient[bias], [[0.0]])
 
+    def test_regularization_allows_lora_b_and_scales_accumulation(self):
+        from MyFlows.train.opt import MBGD
+        from MyFlows.train.regularization import _regularize_param
+
+        for included in ("fc_B", "layer4.0.conv1_B", "lora_dense_B", "layer1_block0_conv1_kernel", "backbone_W"):
+            self.assertTrue(_regularize_param(included, False), included)
+        for excluded in ("fc_b", "dense_b", "b", "conv_bias", "stem_bn_gamma", "layer1.0.bn2.beta", "bn1_weight"):
+            self.assertFalse(_regularize_param(excluded, False), excluded)
+
+        w = Variable(np.array([[2.0, -4.0]], dtype=np.float64), trainable=True, name="layer4.0.conv1_B")
+        opt = MBGD(Graph(w), learning_rate=0.1)
+        raw_grad = np.array([[0.5, -0.25]], dtype=np.float64)
+        opt.acc_gradient[w] = raw_grad * 4.0
+        opt.acc_no = 4
+        applied = apply_regularization(opt, [w], RegularizationConfig(l2=0.1, l1=0.05))
+        self.assertEqual(applied, 1)
+        np.testing.assert_allclose(opt.get_gradient(w), raw_grad + 0.1 * w.value + 0.05 * np.sign(w.value))
+
     def test_dropout_train_eval_and_seed_behavior(self):
         x = Variable(np.ones((2, 4), dtype=np.float64), name="x")
         dropout = Dropout(p=0.5, seed=123)

@@ -9,7 +9,7 @@ import uuid
 
 import numpy as np
 
-from .constants import PROTOCOL_VERSION, STATUS_OK, STATUS_WAITING
+from .constants import DEFAULT_MAX_FRAME, PROTOCOL_VERSION, STATUS_OK, STATUS_WAITING
 from .data_meta import lightweight_data_meta
 from .monitor import emit
 from .protocol import decode_tensors, encode_tensors, payload_hash
@@ -21,14 +21,16 @@ from .transport_socket import SocketClient
 
 def worker_main(worker_id, config, shard, events, stop):
     client = None
+    hb_client = None
     heartbeat = None
     try:
         emit(events, config, "worker", worker_id, -1, "worker_start")
         session = TrainSession(config, for_compute=True)
         emit(events, config, "worker", worker_id, -1, "session_ready", communication=True)
         client = _connect(config)
+        hb_client = _connect(config)
         hb_stop = threading.Event()
-        heartbeat = threading.Thread(target=_heartbeat, args=(client, worker_id, config, hb_stop), daemon=True)
+        heartbeat = threading.Thread(target=_heartbeat, args=(hb_client, worker_id, config, hb_stop), daemon=True)
         heartbeat.start()
         _handshake(client, session, worker_id, config)
         emit(events, config, "worker", worker_id, -1, "handshake_ok", communication=True)
@@ -166,8 +168,10 @@ def worker_main(worker_id, config, shard, events, stop):
     finally:
         if heartbeat is not None:
             hb_stop.set()
-        if client is not None:
-            client.close()
+            heartbeat.join(timeout=2)
+        for conn in (hb_client, client):
+            if conn is not None:
+                conn.close()
 
 
 def _connect(config):
@@ -175,19 +179,20 @@ def _connect(config):
     host = config.get("bind_host", "127.0.0.1")
     port = config["ps_port"]
     timeout = float(config.get("timeout", 30))
+    max_bytes = int(config.get("max_bytes", DEFAULT_MAX_FRAME))
     if transport == "socket_json":
         deadline = time.perf_counter() + timeout
         last = None
         while time.perf_counter() < deadline:
             try:
-                return SocketClient(host, port, timeout=timeout)
+                return SocketClient(host, port, timeout=timeout, max_bytes=max_bytes)
             except OSError as exc:
                 last = exc
                 time.sleep(0.05)
         raise ConnectionError(f"ps connect failed: {last}")
     if transport == "grpc_proto":
         from .transport_grpc import GrpcPsClient
-        return GrpcPsClient(host, port, timeout=timeout)
+        return GrpcPsClient(host, port, timeout=timeout, max_bytes=max_bytes)
     raise ValueError(f"unsupported transport {transport}")
 
 

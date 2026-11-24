@@ -3,13 +3,15 @@
 import json
 import os
 from pathlib import Path
+import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 from unittest import mock
 
-from MyFlows.monitoring.gpu import ResourceRecorder
+from MyFlows.monitoring.gpu import GpuSampler, ResourceRecorder, _CpuMeter, _NvmlBackend
 from MyFlows.monitoring.record import monitoring_enabled, watch
 from MyFlows.monitoring.schema import EXTERNAL_MONITOR_ENV, JsonlCursor
 from MyFlows.utils.training_dashboard import TrainingDashboard
@@ -131,6 +133,84 @@ class MonitoringRecordsTest(unittest.TestCase):
             self.assertIn(mock.call("train/backward_ms", 1.5, 21), calls)
             self.assertNotIn(mock.call("train/loss_step", 1., 21), calls)
             dashboard.close()
+
+    def test_nvml_partial_init_failure_calls_shutdown(self):
+        fake_nvml = types.SimpleNamespace(
+            nvmlInit=mock.Mock(),
+            nvmlShutdown=mock.Mock(),
+            nvmlDeviceGetCount=mock.Mock(side_effect=RuntimeError("nvml query fail")),
+        )
+        with mock.patch.dict(sys.modules, {"pynvml": fake_nvml}):
+            with self.assertRaisesRegex(RuntimeError, "nvml query fail"):
+                _NvmlBackend()
+        fake_nvml.nvmlInit.assert_called_once()
+        fake_nvml.nvmlShutdown.assert_called_once()
+
+    def test_gpu_sampler_close_is_synchronized_and_idempotent(self):
+        sampler = GpuSampler.__new__(GpuSampler)
+        sampler._lock = threading.Lock()
+        sampler.errors = {}
+        sampler.backend = mock.Mock()
+        sampler.backend.name = "fake"
+        sampler.backend.read.return_value = []
+        sampler.close()
+        self.assertIsNone(sampler.backend)
+        row = sampler.sample()
+        self.assertEqual(row["status"], "unavailable")
+
+    def test_cpu_meters_are_independent_across_recorders(self):
+        from collections import namedtuple
+
+        CpuTimes = namedtuple("scputimes", ("user", "system", "idle"))
+        meter_a = _CpuMeter()
+        meter_b = _CpuMeter()
+        ticks = iter([
+            CpuTimes(user=10.0, system=0.0, idle=90.0),
+            CpuTimes(user=12.0, system=0.0, idle=98.0),
+            CpuTimes(user=15.0, system=0.0, idle=105.0),
+        ])
+        fake_psutil = types.SimpleNamespace(LINUX=False, cpu_times=lambda: next(ticks))
+        self.assertIsNone(meter_a.sample(fake_psutil))
+        self.assertIsNone(meter_b.sample(fake_psutil))
+        # meter_a's interval runs from (10, 100) to (15, 120): busy +5 / total +20 = 25.0%
+        self.assertAlmostEqual(meter_a.sample(fake_psutil), 25.0, places=1)
+
+    def test_non_finite_metrics_are_sanitized_to_null_with_reason(self):
+        class _NaNSampler:
+            backend_name = "fake"
+
+            def sample(self):
+                return {
+                    "backend": "fake",
+                    "monotonic_s": 1.0,
+                    "unix_s": 2.0,
+                    "status": "ok",
+                    "gpus": [{
+                        "index": 0, "name": "fixture", "uuid": "fixture",
+                        "utilization_pct": float("nan"), "memory_used_mib": float("inf"),
+                        "memory_total_mib": 8000.0, "temperature_c": 40.0,
+                        "power_w": 20.0, "power_limit_w": 50.0, "processes": [], "missing": {},
+                    }],
+                    "error": None,
+                }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "resources.jsonl"
+            sampled = threading.Event()
+            host = {"cpu_utilization_pct": float("nan"), "ram_used_bytes": 1000, "ram_total_bytes": 2000,
+                    "process_rss_bytes": {"1": 100}}
+            with mock.patch("MyFlows.monitoring.gpu.sample_host", return_value=host):
+                with ResourceRecorder(_NaNSampler(), interval_s=0.01, jsonl_path=path,
+                                      on_sample=lambda _row: sampled.set()) as recorder:
+                    self.assertTrue(sampled.wait(3))
+                self.assertIsNone(recorder.error)
+            row = json.loads(path.read_text(encoding="utf-8").splitlines()[0])
+            self.assertIsNone(row["gpu_utilization_pct"])
+            self.assertIsNone(row["gpu_memory_mib"])
+            self.assertIsNone(row["cpu_utilization_pct"])
+            self.assertEqual(row["missing"]["gpu_utilization_pct"], "non-finite metric value")
+            self.assertEqual(row["missing"]["cpu_utilization_pct"], "non-finite metric value")
+            self.assertEqual(row["gpus"][0]["missing"]["utilization_pct"], "non-finite metric value")
 
 
 if __name__ == "__main__":

@@ -142,15 +142,18 @@ def unpack_frame(frame):
 
 
 def recv_frame_from_buffer(buffer, max_bytes=DEFAULT_MAX_FRAME):
-    buf = bytearray(buffer)
+    buf = buffer if isinstance(buffer, bytearray) else bytearray(buffer)
     if len(buf) < 4:
         return None, buf
-    length = struct.unpack("!I", buf[:4])[0]
+    length = struct.unpack_from("!I", buf, 0)[0]
     if length > int(max_bytes):
         raise ValueError(f"frame length {length} exceeds {max_bytes}")
-    if len(buf) < 4 + length:
+    end = 4 + length
+    if len(buf) < end:
         return None, buf
-    return bytes(buf[:4 + length]), buf[4 + length:]
+    frame = bytes(buf[:end])
+    del buf[:end]
+    return frame, buf
 
 
 def aggregate_weighted(messages):

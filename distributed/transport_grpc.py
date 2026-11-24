@@ -257,17 +257,24 @@ class GrpcPsClient:
         ]
         deadline = time.perf_counter() + timeout
         last = None
+        channel = None
         while time.perf_counter() < deadline:
-            self.channel = grpc.insecure_channel(f"{host}:{int(port)}", options=options)
+            channel = grpc.insecure_channel(f"{host}:{int(port)}", options=options)
             try:
-                grpc.channel_ready_future(self.channel).result(timeout=0.5)
+                grpc.channel_ready_future(channel).result(timeout=0.5)
                 last = None
                 break
             except Exception as exc:  # noqa: BLE001
                 last = exc
+                try:
+                    channel.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                channel = None
                 time.sleep(0.05)
-        if last is not None:
+        if last is not None or channel is None:
             raise ConnectionError(f"grpc ps connect failed: {last}")
+        self.channel = channel
         self.stub = ps_pb2_grpc.ParameterServiceStub(self.channel)
         self.lock = threading.Lock()
         self.traffic = {}
@@ -443,24 +450,31 @@ class _RingServicer(ring_pb2_grpc.RingAllReduceServiceServicer):
 
 
 class GrpcRingClient:
-    def __init__(self, host, port, timeout=30.0):
+    def __init__(self, host, port, timeout=30.0, max_bytes=DEFAULT_MAX_FRAME):
         options = [
-            ("grpc.max_send_message_length", DEFAULT_MAX_FRAME),
-            ("grpc.max_receive_message_length", DEFAULT_MAX_FRAME),
+            ("grpc.max_send_message_length", int(max_bytes)),
+            ("grpc.max_receive_message_length", int(max_bytes)),
         ]
         deadline = time.perf_counter() + timeout
         last = None
+        channel = None
         while time.perf_counter() < deadline:
-            self.channel = grpc.insecure_channel(f"{host}:{int(port)}", options=options)
+            channel = grpc.insecure_channel(f"{host}:{int(port)}", options=options)
             try:
-                grpc.channel_ready_future(self.channel).result(timeout=0.5)
+                grpc.channel_ready_future(channel).result(timeout=0.5)
                 last = None
                 break
             except Exception as exc:  # noqa: BLE001
                 last = exc
+                try:
+                    channel.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                channel = None
                 time.sleep(0.05)
-        if last is not None:
+        if last is not None or channel is None:
             raise ConnectionError(f"ring connect failed: {last}")
+        self.channel = channel
         self.stub = ring_pb2_grpc.RingAllReduceServiceStub(self.channel)
         self.timeout = timeout
         self.traffic = {}
@@ -515,10 +529,10 @@ class GrpcRingClient:
         self.channel.close()
 
 
-def serve_ring_grpc(inbox, init_handler, port, stop, host=BIND_HOST):
+def serve_ring_grpc(inbox, init_handler, port, stop, host=BIND_HOST, max_bytes=DEFAULT_MAX_FRAME):
     options = [
-        ("grpc.max_send_message_length", DEFAULT_MAX_FRAME),
-        ("grpc.max_receive_message_length", DEFAULT_MAX_FRAME),
+        ("grpc.max_send_message_length", int(max_bytes)),
+        ("grpc.max_receive_message_length", int(max_bytes)),
     ]
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=8), options=options)
     ring_pb2_grpc.add_RingAllReduceServiceServicer_to_server(_RingServicer(inbox, init_handler), server)

@@ -4,9 +4,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from typing import Iterable
 
 from ..core.device import xp
+
+_BN_TOKEN_RE = re.compile(r"(?:^|[._/])(?:bn\d*|batchnorm\d*|beta|gamma)(?:$|[._/])", re.IGNORECASE)
+_BIAS_TOKEN_RE = re.compile(r"(?:^|[._/])bias(?:$|[._/])", re.IGNORECASE)
+# Case-sensitive suffix so lowercase parameter biases (fc_b, dense_b) are skipped while LoRA *_B are regularized.
+_LOWER_BIAS_SUFFIX_RE = re.compile(r"(?:^|[._/])b$")
 
 
 @dataclass
@@ -23,9 +29,10 @@ class RegularizationConfig:
 def _regularize_param(name: str, regularize_bias_bn: bool) -> bool:
     if regularize_bias_bn:
         return True
-    lowered = (name or "").lower()
-    excluded = ("bias", "_b", "beta", "gamma", "bn")
-    return not any(part in lowered for part in excluded)
+    raw = name or ""
+    if _BN_TOKEN_RE.search(raw) or _BIAS_TOKEN_RE.search(raw) or _LOWER_BIAS_SUFFIX_RE.search(raw):
+        return False
+    return True
 
 
 def apply_regularization(optimizer, params: Iterable, config: RegularizationConfig) -> int:
@@ -34,6 +41,7 @@ def apply_regularization(optimizer, params: Iterable, config: RegularizationConf
     if not config or not config.enabled:
         return 0
     applied = 0
+    scale = float(max(1, int(getattr(optimizer, "acc_no", 1) or 1)))
     for param in params:
         if not getattr(param, "trainable", False):
             continue
@@ -47,6 +55,6 @@ def apply_regularization(optimizer, params: Iterable, config: RegularizationConf
             extra = extra + float(config.l2) * value
         if float(config.l1) != 0.0:
             extra = extra + float(config.l1) * xp.sign(value)
-        optimizer.acc_gradient[param] = optimizer.acc_gradient[param] + extra
+        optimizer.acc_gradient[param] = optimizer.acc_gradient[param] + extra * scale
         applied += 1
     return applied

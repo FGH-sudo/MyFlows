@@ -31,7 +31,65 @@ _SMI_QUERY = (
 )
 _SMI_COLUMNS = ("index", "name", "uuid") + GPU_FIELDS
 _MIB = 1024 * 1024
-_HOST_CPU_PRIMED = threading.local()
+_HOST_CPU_METER = threading.local()
+
+
+class _CpuMeter:
+    """Per-recorder delta CPU utilization meter via psutil.cpu_times()."""
+
+    def __init__(self):
+        self._prev: tuple[float, float] | None = None
+
+    @staticmethod
+    def _totals(times, linux: bool) -> tuple[float, float]:
+        total = float(sum(times))
+        if linux:
+            total -= float(getattr(times, "guest", 0.0))
+            total -= float(getattr(times, "guest_nice", 0.0))
+        busy = total - float(getattr(times, "idle", 0.0)) - float(getattr(times, "iowait", 0.0))
+        return busy, total
+
+    def sample(self, psutil_mod) -> float | None:
+        times = psutil_mod.cpu_times()
+        linux = bool(getattr(psutil_mod, "LINUX", False))
+        busy, total = self._totals(times, linux)
+        if self._prev is None:
+            self._prev = (busy, total)
+            return None
+        prev_busy, prev_total = self._prev
+        self._prev = (busy, total)
+        delta_total = total - prev_total
+        if not math.isfinite(delta_total) or delta_total <= 0.0:
+            return 0.0
+        delta_busy = max(0.0, busy - prev_busy)
+        pct = min(100.0, (delta_busy / delta_total) * 100.0)
+        return round(pct, 1)
+
+
+def _default_cpu_meter() -> _CpuMeter:
+    meter = getattr(_HOST_CPU_METER, "meter", None)
+    if meter is None:
+        meter = _CpuMeter()
+        _HOST_CPU_METER.meter = meter
+    return meter
+
+
+def _finite_metric(value):
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
+
+
+def _sanitize_json(value):
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {k: _sanitize_json(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_json(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_sanitize_json(v) for v in value)
+    return value
 # Why NVML reports a process without its memory: the WDDM driver model on Windows, the same
 # paravirtualized driver inside WSL2, or a container without access to the host's process table.
 _PROCESS_MEMORY_REASON = ("NVML 未提供每进程显存（Windows WDDM 驱动模式下常见）" if os.name == "nt"
@@ -50,16 +108,23 @@ class _NvmlBackend:
 
         self.nv = pynvml
         pynvml.nvmlInit()
-        self.count = pynvml.nvmlDeviceGetCount()
-        self.handles = [pynvml.nvmlDeviceGetHandleByIndex(i) for i in range(self.count)]
-        self.static = []
-        for index, handle in enumerate(self.handles):
-            self.static.append({
-                "index": index,
-                "name": self._try(lambda: _text(pynvml.nvmlDeviceGetName(handle)))[0],
-                "uuid": self._try(lambda: _text(pynvml.nvmlDeviceGetUUID(handle)))[0],
-            })
-        self.driver_version = self._try(lambda: _text(pynvml.nvmlSystemGetDriverVersion()))[0]
+        try:
+            self.count = pynvml.nvmlDeviceGetCount()
+            self.handles = [pynvml.nvmlDeviceGetHandleByIndex(i) for i in range(self.count)]
+            self.static = []
+            for index, handle in enumerate(self.handles):
+                self.static.append({
+                    "index": index,
+                    "name": self._try(lambda: _text(pynvml.nvmlDeviceGetName(handle)))[0],
+                    "uuid": self._try(lambda: _text(pynvml.nvmlDeviceGetUUID(handle)))[0],
+                })
+            self.driver_version = self._try(lambda: _text(pynvml.nvmlSystemGetDriverVersion()))[0]
+        except Exception:
+            try:
+                pynvml.nvmlShutdown()
+            except Exception:
+                pass
+            raise
 
     @staticmethod
     def _try(fn: Callable):
@@ -77,14 +142,24 @@ class _NvmlBackend:
 
             def put(field, fn):
                 value, reason = self._try(fn)
+                if isinstance(value, float) and not math.isfinite(value):
+                    value, reason = None, "non-finite metric value"
                 gpu[field] = value
                 if reason:
                     missing[field] = reason
 
             put("utilization_pct", lambda: float(nv.nvmlDeviceGetUtilizationRates(handle).gpu))
             memory, reason = self._try(lambda: nv.nvmlDeviceGetMemoryInfo(handle))
-            gpu["memory_used_mib"] = memory.used / _MIB if memory else None
-            gpu["memory_total_mib"] = memory.total / _MIB if memory else None
+            used_mib = (memory.used / _MIB) if memory else None
+            total_mib = (memory.total / _MIB) if memory else None
+            if isinstance(used_mib, float) and not math.isfinite(used_mib):
+                used_mib = None
+                reason = reason or "non-finite metric value"
+            if isinstance(total_mib, float) and not math.isfinite(total_mib):
+                total_mib = None
+                reason = reason or "non-finite metric value"
+            gpu["memory_used_mib"] = used_mib
+            gpu["memory_total_mib"] = total_mib
             if reason:
                 missing["memory_used_mib"] = missing["memory_total_mib"] = reason
             put("temperature_c", lambda: float(nv.nvmlDeviceGetTemperature(handle, nv.NVML_TEMPERATURE_GPU)))
@@ -150,7 +225,10 @@ class _SmiBackend:
                     gpu[column] = int(raw)
                 else:
                     try:
-                        gpu[column] = float(raw)
+                        val = float(raw)
+                        if not math.isfinite(val):
+                            raise ValueError("non-finite")
+                        gpu[column] = val
                     except ValueError:
                         gpu[column] = None
                         missing[column] = f"nvidia-smi 返回 {raw}"
@@ -192,24 +270,32 @@ class GpuSampler:
         return getattr(self.backend, "driver_version", None)
 
     def sample(self) -> dict:
-        row = {"monotonic_s": time.perf_counter(), "unix_s": time.time(), "backend": self.backend_name}
-        if self.backend is None:
-            row.update(status="unavailable", gpus=[], error="; ".join(f"{k}: {v}" for k, v in self.errors.items()))
-            return row
-        try:
-            with self._lock:
-                gpus = self.backend.read()
-        except Exception as exc:
-            row.update(status="error", gpus=[], error=f"{type(exc).__name__}: {exc}")
-            return row
+        with self._lock:
+            backend = self.backend
+            row = {
+                "monotonic_s": time.perf_counter(),
+                "unix_s": time.time(),
+                "backend": backend.name if backend else None,
+            }
+            if backend is None:
+                row.update(status="unavailable", gpus=[], error="; ".join(f"{k}: {v}" for k, v in self.errors.items()))
+                return row
+            try:
+                gpus = backend.read()
+            except Exception as exc:
+                row.update(status="error", gpus=[], error=f"{type(exc).__name__}: {exc}")
+                return row
         partial = any(set(g["missing"]) - {"process_memory", "processes"} for g in gpus)
         row.update(status="partial" if partial else "ok", gpus=gpus, error=None)
         return row
 
     def close(self):
-        if self.backend is not None:
-            self.backend.close()
-            self.backend = None
+        with self._lock:
+            if self.backend is not None:
+                try:
+                    self.backend.close()
+                finally:
+                    self.backend = None
 
     def __enter__(self):
         return self
@@ -218,16 +304,16 @@ class GpuSampler:
         self.close()
 
 
-def sample_host(root_pid: int | None = None) -> dict:
+def sample_host(root_pid: int | None = None, *, cpu_meter: _CpuMeter | None = None) -> dict:
     """CPU/RAM for the host plus RSS of ``root_pid`` and its descendants."""
     import psutil
 
-    row = {"cpu_utilization_pct": psutil.cpu_percent(), "ram_used_bytes": psutil.virtual_memory().used,
+    meter = _default_cpu_meter() if cpu_meter is None else cpu_meter
+    cpu_pct = meter.sample(psutil)
+    row = {"cpu_utilization_pct": cpu_pct, "ram_used_bytes": psutil.virtual_memory().used,
            "ram_total_bytes": psutil.virtual_memory().total}
-    if not getattr(_HOST_CPU_PRIMED, "ready", False):
-        row["cpu_utilization_pct"] = None
+    if cpu_pct is None:
         row["missing"] = {"cpu_utilization_pct": "first sample primes the CPU utilization interval"}
-        _HOST_CPU_PRIMED.ready = True
     if root_pid is not None:
         rss = {}
         unreadable = []
@@ -246,13 +332,30 @@ def sample_host(root_pid: int | None = None) -> dict:
     return row
 
 
+def _clean_gpu_entry(gpu: dict) -> dict:
+    cleaned = dict(gpu)
+    gpu_missing = dict(cleaned.get("missing") or {})
+    for key in GPU_FIELDS:
+        val = cleaned.get(key)
+        if isinstance(val, float) and not math.isfinite(val):
+            cleaned[key] = None
+            gpu_missing[key] = "non-finite metric value"
+    cleaned["missing"] = gpu_missing
+    return cleaned
+
+
 def flat_resource_row(sample: dict, host: dict | None = None, gpu_index: int = 0) -> dict:
     """One ``resources.jsonl`` row, field-compatible with ``benchmark.distributed_experiment``."""
-    row = record({"monotonic_s": sample["monotonic_s"], "unix_s": sample["unix_s"],
+    row = record({"monotonic_s": _finite_metric(sample["monotonic_s"]), "unix_s": _finite_metric(sample["unix_s"]),
                   "sampler_backend": sample["backend"], "sampling_status": sample.get("status", "ok")})
     row.update(host or {})
     missing = dict(row.get("missing") or {})
-    gpu = next((g for g in sample["gpus"] if g.get("index") == gpu_index), None)
+    for key in ("cpu_utilization_pct", "ram_used_bytes", "ram_total_bytes"):
+        if isinstance(row.get(key), float) and not math.isfinite(row[key]):
+            row[key] = None
+            missing[key] = "non-finite metric value"
+    gpus = [_clean_gpu_entry(g) for g in sample.get("gpus") or []]
+    gpu = next((g for g in gpus if g.get("index") == gpu_index), None)
     if gpu is None:
         row["sampling_error"] = sample.get("error") or f"GPU {gpu_index} 不可用"
         for key in ("gpu_utilization_pct", "gpu_memory_mib", "gpu_temperature_c", "gpu_power_w", "gpu_power_limit_w"):
@@ -281,7 +384,7 @@ def flat_resource_row(sample: dict, host: dict | None = None, gpu_index: int = 0
     if row["process_rss_total_bytes"] is None:
         missing["process_rss_total_bytes"] = missing.get("process_rss_bytes", "no readable process RSS")
     row["missing"] = missing
-    row["gpus"] = sample["gpus"]
+    row["gpus"] = gpus
     return row
 
 
@@ -306,6 +409,7 @@ class ResourceRecorder:
         self._thread = threading.Thread(target=self._loop, name="resource-recorder", daemon=True)
         self.error = None
         self._device_peak = None
+        self._cpu_meter = _CpuMeter()
 
     def start(self):
         self._thread.start()
@@ -334,20 +438,21 @@ class ResourceRecorder:
             while not self._stop.is_set():
                 started = time.perf_counter()
                 try:
-                    host = sample_host(self.root_pid)
+                    host = sample_host(self.root_pid, cpu_meter=self._cpu_meter)
                 except Exception as exc:
                     host = {"missing": {key: f"{type(exc).__name__}: {exc}" for key in (
                         "cpu_utilization_pct", "ram_used_bytes", "ram_total_bytes", "process_rss_bytes")}}
                 row = flat_resource_row(self.sampler.sample(), host)
                 row.update(interval_s=self.interval_s, root_pid=self.root_pid)
                 used = row["gpu_device_memory_mib"]
-                if used is not None:
+                if used is not None and math.isfinite(used):
                     self._device_peak = max(self._device_peak or 0., used)
                 row["gpu_device_memory_peak_mib"] = self._device_peak
                 if self._device_peak is None:
                     row["missing"]["gpu_device_memory_peak_mib"] = "no successful device memory samples"
                 if row["missing"] and row["sampling_status"] == "ok":
                     row["sampling_status"] = "partial"
+                row = _sanitize_json(row)
                 with self._lock:
                     self._history.append(row)
                     del self._history[:-self.history_size]

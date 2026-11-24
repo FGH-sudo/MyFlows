@@ -260,14 +260,14 @@ class PSEngine:
             raise ProtocolError(STATUS_DUP, "duplicate worker gradient")
         if int(message.get("n_samples")) != self.shard_sizes[worker]:
             raise ProtocolError(STATUS_INVALID, "n_samples does not match shard plan")
-        if message.get("schema_hash") not in (None, self.schema_hash):
+        if message.get("schema_hash") != self.schema_hash:
             raise ProtocolError(STATUS_SCHEMA, "schema_hash mismatch")
         tensors = (message.get("tensor_arrays")
                    if message.get("tensor_arrays") is not None
                    else message.get("tensors") or message.get("gradients"))
         gradients = decode_tensors(tensors, self.schema)
         expected_hash = payload_hash(gradients)
-        if message.get("payload_hash") not in (None, expected_hash):
+        if message.get("payload_hash") != expected_hash:
             raise ProtocolError(STATUS_INVALID, "gradient payload hash mismatch")
         if not _finite_loss(message.get("loss")):
             raise ProtocolError(STATUS_INVALID, "non-finite loss")
@@ -416,6 +416,8 @@ class PSEngine:
         if indexed is not None:
             if indexed["digest"] != digest:
                 raise ProtocolError(STATUS_DUP, f"conflicting duplicate {message.get('type')}")
+            if message.get("type") == "pull":
+                raise ProtocolError(STATUS_STALE, "pull payload expired")
             if indexed.get("light") is not None:
                 return indexed["light"]
         return None

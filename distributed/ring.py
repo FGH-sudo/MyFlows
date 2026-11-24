@@ -13,7 +13,7 @@ import uuid
 
 import numpy as np
 
-from .constants import BIND_HOST, DEFAULT_CLEANUP_S, PROTOCOL_VERSION, STATUS_OK, STATUS_WAITING
+from .constants import BIND_HOST, DEFAULT_CLEANUP_S, DEFAULT_MAX_FRAME, PROTOCOL_VERSION, STATUS_OK, STATUS_WAITING
 from .gradient_layout import (
     allgather_apply,
     allgather_send_chunk_id,
@@ -186,10 +186,26 @@ def run_ring(config):
                 break
     finally:
         cleanup_start = time.perf_counter()
+        cleanup_deadline = cleanup_start + DEFAULT_CLEANUP_S
         stop.set()
-        for process in processes:
-            if process.pid is not None:
-                process.join(timeout=max(0, min(0.2, cleanup_start + 1 - time.perf_counter())))
+        # Drain events while waiting for workers: a child cannot exit until its queue feeder flushes.
+        grace_deadline = cleanup_deadline - 2.0
+        while True:
+            running = []
+            for process in processes:
+                if process.pid is not None:
+                    process.join(timeout=0)
+                    if process.is_alive():
+                        running.append(process)
+            if not running:
+                break
+            remaining = grace_deadline - time.perf_counter()
+            if remaining <= 0:
+                break
+            try:
+                collected.append(events.get(timeout=min(0.02, remaining)))
+            except queue.Empty:
+                pass
         forced = False
         for process in processes:
             if process.pid is not None and process.is_alive():
@@ -197,10 +213,10 @@ def run_ring(config):
                 process.terminate()
         for process in processes:
             if process.pid is not None:
-                process.join(timeout=max(0, cleanup_start + 4 - time.perf_counter()))
+                process.join(timeout=max(0, cleanup_deadline - 1.0 - time.perf_counter()))
                 if process.is_alive():
                     process.kill()
-                    process.join(timeout=max(0, cleanup_start + 5 - time.perf_counter()))
+                    process.join(timeout=max(0, cleanup_deadline - time.perf_counter()))
         while not forced:
             try:
                 collected.append(events.get_nowait())
@@ -249,16 +265,19 @@ def rank_main(rank, config, shard, events, stop):
                 return {"status": STATUS_OK, "error": ""}
 
             port = config["ring_ports"][rank]
+            max_bytes = int(config.get("max_bytes", DEFAULT_MAX_FRAME))
             server_thread = threading.Thread(
                 target=serve_ring_grpc, args=(inbox, init_handler, port, stop),
-                kwargs={"host": config.get("bind_host", BIND_HOST)}, daemon=True)
+                kwargs={"host": config.get("bind_host", BIND_HOST), "max_bytes": max_bytes}, daemon=True)
             server_thread.start()
             right_rank = (rank + 1) % n
             right = GrpcRingClient(config.get("bind_host", BIND_HOST),
                                    config["ring_ports"][right_rank],
-                                   timeout=float(config.get("timeout", 30)))
+                                   timeout=float(config.get("timeout", 30)),
+                                   max_bytes=max_bytes)
             barrier = GrpcPsClient(config.get("bind_host", BIND_HOST), config["barrier_port"],
-                                   timeout=float(config.get("timeout", 30)))
+                                   timeout=float(config.get("timeout", 30)),
+                                   max_bytes=max_bytes)
             _ring_init(rank, n, session, right, init_box, config, stop)
             _barrier_wait(barrier, {
                 "protocol_version": PROTOCOL_VERSION,
