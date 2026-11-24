@@ -249,7 +249,7 @@ def rank_main(rank, config, shard, events, stop):
     right = None
     barrier = None
     try:
-        session = TrainSession(config, for_compute=True)
+        session = TrainSession(config, for_compute=True, rank=rank)
         n = int(config["train_workers"])
         inbox = None
         init_box = {"payload": None}

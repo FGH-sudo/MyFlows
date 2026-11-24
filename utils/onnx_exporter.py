@@ -21,7 +21,7 @@ def export_onnx(graph, filepath, input_nodes=None, output_names=None, opset=13, 
         raise ImportError("导出 ONNX 需要先安装可选依赖: pip install onnx") from exc
 
     for node in graph.sorted_nodes:
-        if node.__class__.__name__ == "BatchNorm2d_Op" and node.training:
+        if node.__class__.__name__ in ("BatchNorm2d_Op", "SyncBatchNorm2d_Op") and node.training:
             raise ValueError("export batchnorm in evaluation mode")
 
     if any(getattr(node, "value", None) is None for node in graph.sorted_nodes):
@@ -227,7 +227,7 @@ def export_onnx(graph, filepath, input_nodes=None, output_names=None, opset=13, 
             nodes.append(helper.make_node("Identity", parent_names, [out_name], name=name))
         elif op_type == "Flatten_Op":
             nodes.append(helper.make_node("Flatten", parent_names, [out_name], name=name, axis=1))
-        elif op_type == "BatchNorm2d_Op":
+        elif op_type in ("BatchNorm2d_Op", "SyncBatchNorm2d_Op"):
             mean_name = f"{name}_running_mean"
             var_name = f"{name}_running_var"
             add_initializer(mean_name, node.running_mean)

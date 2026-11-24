@@ -10,6 +10,7 @@ from pathlib import Path
 import numpy as np
 
 _DEVICE = "cpu"
+_DEVICE_INDEX = 0
 _CUPY = None
 _CUDA_PATH_CONFIGURED = False
 
@@ -137,6 +138,17 @@ def cuda_available() -> bool:
         return False
 
 
+def cuda_device_count() -> int:
+    """返回本机可用的 CUDA GPU 数量（无可用 GPU 时返回 0）。"""
+    try:
+        cp = _lazy_cupy()
+        if not cp.cuda.is_available():
+            return 0
+        return int(cp.cuda.runtime.getDeviceCount())
+    except Exception:
+        return 0
+
+
 def _active_module():
     if _DEVICE == "cuda":
         return _lazy_cupy()
@@ -147,20 +159,75 @@ def get_device() -> str:
     return _DEVICE
 
 
+def get_device_index() -> int | None:
+    return _DEVICE_INDEX if _DEVICE == "cuda" else None
+
+
+def get_device_string() -> str:
+    return f"cuda:{_DEVICE_INDEX}" if _DEVICE == "cuda" else "cpu"
+
+
+def _parse_cuda_index(name: str) -> int | None:
+    if name in ("cuda", "gpu"):
+        return 0
+    for prefix in ("cuda:", "gpu:"):
+        if name.startswith(prefix):
+            raw = name[len(prefix):]
+            if not raw or not raw.lstrip("+-").isdigit():
+                raise ValueError(f"非法的 CUDA 设备编号: {name!r}")
+            idx = int(raw)
+            if idx < 0:
+                raise ValueError(f"CUDA 设备编号不能为负: {idx}")
+            return idx
+    return None
+
+
+def resolve_rank_device(device: str, rank: int, *, gpu_ids: list[int] | tuple[int, ...] | None = None) -> str:
+    """为分布式 Worker 解析目标设备字符串（支持 ``cuda:auto``/多卡按 rank 隔离，单卡回落 ``cuda:0``）。"""
+    name = str(device).strip().lower()
+    if name == "cpu":
+        return "cpu"
+    if gpu_ids:
+        chosen = int(gpu_ids[int(rank) % len(gpu_ids)])
+        if chosen < 0:
+            raise ValueError(f"gpu_ids 不能包含负数: {chosen}")
+        return f"cuda:{chosen}"
+    if name in ("cuda", "gpu", "cuda:auto", "gpu:auto", "auto"):
+        count = cuda_device_count()
+        if count > 1:
+            return f"cuda:{int(rank) % count}"
+        if count == 1 or name != "auto":
+            return "cuda:0"
+        return "cpu"
+    idx = _parse_cuda_index(name)
+    if idx is not None:
+        return f"cuda:{idx}"
+    raise ValueError(f"不支持的设备: {device!r}，请使用 'cpu'、'cuda'、'cuda:<rank>' 或 'auto'")
+
+
 def set_device(device: str) -> str:
-    """切换全局计算设备，返回实际生效的设备名。"""
-    global _DEVICE
+    """切换全局计算设备（支持 'cpu'、'cuda'、'gpu'、'cuda:<index>'），返回 'cpu' 或 'cuda'。"""
+    global _DEVICE, _DEVICE_INDEX
     name = str(device).strip().lower()
     if name in ("cpu",):
         _DEVICE = "cpu"
+        _DEVICE_INDEX = 0
         return _DEVICE
-    if name in ("cuda", "gpu", "cuda:0"):
+    idx = _parse_cuda_index(name)
+    if idx is not None:
         cp = _lazy_cupy()
         if not cp.cuda.is_available():
             raise RuntimeError("已请求 CUDA，但当前环境检测不到可用 GPU。")
+        count = int(cp.cuda.runtime.getDeviceCount())
+        if count <= 0:
+            raise RuntimeError("已请求 CUDA，但当前环境检测不到可用 GPU。")
+        if idx >= count:
+            raise ValueError(f"CUDA 设备编号 {idx} 超出可用范围 0..{count - 1}")
+        cp.cuda.Device(idx).use()
         _DEVICE = "cuda"
+        _DEVICE_INDEX = idx
         return _DEVICE
-    raise ValueError(f"不支持的设备: {device!r}，请使用 'cpu' 或 'cuda'")
+    raise ValueError(f"不支持的设备: {device!r}，请使用 'cpu'、'cuda' 或 'cuda:<index>'")
 
 
 def use_cuda(device: str = "cuda") -> str:

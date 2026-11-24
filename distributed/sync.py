@@ -497,3 +497,15 @@ class RingSync(RankSync):
 def _layout(arrays):
     from .gradient_layout import layout_from_arrays
     return layout_from_arrays(arrays)
+
+
+def make_sync_bn_allreduce(sync, *, prefix: str = "sbn"):
+    """为 :class:`SyncBatchNorm2d` 构造带单调序号键的跨进程 ``sync.reduce`` 回调。"""
+    seq = 0
+
+    def _allreduce(tag: str, values: dict):
+        nonlocal seq
+        seq += 1
+        return sync.reduce(f"{prefix}:{seq}:{tag}", values)
+
+    return _allreduce

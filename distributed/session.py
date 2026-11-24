@@ -3,21 +3,21 @@
 from __future__ import annotations
 
 from .constants import OPTIMIZER_IMPL
-from ..core.device import asnumpy, get_device, set_device, xp
+from ..core.device import asnumpy, get_device, get_device_string, resolve_rank_device, set_device, xp
 from ..train.opt import Adam, MBGD
 from .protocol import digest_state, payload_hash, schema_from_arrays, schema_hash
 from .tasks import build_task
 
 
 class TrainSession:
-    def __init__(self, config, *, for_compute=True):
+    def __init__(self, config, *, for_compute=True, rank: int | None = None):
         self.config = dict(config)
         device = str(config.get("device", "cpu"))
         if for_compute:
-            set_device("cuda" if device.startswith("cuda") or device == "gpu" else "cpu")
+            set_device(resolve_rank_device(device, 0 if rank is None else int(rank), gpu_ids=config.get("gpu_ids")) if (device.startswith("cuda") or device.startswith("gpu") or device == "auto") else "cpu")
         else:
             set_device("cpu")
-        self.device = get_device()
+        self.device = get_device(); self.device_string = get_device_string()
         self.task = build_task(config.get("task", "synthetic"))
         built = self.task.build_model(config, device=self.device)
         self.x = built["x"]

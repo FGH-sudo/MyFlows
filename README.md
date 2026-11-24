@@ -15,29 +15,29 @@ ms.use_cuda()  # 或 ms.set_device("cpu")
 
 | 路径 | 职责 |
 |------|------|
-| `core/` | 设备、`Tensor` / `Variable` / `Node`、`Graph`、图优化 |
-| `ops/` | 基础算子、激活、卷积（im2col+GEMM）、BN、Dropout、损失 |
-| `ops/cuda_native/` | 原生 C/C++ 调度自写 Conv/Pool CUDA kernel，GEMM 用寄存器分块 kernel 或 cuBLAS（`native.gemm`）；第 19 讲矩阵乘 kernel（`native.matmul`） |
-| `distributed/` | 单机同步 Parameter Server（Socket JSON / gRPC）与 Ring AllReduce（gRPC）、状态校验与故障注入 |
+| `core/` | 设备（含多卡 `cuda:<rank>` 隔离）、`Module`/`Parameter`/`Buffer`、`Tensor`/`Variable`/`Node`、`Graph`、图优化 |
+| `ops/` | 基础算子、激活、卷积（im2col+GEMM 及融合 FP32 CUDA 深度可分离卷积）、BN/`SyncBatchNorm2d_Op`、Dropout、损失 |
+| `ops/cuda_native/` | 原生 C/C++ 调度自写 Conv/Pool CUDA kernel，`device_capabilities()` 与 `cc >= 8.0` `cp.async` autotune 守卫，GEMM 支持寄存器分块与 cuBLAS（`native.gemm`）；第 19 讲矩阵乘 kernel（`native.matmul`） |
+| `distributed/` | 同步 Parameter Server（Socket JSON / gRPC）与 Ring AllReduce（gRPC）、`cuda:rank` 进程设备绑定、`make_sync_bn_allreduce`、状态校验与故障注入 |
 | `monitoring/` | NVML 优先、nvidia-smi 兜底的 GPU 资源采样与 JSONL 记录 |
 | `transfer/` | 预训练权重导入、Adapter / Regression Head、分层冻结与 ResNet LoRA 微调 |
 | `examples/stage1_cnn.py` | 固定 32 样本 FP32 CNN 训练示例 |
-| `layers/` | Dense / Conv / Pool / AdaptiveAvgPool / Dropout、`ResNet18` / `ResNet34` / `AlexNet` / `MobileNetV2` |
-| `train/` | 优化器（MBGD / Momentum / AdaGrad / RMSProp / Adam）、L1/L2 正则 |
+| `layers/` | Dense / Conv / Pool / AdaptiveAvgPool / Dropout / `SyncBatchNorm2d`（含 `convert_sync_batchnorm`）、`ResNet18` / `ResNet34` / `AlexNet` / `MobileNetV2` |
+| `train/` | 优化器（MBGD / Momentum / AdaGrad / RMSProp / Adam）、L1/L2 正则、`CosineWarmupScheduler` |
 | `data/` | `MultiprocessDataLoader` 生产者-消费者流水线 |
-| `utils/` | checkpoint（含 `TrainingState` 原子发布）、ONNX、指标、增强、可视化、Grad-CAM、量化、初始化、模型检查 |
+| `utils/` | checkpoint（含 `TrainingState` 原子发布与 `Module.state_dict`）、动态 batch ONNX 导出、指标、驾驶/通用增强、可视化、Grad-CAM、量化、初始化、模型检查 |
 | `tests/` | `unittest` 测试套件 |
 
 ## 主要能力
 
-- **动态图**：`ms.Graph(logits)` 自动拓扑排序，支持 `forward()` / `backward()`
-- **设备**：`set_device` / `use_cuda` / `cuda_available`；Windows 下可复用本机 CUDA DLL
-- **数值**：层参数默认 float32（`ms.set_default_dtype(np.float64)` 可切换）；BN 统计量、bias 梯度、交叉熵、MSE 等规约在 FP64 中累加后舍入一次；BN / 交叉熵 / Adam 在 GPU 上是融合 kernel；Adam 为标准实现（零初始化矩估计 + 偏差修正）
-- **CNN**：Conv2D（含分组 / 深度 / 空洞 / 转置）、MaxPool、AdaptiveAvgPool、BN、ReLU6、GlobalAvgPool；默认卷积为 im2col + GEMM，可显式选用阶段一直接 CUDA C 或阶段二 CUDA im2col/col2im 实验后端
-- **模型与迁移**：主线使用 `ResNet18` / `ResNet34`（支持可选 `stem` / `base_width`），并提供 `AlexNet` / `MobileNetV2`、可配置回归头与预训练 / 冻结 / LoRA 微调能力
-- **训练周边**：Dropout、权重正则、Xavier / Kaiming 等初始化、早停与诊断由父仓库训练脚本编排
-- **图优化**：常量折叠、Linear 融合、Conv+ReLU、推理态 Conv+BN 折叠（`Graph(optimize=True)`，兼容 ONNX 导出）
-- **序列化**：JSON + NPZ checkpoint、`TrainingState` 原子发布与滚动修订清理；`export_onnx` 导出部署图（支持 `ReLU6` 与 `AdaptiveAvgPool2d`）
+- **动态图与模块化**：`ms.Graph(logits)` 自动拓扑排序，支持 `forward()` / `backward()`；`Module` / `Parameter` / `Buffer` 自动注册与 `state_dict()` / `load_state_dict()`（与旧 `Layer` 无缝互通）
+- **设备与多卡隔离**：`set_device` / `use_cuda` / `cuda_available` / `cuda_device_count` / `resolve_rank_device` 支持显式 `cuda:<index>`，Windows 下可复用本机 CUDA DLL
+- **数值与融合算子**：层参数默认 float32（`ms.set_default_dtype(np.float64)` 可切换）；BN 统计量、bias 梯度、交叉熵、MSE 等规约在 FP64 中累加；BN / 交叉熵 / Adam / 深度可分离卷积前反向在 GPU 上提供融合 CUDA kernel（`MobileNetV2 64x160 b32` 训练步实测 `50.9 ms/step`、`648.6 MiB` 显存池，较优化前 `2281.7 ms/step` / `8810 MiB` 提速 **44.8×**，并通过 `compute-sanitizer` `memcheck`/`racecheck`/`synccheck` 零错误零竞争验证）
+- **分布式同步 BN**：`SyncBatchNorm2d` + `convert_sync_batchnorm` 通过高精度 FP64 split-float32 collective 同步前向均值/方差与反向激活梯度，支持不均等分片与评估态 Conv+BN 折叠
+- **CNN 与迁移**：Conv2D（含分组 / 深度 / 空洞 / 转置）、MaxPool、AdaptiveAvgPool、BN、ReLU6、GlobalAvgPool；主线支持 `ResNet18` / `ResNet34`（可选 `stem` / `base_width`）以及 `AlexNet` / `MobileNetV2`、可配置回归头与预训练 / 冻结 / LoRA 微调
+- **训练周边**：Dropout、权重正则、Huber/加权控制损失、余弦预热调度、Xavier / Kaiming 等初始化、早停与诊断由父仓库训练脚本编排
+- **图优化**：常量折叠、Linear 融合、Conv+ReLU、推理态 Conv+BN 折叠（`apply_graph_optimizations(..., mode="inference")`，兼容 ONNX 导出）
+- **序列化与动态 ONNX**：JSON + NPZ checkpoint、`TrainingState` 原子发布与滚动修订清理；`export_onnx(..., dynamic_batch=True)` 支持第 0 维符号 `"batch"`、自定义 metadata、`ReLU6` / `AdaptiveAvgPool2d` / 评估态 `SyncBatchNorm2d_Op` 导出
 - **可视化与监控**：TensorBoard logger（含指标与资源曲线）、训练 dashboard / observers、PNG 曲线（`utils/viz.py`）与 `monitoring` GPU 采样
 - **指标与增强**：回归 / 分类指标、`DonkeyRegressionEvaluator`；RandomCrop / Rotation / ColorJitter / MixUp / CutMix
 - **解释与量化**：Grad-CAM；ONNX 动态 / 静态 INT8（闭环评测与服务部署在父仓库 `apps/` / `scripts/`）

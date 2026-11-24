@@ -17,10 +17,10 @@ import weakref
 
 from ..core.device import xp
 from ..core.dtype import resolve_dtype
-
+from ..core.module import Module
 from ..core.node import Variable
 from ..ops.basic import Add
-from ..ops.batchnorm import BatchNorm2d_Op, GlobalAvgPool2d_Op
+from ..ops.batchnorm import BatchNorm2d_Op, GlobalAvgPool2d_Op, SyncBatchNorm2d_Op
 from ..ops.activation import ReLU
 from ..ops.convolution import Conv2D_Op, Conv2D_ReLU_Op, Flatten_Op
 from ..ops.basic import Linear
@@ -93,6 +93,153 @@ class BatchNorm2d(Layer):
             param.trainable = not self.frozen
         if self.frozen:
             self.train(False)
+
+
+class SyncBatchNorm2d(BatchNorm2d):
+    """跨进程同步统计量的 2D 批归一化层。"""
+
+    def __init__(
+        self,
+        num_features,
+        momentum=0.1,
+        eps=1e-5,
+        name=None,
+        dtype=None,
+        unbiased_running_var=False,
+        *,
+        allreduce_fn=None,
+        sample_weighted=True,
+    ):
+        super().__init__(
+            num_features,
+            momentum=momentum,
+            eps=eps,
+            name=name,
+            dtype=dtype,
+            unbiased_running_var=unbiased_running_var,
+        )
+        self.allreduce_fn = allreduce_fn
+        self.sample_weighted = bool(sample_weighted)
+
+    @classmethod
+    def from_batchnorm(cls, bn: BatchNorm2d, *, allreduce_fn=None, sample_weighted=True):
+        inst = cls.__new__(cls)
+        Layer.__init__(inst, name=bn.name)
+        inst.num_features = int(bn.num_features)
+        inst.momentum = float(bn.momentum)
+        inst.eps = float(bn.eps)
+        inst.unbiased_running_var = bool(bn.unbiased_running_var)
+        inst.training = bool(bn.training)
+        inst.frozen = bool(bn.frozen)
+        inst.gamma = bn.gamma
+        inst.beta = bn.beta
+        inst.params = bn.params
+        inst.running_mean = bn.running_mean
+        inst.running_var = bn.running_var
+        inst._last_op = None
+        inst._ops = weakref.WeakSet()
+        inst.allreduce_fn = allreduce_fn
+        inst.sample_weighted = bool(sample_weighted)
+        return inst
+
+    def forward(self, input_node):
+        op = SyncBatchNorm2d_Op(
+            input_node,
+            self.gamma,
+            self.beta,
+            self.running_mean,
+            self.running_var,
+            momentum=self.momentum,
+            eps=self.eps,
+            training=self.training,
+            unbiased_running_var=self.unbiased_running_var,
+            allreduce_fn=self.allreduce_fn,
+            sample_weighted=self.sample_weighted,
+            sync_tag=self.name or "bn",
+        )
+        self._last_op = op
+        self._ops.add(op)
+        return op
+
+
+def convert_sync_batchnorm(root, allreduce_fn, *, sample_weighted: bool = True):
+    """递归将模型内的 ``BatchNorm2d`` 原地替换为共享参数/缓冲区的 ``SyncBatchNorm2d``，返回 ``(root, 数量)``。"""
+    replaced: dict[int, SyncBatchNorm2d] = {}
+    visited: set[int] = set()
+    converted = 0
+    _skip_attrs = frozenset({
+        "_ops",
+        "_last_op",
+        "_last_feature_nodes",
+        "_last_transfer_features",
+        "_parameters",
+        "_buffers",
+        "params",
+        "transfer_manager",
+    })
+
+    def _visit(obj):
+        nonlocal converted
+        if obj is None or isinstance(obj, (Variable, str, bytes, int, float, bool)):
+            return obj
+        if hasattr(obj, "shape") and hasattr(obj, "dtype") and not isinstance(obj, (Layer, Module)):
+            return obj
+        if isinstance(obj, SyncBatchNorm2d):
+            obj.allreduce_fn = allreduce_fn
+            obj.sample_weighted = bool(sample_weighted)
+            return obj
+        if isinstance(obj, BatchNorm2d):
+            oid = id(obj)
+            if oid not in replaced:
+                replaced[oid] = SyncBatchNorm2d.from_batchnorm(
+                    obj, allreduce_fn=allreduce_fn, sample_weighted=sample_weighted
+                )
+                converted += 1
+            return replaced[oid]
+        if isinstance(obj, list):
+            if id(obj) in visited:
+                return obj
+            visited.add(id(obj))
+            for idx, item in enumerate(list(obj)):
+                new_item = _visit(item)
+                if new_item is not item:
+                    obj[idx] = new_item
+            return obj
+        if isinstance(obj, tuple):
+            items = [_visit(item) for item in obj]
+            if any(new is not old for new, old in zip(items, obj)):
+                return tuple(items)
+            return obj
+        if isinstance(obj, dict):
+            if id(obj) in visited:
+                return obj
+            visited.add(id(obj))
+            for k, v in list(obj.items()):
+                new_v = _visit(v)
+                if new_v is not v:
+                    obj[k] = new_v
+            return obj
+        if isinstance(obj, (Layer, Module)):
+            if id(obj) in visited:
+                return obj
+            visited.add(id(obj))
+            modules_map = getattr(obj, "_modules", None)
+            if isinstance(modules_map, dict):
+                for k, child in list(modules_map.items()):
+                    new_child = _visit(child)
+                    if new_child is not child:
+                        modules_map[k] = new_child
+            for attr, value in list(getattr(obj, "__dict__", {}).items()):
+                if attr in _skip_attrs or attr == "_modules":
+                    continue
+                new_value = _visit(value)
+                if new_value is not value:
+                    object.__setattr__(obj, attr, new_value)
+            return obj
+        return obj
+
+    result = _visit(root)
+    return result, converted
 
 
 class GlobalAvgPool2d(Layer):

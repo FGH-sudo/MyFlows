@@ -1,7 +1,20 @@
 import numpy as np
 
+from ..core.device import asnumpy, xp
 from ..core.node import GradientOp
 from .fused import batchnorm2d_backward, batchnorm2d_forward
+
+
+def _split_f64(arr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """将 float64 精确拆为高低两段 float32 传过 collective，再累加回 float64（保留约 48 bit 尾数精度）。"""
+    f64 = np.asarray(arr, dtype=np.float64)
+    hi = f64.astype(np.float32)
+    lo = (f64 - hi.astype(np.float64)).astype(np.float32)
+    return hi, lo
+
+
+def _merge_f64(hi, lo) -> np.ndarray:
+    return np.asarray(hi, dtype=np.float64) + np.asarray(lo, dtype=np.float64)
 
 
 class BatchNorm2d_Op(GradientOp):
@@ -58,6 +71,136 @@ class BatchNorm2d_Op(GradientOp):
             x_node.value, self.grad, gamma_node.value, self._mean, self._inv_std,
             training=self._training_used, x_grad=outputs[0][0], gamma_grad=outputs[1][0],
             beta_grad=outputs[2][0], accumulate=tuple(add for _, add in outputs))
+
+
+class SyncBatchNorm2d_Op(BatchNorm2d_Op):
+    """跨进程同步批归一化算子（FP64 split collective 前向统计 + 精确反向 dx 归约）。
+
+    继承自 :class:`BatchNorm2d_Op`：推理态可被图优化折叠进 Conv，训练态通过 ``type(bn) is BatchNorm2d_Op``
+    守卫跳过 BN+ReLU 融合，保证前反向集合通信完整执行。
+    """
+
+    def __init__(
+        self,
+        x,
+        gamma,
+        beta,
+        running_mean,
+        running_var,
+        momentum=0.1,
+        eps=1e-5,
+        training=True,
+        unbiased_running_var=False,
+        *,
+        allreduce_fn=None,
+        sample_weighted: bool = True,
+        sync_tag: str = "bn",
+    ):
+        super().__init__(
+            x,
+            gamma,
+            beta,
+            running_mean,
+            running_var,
+            momentum=momentum,
+            eps=eps,
+            training=training,
+            unbiased_running_var=unbiased_running_var,
+        )
+        self.allreduce_fn = allreduce_fn
+        self.sample_weighted = bool(sample_weighted)
+        self.sync_tag = str(sync_tag)
+        self._global_count = None
+
+    def forward(self, x_val, gamma_val, beta_val):
+        if not self.training or self.allreduce_fn is None:
+            self._global_count = None
+            super().forward(x_val, gamma_val, beta_val)
+            return
+
+        N, C, H, W = x_val.shape
+        if gamma_val.shape != (C,) or beta_val.shape != (C,):
+            raise ValueError("gamma/beta shape must be (C,)")
+        self._training_used = True
+        local_count = float(N * H * W)
+        s1_local = asnumpy(x_val.sum(axis=(0, 2, 3), dtype=xp.float64))
+        hi, lo = _split_f64(s1_local)
+        reduced = self.allreduce_fn(
+            f"{self.sync_tag}:fwd_mean",
+            {"hi": hi, "lo": lo, "count": np.array([local_count], dtype=np.float32)},
+        )
+        global_count = float(np.asarray(reduced["count"], dtype=np.float64).reshape(-1)[0])
+        if global_count <= 0:
+            raise ValueError(f"SyncBatchNorm2d global sample count must be positive, got {global_count}")
+        mean = _merge_f64(reduced["hi"], reduced["lo"]) / global_count
+
+        mean_dev = xp.asarray(mean, dtype=xp.float64).reshape(1, C, 1, 1)
+        sq_local = asnumpy(((x_val.astype(xp.float64) - mean_dev) ** 2).sum(axis=(0, 2, 3)))
+        sq_hi, sq_lo = _split_f64(sq_local)
+        reduced_v = self.allreduce_fn(f"{self.sync_tag}:fwd_var", {"hi": sq_hi, "lo": sq_lo})
+        var = np.maximum(_merge_f64(reduced_v["hi"], reduced_v["lo"]) / global_count, 0.0)
+        inv_std = 1.0 / np.sqrt(var + self.eps)
+
+        var_stat = var * (global_count / (global_count - 1.0)) if (self.unbiased_running_var and global_count > 1.0) else var
+        prev_rm = asnumpy(self.running_mean).astype(np.float64)
+        prev_rv = asnumpy(self.running_var).astype(np.float64)
+        self.running_mean[...] = xp.asarray(
+            (1.0 - self.momentum) * prev_rm + self.momentum * mean,
+            dtype=self.running_mean.dtype,
+        )
+        self.running_var[...] = xp.asarray(
+            (1.0 - self.momentum) * prev_rv + self.momentum * var_stat,
+            dtype=self.running_var.dtype,
+        )
+
+        inv_dev = xp.asarray(inv_std, dtype=xp.float64).reshape(1, C, 1, 1)
+        gamma64 = gamma_val.astype(xp.float64).reshape(1, C, 1, 1)
+        beta64 = beta_val.astype(xp.float64).reshape(1, C, 1, 1)
+        self.value = ((x_val.astype(xp.float64) - mean_dev) * inv_dev * gamma64 + beta64).astype(
+            x_val.dtype, copy=False
+        )
+        if self.requires_grad:
+            self._mean = mean
+            self._inv_std = inv_std
+            self._global_count = global_count
+        else:
+            self._mean = self._inv_std = self._global_count = None
+
+    def backward(self):
+        if not self._training_used or self.allreduce_fn is None:
+            super().backward()
+            return
+        x_node, gamma_node, beta_node = self.parents
+        x_val = x_node.value
+        dy = self.grad
+        N, C, _H, _W = x_val.shape
+        mean64 = xp.asarray(self._mean, dtype=xp.float64).reshape(1, C, 1, 1)
+        inv64 = xp.asarray(self._inv_std, dtype=xp.float64).reshape(1, C, 1, 1)
+        x_hat = (x_val.astype(xp.float64) - mean64) * inv64
+        dy64 = dy.astype(xp.float64)
+        dbeta_local = dy64.sum(axis=(0, 2, 3))
+        dgamma_local = (dy64 * x_hat).sum(axis=(0, 2, 3))
+
+        if gamma_node.requires_grad:
+            gamma_node.accumulate_grad(dgamma_local.astype(gamma_node.value.dtype, copy=False))
+        if beta_node.requires_grad:
+            beta_node.accumulate_grad(dbeta_local.astype(beta_node.value.dtype, copy=False))
+        if x_node.requires_grad:
+            scale = float(N) if self.sample_weighted else 1.0
+            g1_hi, g1_lo = _split_f64(asnumpy(dbeta_local) * scale)
+            g2_hi, g2_lo = _split_f64(asnumpy(dgamma_local) * scale)
+            reduced_g = self.allreduce_fn(
+                f"{self.sync_tag}:bwd",
+                {"g1_hi": g1_hi, "g1_lo": g1_lo, "g2_hi": g2_hi, "g2_lo": g2_lo},
+            )
+            g1_global = _merge_f64(reduced_g["g1_hi"], reduced_g["g1_lo"])
+            g2_global = _merge_f64(reduced_g["g2_hi"], reduced_g["g2_lo"])
+            denom = scale * float(self._global_count)
+            term1 = xp.asarray(g1_global / denom, dtype=xp.float64).reshape(1, C, 1, 1)
+            term2 = xp.asarray(g2_global / denom, dtype=xp.float64).reshape(1, C, 1, 1)
+            gamma64 = gamma_node.value.astype(xp.float64).reshape(1, C, 1, 1)
+            dx = (gamma64 * inv64) * (dy64 - term1 - x_hat * term2)
+            x_node.accumulate_grad(dx.astype(x_val.dtype, copy=False))
 
 
 class BatchNormActivation:

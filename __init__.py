@@ -13,7 +13,18 @@ from .core.tensor import Tensor
 # 导入 Graph，并暴露在顶层命名空间 (ms.Graph)
 from .core.graph import Graph
 from .core.graph_opt import apply_graph_optimizations
-from .core.device import cuda_available, configure_cuda_dll_path, get_device, set_device, to_device, use_cuda
+from .core.device import (
+    configure_cuda_dll_path,
+    cuda_available,
+    cuda_device_count,
+    get_device,
+    get_device_index,
+    get_device_string,
+    resolve_rank_device,
+    set_device,
+    to_device,
+    use_cuda,
+)
 from .core.dtype import get_default_dtype, set_default_dtype
 
 # --- 连接层 (layers) ---
@@ -33,6 +44,8 @@ from .layers.layer import (
 )
 from .layers.resnet import (
     BatchNorm2d,
+    SyncBatchNorm2d,
+    convert_sync_batchnorm,
     GlobalAvgPool2d,
     BasicBlock,
     ResNet18,
@@ -58,7 +71,7 @@ from .ops.convolution import (
     im2col,
     col2im,
 )
-from .ops.batchnorm import BatchNorm2d_Op, GlobalAvgPool2d_Op
+from .ops.batchnorm import BatchNorm2d_Op, GlobalAvgPool2d_Op, SyncBatchNorm2d_Op
 from .ops.dropout import Dropout_Op
 
 # --- 训练和优化 (train) ---
@@ -108,17 +121,18 @@ from .data.pipeline import MultiprocessDataLoader
 __all__ = [
     # Core
     'Node', 'Variable', 'Module', 'Parameter', 'Buffer', 'Tensor', 'Graph',
-    'set_device', 'get_device', 'use_cuda', 'cuda_available', 'to_device', 'configure_cuda_dll_path',
+    'set_device', 'get_device', 'get_device_index', 'get_device_string', 'cuda_device_count', 'resolve_rank_device',
+    'use_cuda', 'cuda_available', 'to_device', 'configure_cuda_dll_path',
     'get_default_dtype', 'set_default_dtype',
     # Layers
     'Layer', 'Dense', 'Conv2D', 'GroupedConv2D', 'DepthwiseConv2D', 'DepthwiseSeparableConv2D', 'DilatedConv2D', 'ConvTranspose2D', 'Dropout', 'MaxPool2d', 'Flatten', 'save_checkpoint', 'load_checkpoint', 'export_onnx',
-    'BatchNorm2d', 'GlobalAvgPool2d', 'BasicBlock', 'ResNet18', 'ResNet34',
+    'BatchNorm2d', 'SyncBatchNorm2d', 'convert_sync_batchnorm', 'GlobalAvgPool2d', 'BasicBlock', 'ResNet18', 'ResNet34',
     'VGG11', 'VGG11Standard', 'VGG13', 'vgg_fc_input_dim',
     # Ops
     'Add', 'MatMul', 'PerceptionLoss', 'LogLoss', 'CrossEntropy', 'MSELoss', 'HuberLoss', 'WeightedControlLoss',
     'Logistic', 'Softmax', 'Tanh', 'ReLU', 'LeakyReLU', 'Conv2D_Op', 'ConvTranspose2D_Op', 'Dropout_Op',
     'MaxPool2d_Op', 'Flatten_Op', 'effective_kernel_size', 'im2col', 'col2im',
-    'BatchNorm2d_Op', 'GlobalAvgPool2d_Op',
+    'BatchNorm2d_Op', 'SyncBatchNorm2d_Op', 'GlobalAvgPool2d_Op',
     # Train
     'Optimizer', 'MBGD', 'Momentum', 'AdaGrad', 'RMSProp', 'Adam', 'RegularizationConfig', 'apply_regularization',
     'CosineWarmupScheduler',

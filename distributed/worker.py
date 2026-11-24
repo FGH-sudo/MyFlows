@@ -25,7 +25,7 @@ def worker_main(worker_id, config, shard, events, stop):
     heartbeat = None
     try:
         emit(events, config, "worker", worker_id, -1, "worker_start")
-        session = TrainSession(config, for_compute=True)
+        session = TrainSession(config, for_compute=True, rank=worker_id)
         emit(events, config, "worker", worker_id, -1, "session_ready", communication=True)
         client = _connect(config)
         hb_client = _connect(config)
